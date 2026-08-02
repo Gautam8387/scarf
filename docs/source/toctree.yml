@@ -1,56 +1,137 @@
 root: index
 subtrees:
-  - entries:
-      - file: install
+  - caption: Get started
+    entries:
+      - file: installation
         title: Installation
-      - file: contributions
-        title: For developers
-      - file: faq
-        title: Frequently asked questions
-      - file: colab
-        title: Interactive tutorials on Colab
-  - caption: Basic pipelines
+      - file: quickstart
+        title: Quick start
+      - file: analysis_with_agents
+        title: Analysis with AI agents
+      - file: scarf_and_scanpy
+        title: Scanpy and Seurat users
+  - caption: Core workflows
     entries:
-      - file: vignettes/basic_tutorial_scRNAseq
-        title: Workflow for scRNA-Seq data
-      - file: vignettes/basic_tutorial_scATACseq
-        title: Workflow for scATAC-Seq data
-  - caption: Multi-omics/Multimodal analysis
-    entries: 
-      - file: vignettes/multiple_modalities
-        title: Transcriptome + Surface Proteome
-  - caption: Data integration tutorials
+      - file: tutorials/scrna_seq
+        title: scRNA-seq heterogeneity
+      - file: tutorials/pseudotime
+        title: Pseudotime
+      - file: tutorials/pseudotime_modules
+        title: Expression dynamics
+      - file: tutorials/fate_mapping
+        title: Fate mapping
+      - file: tutorials/scatac_seq
+        title: scATAC-seq
+      - file: tutorials/cite_seq
+        title: CITE-seq
+  - caption: Integration and mapping
     entries:
-      - file: vignettes/data_projection
-        title: Integration through projection
-      - file: vignettes/merging_datasets
-        title: Merging samples and datasets
-  - caption: Trajectory analysis tutorials
+      - file: tutorials/choosing_integration_methods
+        title: Integration vs. mapping
+      - file: tutorials/data_integration
+        title: Dataset merging
+      - file: tutorials/batch_correction
+        title: Batch correction
+      - file: tutorials/integration_metrics
+        title: Integration metrics
+      - file: tutorials/multimodal_integration
+        title: Multimodal diagnostics
+      - file: tutorials/mapping_and_label_transfer
+        title: Mapping and label transfer
+      - file: tutorials/reference_atlases
+        title: Reference atlases
+  - caption: Downstream analysis
     entries:
-      - file: vignettes/pseudotime_dynamics.md
-        title: Pseudotime dynamics
-  - caption: Vignettes
+      - file: tutorials/annotation
+        title: Cell type annotation
+      - file: tutorials/cell_cycle
+        title: Cell cycle
+      - file: tutorials/gene_set_enrichment
+        title: Gene-set scoring
+      - file: tutorials/pseudobulk_and_differential_expression
+        title: Pseudobulk and DE
+  - caption: Methods and diagnostics
     entries:
-      - file: vignettes/zarr_explanation
-        title: Data organization in Scarf
-      - file: vignettes/download_conversion
-        title: Data import and export
-      - file: vignettes/cell_subsampling_tutorial
-        title: Automated cell downsampling
-      - file: vignettes/cell_cycle
-        title: Estimate cell-cycle phases
-      - file: vignettes/mnist
-        title: Exploring MNIST dataset
-  - caption: Useful links
+      - file: tutorials/plotting
+        title: Plotting
+      - file: tutorials/quality_control
+        title: Quality control
+      - file: tutorials/feature_selection
+        title: Feature selection
+      - file: tutorials/custom_graph_construction
+        title: Graph construction
+      - file: tutorials/dimensionality_reduction
+        title: Dimensionality reduction
+      - file: tutorials/clustering
+        title: Clustering
+      - file: tutorials/imputation
+        title: Imputation by graph diffusion
+      - file: tutorials/downsampling
+        title: Cell downsampling
+      - file: tutorials/trajectory_analysis
+        title: Trajectory validation
+      - file: tutorials/custom_analyses
+        title: Custom analyses
+  - caption: Data management and scaling
     entries:
-        - url: https://www.nature.com/articles/s41467-022-32097-3
-          title: Scarf paper in Nature Comm
-        - url: https://github.com/parashardhapola/scarf/discussions
-          title: Discussion page
-        - url: https://github.com/parashardhapola/scarf/issues
-          title: Report bug
-  - caption: Reference manual
+      - file: tutorials/import_and_export
+        title: Import and export
+      - file: tutorials/data_organization
+        title: Data organization
+      - file: tutorials/remote_stores
+        title: Remote stores
+      - file: concepts/provenance
+        title: Provenance
+      - file: tutorials/provenance_and_reuse
+        title: Reuse and tracing
+      - file: concepts/scale_and_memory
+        title: Memory and execution
+      - file: concepts/benchmarks
+        title: Benchmarks
+  - caption: Reference and support
     entries:
-      - file: api
-      - file: license
-      - file: genindex
+      - file: tutorials/hto_demultiplexing
+        title: HTO demultiplexing
+      - file: reference/api
+        title: API reference
+        entries:
+          - file: reference/api/datastore
+            title: DataStore
+          - file: reference/api/graph_construction
+            title: Graph construction
+          - file: reference/api/artifacts
+            title: Artifacts and state
+          - file: reference/api/pipeline
+            title: Pipeline
+          - file: reference/api/import_export
+            title: Import and export
+          - file: reference/api/assays
+            title: Assays and metadata
+          - file: reference/api/integration
+            title: Integration and metrics
+          - file: reference/api/mapping
+            title: Mapping
+          - file: reference/api/plotting
+            title: Plotting
+          - file: reference/api/utilities
+            title: Datasets and utilities
+      - file: reference/faq
+        title: FAQ
+      - file: reference/glossary
+        title: Glossary
+      - file: reference/citation
+        title: Citation
+      - file: reference/license
+        title: License
+      - url: https://github.com/parashardhapola/scarf/discussions
+        title: Ask a question
+      - url: https://github.com/parashardhapola/scarf/issues
+        title: Report a bug
+  - caption: Developers
+    entries:
+      - file: developers/contributing
+        title: Contributing
+      - file: developers/architecture
+        title: Architecture
+      - file: developers/zarr_internals
+        title: Zarr internals

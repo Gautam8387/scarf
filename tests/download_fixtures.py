@@ -1,0 +1,233 @@
+"""Download bundled test datasets for CI and local development."""
+
+import argparse
+import gzip
+import hashlib
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+import h5py
+import pandas as pd
+from scipy.sparse import csr_matrix
+
+_H5AD_DOWNLOAD_ATTEMPTS = 3
+
+_FIXTURES_BASE_URL = "https://raw.githubusercontent.com/parashardhapola/scarf/master/scarf/tests/datasets"
+_EXTERNAL_FIXTURES = {
+    "seurat_assay5_synthetic.rds": (
+        "https://raw.githubusercontent.com/harryhaller001/readseurat/"
+        "8a688b47df27f90e98a4c57ddd9e47c0e5ded01e/tests/data/synthetic.rds",
+        "f1e6f6fd3e1959452a9ef7e72571a86e1b27a061d8cf00cd28932d8757cdac7c",
+    ),
+    "seurat_v4_1_3_pbmc_mye.rds": (
+        "https://zenodo.org/api/records/10944066/files/"
+        "pbmc10k_mye_small_velocyto.rds/content",
+        "f84adf523a78aeb6e6681cf09e06a2a2fcd4e3fe857fdd89b17e90a1782fac3d",
+    ),
+}
+
+FIXTURE_FILES = (
+    "1K_pbmc_citeseq.h5",
+    "1K_pbmc_citeseq.zarr.tar.gz",
+    "500_pbmc_atac.zarr.tar.gz",
+    "toy_cr_dir.tar.gz",
+    "toy_cr_dir_empty.tar.gz",
+    "sympathetic.loom",
+    "cell_attributes.csv",
+    "knn_indices.npy",
+    "knn_distances.npy",
+    "knn_weights.npy",
+    "atac_knn_indices.npy",
+    "atac_knn_distances.npy",
+    "markers_cluster1.csv",
+    "pseudotime_markers_r_values.csv",
+    "aggregated_feat_idx.npy",
+    "aggregated_df_top_10.npy",
+    "pseudotime_clusters.npy",
+    "ptime_modules_group_1.npy",
+    "seurat_assay5_synthetic.rds",
+    "seurat_v4_1_3_pbmc_mye.rds",
+)
+
+
+def datasets_dir() -> Path:
+    return Path(__file__).resolve().parent / "datasets"
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while block := handle.read(1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def download_fixtures(*, force: bool = False) -> None:
+    target = datasets_dir()
+    target.mkdir(parents=True, exist_ok=True)
+
+    missing: list[tuple[str, urllib.error.HTTPError]] = []
+    for name in FIXTURE_FILES:
+        dest = target / name
+        external = _EXTERNAL_FIXTURES.get(name)
+        if dest.is_file() and not force:
+            if external is None or _sha256(dest) == external[1]:
+                continue
+            dest.unlink()
+        url = f"{_FIXTURES_BASE_URL}/{name}" if external is None else external[0]
+        try:
+            urllib.request.urlretrieve(url, dest)
+        except urllib.error.HTTPError as exc:
+            missing.append((name, exc))
+            continue
+        if external is not None:
+            digest = _sha256(dest)
+            if digest != external[1]:
+                dest.unlink()
+                raise RuntimeError(
+                    f"Fixture {name} has SHA-256 {digest}, expected {external[1]}"
+                )
+
+    if missing:
+        details = "\n".join(f"  {name}: HTTP {exc.code}" for name, exc in missing)
+        msg = f"Failed to download {len(missing)} fixture(s):\n{details}"
+        raise RuntimeError(msg)
+
+
+def build_mtx_dir_fixture() -> None:
+    archive = datasets_dir() / "1K_pbmc_citeseq_dir.tar.gz"
+    if archive.is_file():
+        return
+
+    h5_path = datasets_dir() / "1K_pbmc_citeseq.h5"
+    if not h5_path.is_file():
+        msg = (
+            "Cannot build 1K_pbmc_citeseq_dir.tar.gz without "
+            f"{h5_path.name}; download core fixtures first."
+        )
+        raise RuntimeError(msg)
+
+    from scarf.readers import CrDirReader, CrH5Reader
+
+    reader = CrH5Reader(str(h5_path))
+    rna = "RNA"
+    assay = reader.assayFeats[rna]
+    start, end = int(assay["start"]), int(assay["end"])
+    feat_ids = reader.feature_ids(rna)
+    feat_names = reader.feature_names(rna)
+    feat_types = reader.feature_types()
+    cells = reader.cell_names()
+
+    with tempfile.TemporaryDirectory(prefix="scarf_mtx_fixture_") as tmp:
+        mtx_dir = Path(tmp) / "1K_pbmc_citeseq_dir"
+        mtx_dir.mkdir()
+
+        with gzip.open(mtx_dir / "features.tsv.gz", "wt") as handle:
+            for idx in range(start, end):
+                handle.write(
+                    f"{feat_ids[idx - start]}\t{feat_names[idx - start]}\t{feat_types[idx]}\n"
+                )
+
+        with gzip.open(mtx_dir / "barcodes.tsv.gz", "wt") as handle:
+            for cell in cells:
+                handle.write(f"{cell}\n")
+
+        with h5py.File(h5_path) as h5:
+            matrix = h5["matrix"]
+            mat = csr_matrix(
+                (matrix["data"][:], matrix["indices"][:], matrix["indptr"][:]),
+                shape=(len(cells), reader.nFeatures),
+            )
+        rna_mat = mat[:, start:end].T.tocoo()
+
+        with gzip.open(mtx_dir / "matrix.mtx.gz", "wt") as handle:
+            handle.write(
+                "%%MatrixMarket matrix coordinate integer general\n% Generated by Scarf\n"
+            )
+            handle.write(f"{rna_mat.shape[0]} {rna_mat.shape[1]} {rna_mat.nnz}\n")
+            pd.DataFrame(
+                {"row": rna_mat.row + 1, "col": rna_mat.col + 1, "d": rna_mat.data}
+            ).to_csv(
+                handle,
+                sep=" ",
+                header=False,
+                index=False,
+                mode="a",
+                lineterminator="\n",
+            )
+
+        CrDirReader(str(mtx_dir))
+
+        with tarfile.open(archive, "w:gz") as tar:
+            tar.add(mtx_dir, arcname=mtx_dir.name)
+
+
+def download_optional_h5ad(*, attempts: int = _H5AD_DOWNLOAD_ATTEMPTS) -> bool:
+    sample = "bastidas-ponce_4K_pancreas-d15_rnaseq"
+    local_h5ad = datasets_dir() / sample / "data.h5ad"
+    if local_h5ad.is_file():
+        return True
+
+    from scarf import cytebase
+
+    last_error: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            cytebase.connect("scarf_docs").download_dataset(
+                sample,
+                destination=datasets_dir(),
+            )
+            if local_h5ad.is_file():
+                return True
+            last_error = FileNotFoundError(
+                f"Cytebase download finished without creating {local_h5ad}"
+            )
+        except Exception as exc:
+            last_error = exc
+
+        if attempt >= attempts:
+            break
+        delay = min(60.0, 2.0**attempt)
+        print(
+            f"Warning: h5ad download attempt {attempt}/{attempts} failed "
+            f"({last_error}); retrying in {delay:.0f}s",
+            file=sys.stderr,
+        )
+        time.sleep(delay)
+
+    print(
+        f"Warning: skipping optional h5ad fixture after {attempts} attempts "
+        f"({last_error}). Tests that need {local_h5ad} will be skipped.",
+        file=sys.stderr,
+    )
+    return False
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-download fixtures even when files already exist.",
+    )
+    parser.add_argument(
+        "--with-h5ad",
+        action="store_true",
+        help="Also download the bastidas-ponce h5ad from Cytebase.",
+    )
+    args = parser.parse_args(argv)
+
+    download_fixtures(force=args.force)
+    build_mtx_dir_fixture()
+    if args.with_h5ad:
+        download_optional_h5ad()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
