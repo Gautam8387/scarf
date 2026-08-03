@@ -8,6 +8,9 @@
   <a href="https://codecov.io/gh/NygenAnalytics/scarf"><img src="https://codecov.io/gh/NygenAnalytics/scarf/graph/badge.svg?token=ZvJXuYq3pd" alt="Coverage"></a>
 </p>
 
+> [!IMPORTANT]
+> **Scarf 1.0 is coming soon.** Install the `1.0.0rc1` release candidate with `uv pip install --prerelease allow "scarf[extra]"`. The current stable release on PyPI is `0.32.3`.
+
 Scarf is a Python framework for analysing single-cell RNA, ATAC, protein, and multi-omic data, from a few thousand cells to tens of millions.
 
 | Problem | How Scarf solves it | What you get |
