@@ -4,45 +4,53 @@ on:
   push:
     branches:
       - master
-      - development
     paths:
       - "docs/**"
       - "scarf/**"
+      - "LICENSE"
+      - "README.md"
+      - "VERSION"
       - "pyproject.toml"
+      - "tests/test_docs_cache.py"
+      - "tests/test_docs_structure.py"
       - "uv.lock"
       - ".readthedocs.yml"
       - ".github/workflows/docs.yml"
   pull_request:
     branches:
       - master
-      - development
     paths:
       - "docs/**"
       - "scarf/**"
+      - "LICENSE"
+      - "README.md"
+      - "VERSION"
       - "pyproject.toml"
+      - "tests/test_docs_cache.py"
+      - "tests/test_docs_structure.py"
       - "uv.lock"
       - ".readthedocs.yml"
       - ".github/workflows/docs.yml"
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     env:
       HNSWLIB_NO_NATIVE: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install system build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential libfftw3-dev libmetis-dev
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v9.0.0
         with:
           python-version: "3.14"
       - name: Install documentation dependencies
         run: uv sync --extra docs --extra test --extra extra
-      - name: Documentation cache tests
-        run: uv run pytest -n 0 tests/test_docs_cache.py
+      - name: Documentation tests
+        run: uv run pytest -n 0 tests/test_docs_cache.py tests/test_docs_structure.py
       - name: Validate committed notebook cache
         run: uv run python docs/execute_all_vignettes.py --validate
       - name: Sphinx HTML build (nitpicky, warnings as errors)
