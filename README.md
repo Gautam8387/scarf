@@ -1,4 +1,5 @@
 # Scarf
+### Single Cell Analysis on Remote Filesystems
 
 <p align="left">
   <a href="https://github.com/NygenAnalytics/scarf/actions/workflows/pytest.yml"><img src="https://github.com/NygenAnalytics/scarf/actions/workflows/pytest.yml/badge.svg" alt="Tests"></a>
