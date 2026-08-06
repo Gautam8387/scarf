@@ -5,7 +5,11 @@ import h5py
 import numpy as np
 
 from ..utils.logging import logger
-from ._assay_names import auto_name_feat_table, make_feat_table_from_types
+from ._assay_names import (
+    AUTO_ASSAY_NAMES,
+    auto_name_feat_table,
+    make_feat_table_from_types,
+)
 
 
 _FEATURE_ID_KEYS = (
@@ -55,6 +59,7 @@ class H5adInspectResult:
     matrixKey: str
     matrixCandidates: tuple[str, ...]
     matrixEncoding: str
+    integerLike: bool
     cellAttrsKey: str
     cellIdsKey: str
     featureAttrsKey: str
@@ -545,11 +550,18 @@ def _select_matrix(
     raise ValueError("No matrix candidate matches the obs and var dimensions")
 
 
-def inspect_h5ad(h5ad_fn: str) -> H5adInspectResult:
+def inspect_h5ad(
+    h5ad_fn: str,
+    *,
+    matrix_key: str | None = None,
+) -> H5adInspectResult:
     """Report the matrix and metadata layout of an H5AD file.
 
     Args:
         h5ad_fn: Path to the H5AD file.
+        matrix_key: Optional matrix path to force (for example ``X`` or
+            ``raw/X``). When set, that candidate must exist and match obs/var
+            dimensions.
 
     Returns:
         Keys, shape, and column names needed to configure
@@ -560,7 +572,18 @@ def inspect_h5ad(h5ad_fn: str) -> H5adInspectResult:
         if not candidates:
             raise ValueError("No sparse or numeric 2D matrix found in the H5AD file")
 
-        matrix, feature_attrs_key = _select_matrix(h5, candidates)
+        if matrix_key is not None:
+            forced = [
+                candidate for candidate in candidates if candidate.key == matrix_key
+            ]
+            if not forced:
+                available = ", ".join(candidate.key for candidate in candidates)
+                raise ValueError(
+                    f"matrix_key {matrix_key!r} not found. Available: {available}"
+                )
+            matrix, feature_attrs_key = _select_matrix(h5, forced)
+        else:
+            matrix, feature_attrs_key = _select_matrix(h5, candidates)
         n_cells, n_features = matrix.shape
         cell_node = h5.get("obs")
         feature_node = h5.get(feature_attrs_key)
@@ -596,17 +619,26 @@ def inspect_h5ad(h5ad_fn: str) -> H5adInspectResult:
                     assay_split_key = None
                 else:
                     feature_types = [_as_text(value) for value in values]
-                    assay_table = auto_name_feat_table(
-                        make_feat_table_from_types(feature_types)
-                    )
-                    for assay_name in dict.fromkeys(assay_table.columns):
-                        selected = assay_table[assay_name]
-                        count = (
-                            int(selected.loc["nFeatures"].sum())
-                            if selected.ndim == 2
-                            else int(selected.loc["nFeatures"])
+                    # CELLxGENE stores Ensembl biotypes in feature_type. Those are
+                    # not assay modalities; splitting on them invents thousands of
+                    # ASSAY* spans. Require at least one known modality label.
+                    if not any(
+                        feature_type in AUTO_ASSAY_NAMES
+                        for feature_type in feature_types
+                    ):
+                        assay_split_key = None
+                    else:
+                        assay_table = auto_name_feat_table(
+                            make_feat_table_from_types(feature_types)
                         )
-                        suggested_assays[str(assay_name)] = count
+                        for assay_name in dict.fromkeys(assay_table.columns):
+                            selected = assay_table[assay_name]
+                            count = (
+                                int(selected.loc["nFeatures"].sum())
+                                if selected.ndim == 2
+                                else int(selected.loc["nFeatures"])
+                            )
+                            suggested_assays[str(assay_name)] = count
 
         layers_node = h5.get("layers")
         layers = (
@@ -624,6 +656,7 @@ def inspect_h5ad(h5ad_fn: str) -> H5adInspectResult:
         matrixKey=matrix.key,
         matrixCandidates=tuple(candidate.key for candidate in candidates),
         matrixEncoding=matrix.encoding,
+        integerLike=matrix.integerLike,
         cellAttrsKey="obs",
         cellIdsKey=cell_ids_key,
         featureAttrsKey=feature_attrs_key,
