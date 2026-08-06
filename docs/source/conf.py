@@ -126,6 +126,8 @@ matplotlib.use("agg")
 nitpick_ignore = [
     ("py:class", "numpy.ndarray"),
     ("py:class", "numpy.dtype"),
+    ("py:class", "pandas.DataFrame"),
+    ("py:class", "pandas.Series"),
     ("py:class", "pandas.core.frame.DataFrame"),
     ("py:class", "pandas.core.series.Series"),
     ("py:class", "scipy.sparse._csr.csr_matrix"),
@@ -134,6 +136,7 @@ nitpick_ignore = [
     ("py:class", "zarr.core.group.Group"),
     ("py:class", "zarr.core.array.Array"),
     ("py:class", "pathlib.Path"),
+    ("py:class", "pathlib._local.Path"),
     ("py:class", "os.PathLike"),
     ("py:class", "collections.abc.Callable"),
     ("py:class", "collections.abc.Iterable"),

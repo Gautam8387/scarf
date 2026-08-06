@@ -297,14 +297,6 @@ def test_pseudotime_result_shape_validation_is_stable():
 
 def test_mapping_execution_contract_is_query_owned():
     signature = inspect.signature(scarf.DataStore.run_mapping)
-    assert str(signature) == (
-        "(self, reference: scarf.mapping.reference.MappingReference, "
-        "mapping_name: str, *, query_assay: str | None = None, "
-        "cell_key: str = 'I', save_k: int = 3, "
-        "missing_feature_policy: str = 'reference_mean', "
-        "query_batches: pandas.core.frame.DataFrame | None = None, "
-        "invalidate_cache: bool = False) -> scarf.mapping.models.MappingResult"
-    )
     assert tuple(signature.parameters) == (
         "self",
         "reference",
@@ -315,6 +307,19 @@ def test_mapping_execution_contract_is_query_owned():
         "missing_feature_policy",
         "query_batches",
         "invalidate_cache",
+    )
+    params = signature.parameters
+    assert params["query_assay"].default is None
+    assert params["cell_key"].default == "I"
+    assert params["save_k"].default == 3
+    assert params["missing_feature_policy"].default == "reference_mean"
+    assert params["query_batches"].default is None
+    assert params["invalidate_cache"].default is False
+    # pandas 2 stringifies as pandas.core.frame.DataFrame; pandas 3 as pandas.DataFrame.
+    assert "DataFrame | None" in str(params["query_batches"].annotation)
+    return_annotation = signature.return_annotation
+    assert getattr(return_annotation, "__name__", str(return_annotation)).endswith(
+        "MappingResult"
     )
     with pytest.raises(TypeError, match="unexpected keyword argument 'target_assay'"):
         scarf.DataStore.run_mapping(

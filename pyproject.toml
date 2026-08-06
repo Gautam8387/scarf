@@ -75,6 +75,7 @@ test = [
     "anndata>=0.12",
     "scikit-network>=0.33.1",
     "rdata>=1.1.0",
+    "pydantic-ai-slim[openai]",
 ]
 docs = [
     "jinja2",
@@ -200,6 +201,10 @@ exclude = [
     "scarf/_version.py",
 ]
 
+# Keep the pre-0.16 default rule set until the wider 0.16 defaults are triaged.
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
 [tool.mypy]
 strict = false
 
@@ -228,6 +233,28 @@ module = [
     "scarf.plotting.*",
 ]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+    "numba",
+    "numba.*",
+    "pydantic_ai",
+    "pydantic_ai.*",
+]
+ignore_missing_imports = true
+
+# Numba primitives are untyped and expose runtime-only attributes.
+[[tool.mypy.overrides]]
+module = [
+    "scarf.utils.numba",
+    "scarf.clustering._paris_core",
+    "scarf.embeddings.umap",
+    "scarf.features.markers.*",
+    "scarf.features.enrichment.aucell",
+    "scarf.datastore._operations.features",
+]
+disallow_untyped_calls = false
+disable_error_code = ["attr-defined", "arg-type"]
 
 [[tool.mypy.overrides]]
 module = ["profiling.*"]

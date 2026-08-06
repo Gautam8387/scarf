@@ -2,36 +2,36 @@ from importlib import import_module as _import_module
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .arrays import (
+    from scarf.utils.arrays import (
         array_digest as array_digest,
         clean_array as clean_array,
         permute_into_chunks as permute_into_chunks,
         rescale_array as rescale_array,
         rolling_window as rolling_window,
     )
-    from .compute import (
+    from scarf.utils.compute import (
         controlled_compute as controlled_compute,
         show_dask_progress as show_dask_progress,
     )
-    from .logging import (
+    from scarf.utils.logging import (
         configure_output as configure_output,
         get_log_level as get_log_level,
         logger as logger,
         set_verbosity as set_verbosity,
     )
-    from .prefetch import (
+    from scarf.utils.prefetch import (
         iter_column_blocks as iter_column_blocks,
     )
-    from .process import (
+    from scarf.utils.process import (
         process_rss_mb as process_rss_mb,
         rss_peak_tracker as rss_peak_tracker,
         system_call as system_call,
     )
-    from .progress import (
+    from scarf.utils.progress import (
         tqdm_params as tqdm_params,
         tqdmbar as tqdmbar,
     )
-    from ..storage.stores import load_zarr as load_zarr
+    from scarf.storage.stores import load_zarr as load_zarr
 
 __all__ = [
     "logger",

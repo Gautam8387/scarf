@@ -59,12 +59,12 @@ jobs:
         python-version: ${{ matrix.python-version }}
     - name: Install dependencies (locked)
       if: matrix.resolution == 'locked'
-      run: uv sync --group profiling --extra test --extra extra
+      run: uv sync --group profiling --extra test --extra extra --extra agent
     - name: Install dependencies (lowest-direct)
       if: matrix.resolution == 'lowest-direct'
       run: |
         uv venv --python "${{ matrix.python-version }}"
-        uv pip install --resolution lowest-direct -e ".[test,extra]" --group profiling
+        uv pip install --resolution lowest-direct -e ".[test,extra,agent]" --group profiling
     - name: Lint and check formatting
       if: matrix.resolution == 'locked' && matrix.python-version == '3.12'
       run: |
