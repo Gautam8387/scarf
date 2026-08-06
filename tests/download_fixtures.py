@@ -7,8 +7,6 @@ import sys
 import tarfile
 import tempfile
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 import h5py
@@ -76,22 +74,18 @@ _CYTEBASE_FIXTURES = {
     "ptime_modules_group_1.npy": (
         "7c77de233841133b69bacc3d38b9e412f37a2caaa77442e8a9f1beaebf3653bf"
     ),
-}
-
-_EXTERNAL_FIXTURES = {
+    # Source: harryhaller001/readseurat commit
+    # 8a688b47df27f90e98a4c57ddd9e47c0e5ded01e, tests/data/synthetic.rds (MIT).
     "seurat_assay5_synthetic.rds": (
-        "https://raw.githubusercontent.com/harryhaller001/readseurat/"
-        "8a688b47df27f90e98a4c57ddd9e47c0e5ded01e/tests/data/synthetic.rds",
-        "f1e6f6fd3e1959452a9ef7e72571a86e1b27a061d8cf00cd28932d8757cdac7c",
+        "f1e6f6fd3e1959452a9ef7e72571a86e1b27a061d8cf00cd28932d8757cdac7c"
     ),
+    # Source: https://doi.org/10.5281/zenodo.10944066 (CC0-1.0).
     "seurat_v4_1_3_pbmc_mye.rds": (
-        "https://zenodo.org/api/records/10944066/files/"
-        "pbmc10k_mye_small_velocyto.rds/content",
-        "f84adf523a78aeb6e6681cf09e06a2a2fcd4e3fe857fdd89b17e90a1782fac3d",
+        "f84adf523a78aeb6e6681cf09e06a2a2fcd4e3fe857fdd89b17e90a1782fac3d"
     ),
 }
 
-FIXTURE_FILES = (*_CYTEBASE_FIXTURES, *_EXTERNAL_FIXTURES)
+FIXTURE_FILES = tuple(_CYTEBASE_FIXTURES)
 
 
 def datasets_dir() -> Path:
@@ -151,31 +145,10 @@ def _download_cytebase_fixtures(target: Path, *, force: bool) -> None:
         _verify_digest(dest, expected)
 
 
-def _download_external_fixtures(target: Path, *, force: bool) -> None:
-    missing: list[tuple[str, urllib.error.HTTPError]] = []
-    for name, (url, expected) in _EXTERNAL_FIXTURES.items():
-        dest = target / name
-        if dest.is_file() and not force:
-            if _sha256(dest) == expected:
-                continue
-            dest.unlink()
-        try:
-            urllib.request.urlretrieve(url, dest)
-        except urllib.error.HTTPError as exc:
-            missing.append((name, exc))
-            continue
-        _verify_digest(dest, expected)
-
-    if missing:
-        details = "\n".join(f"  {name}: HTTP {exc.code}" for name, exc in missing)
-        raise RuntimeError(f"Failed to download {len(missing)} fixture(s):\n{details}")
-
-
 def download_fixtures(*, force: bool = False) -> None:
     target = datasets_dir()
     target.mkdir(parents=True, exist_ok=True)
     _download_cytebase_fixtures(target, force=force)
-    _download_external_fixtures(target, force=force)
 
 
 def build_mtx_dir_fixture() -> None:

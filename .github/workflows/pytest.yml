@@ -33,6 +33,56 @@ on:
       - "profiling/BENCHMARKS.md"
 
 jobs:
+  quality:
+    runs-on: ubuntu-26.04
+    env:
+      HNSWLIB_NO_NATIVE: "1"
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+    - name: Install system build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential libfftw3-dev libmetis-dev
+    - name: Install uv
+      uses: astral-sh/setup-uv@v9.0.0
+      with:
+        python-version: "3.12"
+    - name: Install dependencies
+      run: uv sync --group dev --group profiling --extra test --extra extra --extra agent
+    - name: Lint and check formatting
+      run: |
+        uv run ruff check scarf profiling tests
+        uv run ruff format --check scarf profiling tests
+    - name: Type check
+      run: uv run mypy scarf profiling
+
+  visual:
+    runs-on: ubuntu-26.04
+    env:
+      HNSWLIB_NO_NATIVE: "1"
+      MPLBACKEND: Agg
+      SCARF_RUN_VISUAL_REGRESSION: "1"
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+    - name: Install system build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential libfftw3-dev libmetis-dev
+    - name: Install uv
+      uses: astral-sh/setup-uv@v9.0.0
+      with:
+        python-version: "3.12"
+    - name: Install dependencies
+      run: uv sync --group profiling --extra test --extra extra --extra agent
+    - name: Download test fixtures
+      run: uv run python -m tests.download_fixtures --with-h5ad
+    - name: Compare publication plotting references
+      run: uv run pytest -n 0 -m visual tests/test_plotting_showcase.py
+
   test:
     runs-on: ubuntu-26.04
     env:
@@ -65,14 +115,6 @@ jobs:
       run: |
         uv venv --python "${{ matrix.python-version }}"
         uv pip install --resolution lowest-direct -e ".[test,extra,agent]" --group profiling
-    - name: Lint and check formatting
-      if: matrix.resolution == 'locked' && matrix.python-version == '3.12'
-      run: |
-        uv run ruff check scarf profiling tests
-        uv run ruff format --check scarf profiling tests
-    - name: Type check
-      if: matrix.resolution == 'locked' && matrix.python-version == '3.12'
-      run: uv run mypy scarf profiling
     - name: Download test fixtures
       run: |
         if [ "${{ matrix.resolution }}" = "lowest-direct" ]; then
@@ -80,29 +122,25 @@ jobs:
         else
           uv run python -m tests.download_fixtures --with-h5ad
         fi
+    - name: Report runner CPU capacity
+      run: |
+        echo "available_cpu_count=$(nproc)"
+        echo "installed_cpu_count=$(nproc --all)"
     - name: Test with pytest (parallel)
       run: |
         if [ "${{ matrix.resolution }}" = "lowest-direct" ]; then
           uv run --no-sync pytest \
-            -n auto \
-            --dist loadfile \
+            --durations=25 \
             --cov=scarf \
             --cov-report=xml \
             --cov-report=term
         else
           uv run pytest \
-            -n auto \
-            --dist loadfile \
+            --durations=25 \
             --cov=scarf \
             --cov-report=xml \
             --cov-report=term
         fi
-    - name: Compare publication plotting references
-      if: matrix.resolution == 'locked' && matrix.python-version == '3.12'
-      env:
-        MPLBACKEND: Agg
-        SCARF_RUN_VISUAL_REGRESSION: "1"
-      run: uv run pytest -n 0 -m visual tests/test_plotting_showcase.py
     - name: Build and smoke-test wheel
       if: matrix.resolution == 'locked' && matrix.python-version == '3.14'
       run: |
