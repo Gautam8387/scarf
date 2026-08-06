@@ -1,6 +1,7 @@
 import shutil
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
@@ -11,13 +12,29 @@ from zarr.storage import MemoryStore
 
 from scarf.datastore.datastore import DataStore
 from scarf.datastore.graph_datastore import GraphDataStore
-from scarf.storage.artifacts import ArtifactRef, artifact_path, list_artifacts
+from scarf.storage.artifacts import (
+    ArtifactRef,
+    artifact_path,
+    list_artifacts,
+    make_provenance,
+    new_artifact_id,
+)
 
 
 class _MemoryGraphStore(GraphDataStore):
     @property
     def assay_names(self) -> list[str]:
         return self._assay_names
+
+
+class _CoordinateBlocks:
+    data = None
+
+    def __init__(self, blocks: list[np.ndarray]) -> None:
+        self.blocks = blocks
+
+    def iter_coordinate_blocks(self, _message: str):
+        yield from self.blocks
 
 
 @pytest.fixture
@@ -74,6 +91,40 @@ def _add_test_graph(store: _MemoryGraphStore, label: str = "graph") -> str:
         data=np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6]),
     )
     return graph_loc
+
+
+def _add_complete_artifact(
+    store: _MemoryGraphStore,
+    kind: str,
+    *,
+    assay: str | None = "RNA",
+    inputs: dict[str, object] | None = None,
+    parameters: dict[str, object] | None = None,
+    arrays: dict[str, np.ndarray] | None = None,
+) -> ArtifactRef:
+    ref = ArtifactRef(
+        scope="assay" if assay is not None else "datastore",
+        assay=assay,
+        kind=kind,
+        artifact_id=new_artifact_id(),
+    )
+    group = store.zw.create_group(artifact_path(ref))
+    group.attrs.update(
+        {
+            "artifact_id": ref.artifact_id,
+            "kind": kind,
+            "provenance": make_provenance(
+                operation=f"test_{kind}",
+                parameters=parameters or {},
+                inputs=inputs or {},
+            ),
+            "execution_options": {},
+            "complete": True,
+        }
+    )
+    for name, values in (arrays or {}).items():
+        group.create_array(name, data=values)
+    return ref
 
 
 @pytest.mark.parametrize(
@@ -897,9 +948,577 @@ def test_integrate_assays_validation_errors() -> None:
             method="wnn",
         )
 
+    with pytest.raises(TypeError, match="l2_normalize must be a boolean"):
+        store.integrate_assays(
+            assays=["RNA", "ADT"],
+            label="invalid",
+            method="wnn",
+            l2_normalize="yes",
+        )
+
     with pytest.raises(ValueError, match="Method unknown not supported"):
         store.integrate_assays(
             assays=["RNA", "ADT"],
             label="invalid",
             method="unknown",
         )
+
+
+@pytest.mark.parametrize(
+    ("selection", "message"),
+    [
+        ({"from_assay": "ADT"}, "from_assay does not match"),
+        ({"cell_key": "subset"}, "cell_key does not match"),
+        ({"feat_key": "variable"}, "feat_key does not match"),
+    ],
+)
+def test_load_graph_rejects_explicit_artifact_selection_mismatches(
+    monkeypatch: pytest.MonkeyPatch,
+    selection: dict[str, str],
+    message: str,
+) -> None:
+    store = _memory_graph_store()
+    graph = _add_complete_artifact(store, "connectivity_map")
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.stored_assay_graph_from_ref",
+        Mock(
+            return_value=SimpleNamespace(
+                from_assay="RNA",
+                cell_key="I",
+                feat_key="I",
+            )
+        ),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        store.load_graph(
+            graph_loc=artifact_path(graph),
+            **selection,
+        )
+
+
+def test_integrated_graph_index_rejects_corrupt_entries() -> None:
+    store = _memory_graph_store()
+    index = store.zw.create_group("integratedGraphs")
+
+    index.attrs["artifacts"] = []
+    with pytest.raises(RuntimeError, match="artifact index is invalid"):
+        store._resolve_integrated_graph_path("joint")
+
+    index.attrs["artifacts"] = {"joint": "not-a-reference"}
+    with pytest.raises(RuntimeError, match="index for 'joint' is invalid"):
+        store._resolve_integrated_graph_path("joint")
+
+    missing = ArtifactRef(
+        scope="datastore",
+        kind="integrated_graph",
+        artifact_id="8" * 64,
+    )
+    index.attrs["artifacts"] = {"joint": missing.to_dict()}
+    with pytest.raises(RuntimeError, match="index for 'joint' is incomplete"):
+        store._resolve_integrated_graph_path("joint")
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("invalid_index", "ANN query returned an invalid cell index"),
+        ("short_stream", "Coordinate source contains 2 rows, expected 3"),
+    ],
+)
+def test_query_neighbors_guards_ann_indices_and_coordinate_row_count(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    message: str,
+) -> None:
+    store = _memory_graph_store()
+    coordinates = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="reduction",
+        artifact_id="9" * 64,
+    )
+    ann = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="ann_index",
+        artifact_id="a" * 64,
+    )
+    result = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="neighbors",
+        artifact_id="b" * 64,
+    )
+    blocks = [
+        np.zeros(
+            (3 if failure == "invalid_index" else 2, 2),
+            dtype=np.float32,
+        )
+    ]
+    store._coordinate_source = Mock(return_value=(_CoordinateBlocks(blocks), 3, 2))
+
+    def require(ref, _kind, **_kwargs):
+        if ref == ann:
+            return SimpleNamespace(
+                inputs={"coordinates": coordinates.to_dict()},
+                parameters={
+                    "ann_metric": "l2",
+                    "ann_ef": 50,
+                    "parallel_threads": 1,
+                },
+                path="ann",
+            )
+        return SimpleNamespace(inputs={}, parameters={}, path="coordinates")
+
+    store._require_complete_artifact = Mock(side_effect=require)
+    store._plan_assay_artifact = Mock(
+        return_value=SimpleNamespace(ref=result, reused=False)
+    )
+    store._resolve_ann_index = Mock(return_value=object())
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.AnnIndexStage.configure",
+        Mock(return_value=object()),
+    )
+
+    class InvalidQuery:
+        def __init__(self, *_args):
+            pass
+
+        def query(self, block, *, self_indices):
+            if failure == "invalid_index":
+                indices = np.full((len(block), 1), 3, dtype=np.int64)
+            else:
+                indices = ((self_indices + 1) % 3).reshape(-1, 1)
+            return (
+                indices,
+                np.zeros((len(block), 1), dtype=np.float32),
+                0,
+            )
+
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.NeighborQueryStage",
+        InvalidQuery,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        store.query_neighbors(
+            ann,
+            k=1,
+            update_state=False,
+        )
+
+
+def test_reused_graph_stages_skip_expensive_compute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _memory_graph_store()
+    coordinates = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="reduction",
+        artifact_id="c" * 64,
+    )
+    ann = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="ann_index",
+        artifact_id="d" * 64,
+    )
+    neighbors = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="neighbors",
+        artifact_id="e" * 64,
+    )
+    connectivity = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="connectivity_map",
+        artifact_id="f" * 64,
+    )
+    coordinate_source = _CoordinateBlocks([np.zeros((3, 2), dtype=np.float32)])
+    store._coordinate_source = Mock(return_value=(coordinate_source, 3, 2))
+    store._publish_current_artifact = Mock()
+    fit_ann = Mock(side_effect=AssertionError("ANN fit must be skipped"))
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.AnnIndexStage.fit",
+        fit_ann,
+    )
+
+    store._plan_assay_artifact = Mock(
+        return_value=SimpleNamespace(ref=ann, reused=True)
+    )
+    assert (
+        store.build_ann_index(
+            coordinates,
+            update_state=False,
+        )
+        == ann
+    )
+    fit_ann.assert_not_called()
+
+    store._require_complete_artifact = Mock(
+        return_value=SimpleNamespace(
+            inputs={"coordinates": coordinates.to_dict()},
+            parameters={"ann_metric": "l2"},
+            path="ann",
+        )
+    )
+    store._plan_assay_artifact = Mock(
+        return_value=SimpleNamespace(ref=neighbors, reused=True)
+    )
+    store._resolve_ann_index = Mock(
+        side_effect=AssertionError("ANN index must not be loaded")
+    )
+    assert (
+        store.query_neighbors(
+            ann,
+            k=2,
+            update_state=False,
+        )
+        == neighbors
+    )
+    store._resolve_ann_index.assert_not_called()
+
+    neighbor_path = "neighbor_source"
+    neighbor_group = store.zw.create_group(neighbor_path)
+    neighbor_group.create_array(
+        "indices",
+        data=np.array([[1, 2], [0, 2], [0, 1]], dtype=np.uint32),
+    )
+    store._require_complete_artifact = Mock(
+        return_value=SimpleNamespace(path=neighbor_path)
+    )
+    store._plan_assay_artifact = Mock(
+        return_value=SimpleNamespace(ref=connectivity, reused=True)
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.validate_distance_provenance",
+        Mock(),
+    )
+    build_connectivity = Mock(
+        side_effect=AssertionError("connectivity build must be skipped")
+    )
+    monkeypatch.setattr(
+        "scarf.neighbors.graph.build_connectivity_arrays",
+        build_connectivity,
+    )
+
+    assert (
+        store.build_connectivity_map(
+            neighbors,
+            update_state=False,
+        )
+        == connectivity
+    )
+    build_connectivity.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("missing_link", "Neighbors artifact has no coordinates input"),
+        ("non_matrix", "WNN coordinate blocks must be matrices"),
+        ("short_stream", "WNN coordinate stream did not cover every cell"),
+        (
+            "neighbor_count",
+            "WNN neighbors and coordinates for RNA contain different cell counts",
+        ),
+    ],
+)
+def test_wnn_input_helpers_fail_before_integration_compute(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    message: str,
+) -> None:
+    store = _memory_graph_store(["RNA", "ADT"])
+    selection = _add_complete_artifact(
+        store,
+        "cell_selection",
+        assay=None,
+    )
+    states = {}
+    for assay in ("RNA", "ADT"):
+        normalized = _add_complete_artifact(store, "normalized", assay=assay)
+        coordinates = _add_complete_artifact(store, "reduction", assay=assay)
+        inputs = (
+            {}
+            if failure == "missing_link" and assay == "RNA"
+            else {"coordinates": coordinates}
+        )
+        indices = np.array([[1], [0]], dtype=np.uint32)
+        if failure != "neighbor_count":
+            indices = np.array([[1], [2], [0]], dtype=np.uint32)
+        neighbors = _add_complete_artifact(
+            store,
+            "neighbors",
+            assay=assay,
+            inputs=inputs,
+            arrays={"indices": indices},
+        )
+        states[assay] = SimpleNamespace(
+            normalized=normalized,
+            neighbors=neighbors,
+            connectivity_map=None,
+            cell_key="I",
+            feat_key="I",
+        )
+
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.read_assay_state",
+        lambda _root, assay: states[assay],
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.validate_neighbors_artifact_selection",
+        Mock(),
+    )
+    store._artifact_input_ref = Mock(return_value=selection)
+    store._selection_artifacts_match = Mock(return_value=True)
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.column_display",
+        Mock(return_value=None),
+    )
+    integrated = ArtifactRef(
+        scope="datastore",
+        kind="integrated_graph",
+        artifact_id="0" * 64,
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.plan_artifact",
+        Mock(return_value=SimpleNamespace(ref=integrated, reused=False)),
+    )
+
+    if failure == "non_matrix":
+        blocks = [np.zeros(3, dtype=np.float32)]
+    elif failure == "short_stream":
+        blocks = [np.zeros((2, 2), dtype=np.float32)]
+    else:
+        blocks = [np.zeros((3, 2), dtype=np.float32)]
+    store._coordinate_source = Mock(return_value=(_CoordinateBlocks(blocks), 3, 2))
+    integrate = Mock(side_effect=AssertionError("WNN integration must not run"))
+    monkeypatch.setattr(
+        "scarf.neighbors.integration._wnn_integration_many",
+        integrate,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        store.integrate_assays(
+            ["RNA", "ADT"],
+            label="invalid_wnn",
+            method="wnn",
+        )
+    integrate.assert_not_called()
+
+
+def test_artifact_ann_stream_fails_closed_on_incomplete_links(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _memory_graph_store()
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.read_assay_state",
+        Mock(return_value=None),
+    )
+    assert store._load_artifact_ann_stream("RNA", "I", "I", True) is None
+
+    incomplete_state = SimpleNamespace(
+        matches=Mock(return_value=True),
+        normalized=None,
+        feature_scaling=None,
+        reduction=None,
+        ann_index=None,
+        neighbors=None,
+        batch_correction=None,
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.read_assay_state",
+        Mock(return_value=incomplete_state),
+    )
+    with pytest.raises(KeyError, match="no complete ANN stream"):
+        store._load_artifact_ann_stream("RNA", "I", "I", True)
+
+    neighbors = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="neighbors",
+        artifact_id="1" * 64,
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.inspect_artifact",
+        Mock(return_value=SimpleNamespace(inputs={})),
+    )
+    with pytest.raises(ValueError, match="has no 'ann_index' artifact input"):
+        store._load_artifact_ann_stream(
+            "RNA",
+            "I",
+            "I",
+            True,
+            neighbors_ref=neighbors,
+        )
+
+    ann = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="ann_index",
+        artifact_id="2" * 64,
+    )
+    imported = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="imported_coordinates",
+        artifact_id="3" * 64,
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.inspect_artifact",
+        Mock(
+            return_value=SimpleNamespace(
+                inputs={
+                    "ann_index": ann.to_dict(),
+                    "coordinates": imported.to_dict(),
+                }
+            )
+        ),
+    )
+    with pytest.raises(ValueError, match="Unsupported neighbor coordinate artifact"):
+        store._load_artifact_ann_stream(
+            "RNA",
+            "I",
+            "I",
+            True,
+            neighbors_ref=neighbors,
+        )
+
+
+def test_latest_knn_state_and_ann_storage_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _memory_graph_store(["RNA"])
+    state = SimpleNamespace(neighbors=None)
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.read_assay_state",
+        Mock(return_value=state),
+    )
+    with pytest.raises(RuntimeError, match="no neighbors artifact"):
+        store._get_latest_knn_loc("RNA")
+
+    neighbors = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="neighbors",
+        artifact_id="4" * 64,
+    )
+    state.neighbors = neighbors
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.inspect_artifact",
+        Mock(return_value=SimpleNamespace(exists=False, complete=False)),
+    )
+    with pytest.raises(RuntimeError, match="incomplete neighbors"):
+        store._get_latest_knn_loc("RNA")
+
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.legacy_ann_index_path",
+        Mock(return_value=None),
+    )
+    assert store._resolve_ann_index("missing_ann", "l2", 2) is None
+
+    save_index = Mock()
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.save_ann_index",
+        save_index,
+    )
+    store.zarr_mode = "r"
+    store._persist_ann_index(
+        "read_only_ann",
+        object(),
+        ann_metric="l2",
+        dimensions=2,
+        element_count=3,
+    )
+    save_index.assert_not_called()
+
+    store.zarr_mode = "r+"
+    store._persist_ann_index(
+        "writable_ann",
+        object(),
+        ann_metric="l2",
+        dimensions=2,
+        element_count=3,
+    )
+    assert "writable_ann" in store.zw
+    save_index.assert_called_once()
+
+
+def test_norm_statistics_populates_a_fully_empty_cache() -> None:
+    store = _memory_graph_store()
+    store.zw.create_group("stats")
+    data = Mock()
+    data.mean_and_std.return_value = (
+        np.asarray([2.0, np.nan]),
+        np.asarray([3.0, 0.0]),
+    )
+
+    mean, scale = store._load_or_compute_norm_stats("stats", data, "pca")
+
+    np.testing.assert_allclose(mean, [2.0, 0.0])
+    np.testing.assert_allclose(scale, [3.0, 1.0])
+    np.testing.assert_allclose(store.zw["stats/mu"][:], mean)
+    np.testing.assert_allclose(store.zw["stats/sigma"][:], scale)
+
+
+def test_normalized_local_cache_cleans_up_after_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _memory_graph_store()
+    store.zarr_loc = "remote"
+    store.resources = None
+    normalized = _add_complete_artifact(
+        store,
+        "normalized",
+        arrays={"data": np.arange(6, dtype=np.float32).reshape(3, 2)},
+    )
+
+    existing = object()
+    store._normalizedArtifactCache = {normalized: existing}
+    store._resolve_local_cache_plan = Mock(
+        side_effect=AssertionError("an existing cache must be reused")
+    )
+    with store._cache_normalized_artifact(normalized, True, 2):
+        assert store._normalizedArtifactCache[normalized] is existing
+
+    store._normalizedArtifactCache = {}
+    store._resolve_local_cache_plan = Mock(return_value=(True, None, False))
+    with pytest.raises(RuntimeError, match="Local cache path is missing"):
+        with store._cache_normalized_artifact(normalized, True, 2):
+            pass
+
+    cache_base = tmp_path / "normalized_cache"
+    cache_base.mkdir()
+    staged_root = zarr.open_group(store=MemoryStore(), mode="w")
+    staged = staged_root.create_array(
+        "data",
+        shape=(3, 2),
+        dtype=np.float32,
+        chunks=(2, 2),
+    )
+    store._resolve_local_cache_plan = Mock(return_value=(True, str(cache_base), True))
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.create_or_open_staged_normed_array",
+        Mock(return_value=staged),
+    )
+
+    def copy_array(source, target, **_kwargs):
+        target[:, :] = source[:, :]
+
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.copy_zarr_array",
+        copy_array,
+    )
+
+    with pytest.raises(RuntimeError, match="downstream failure"):
+        with store._cache_normalized_artifact(normalized, True, 2):
+            assert normalized in store._normalizedArtifactCache
+            raise RuntimeError("downstream failure")
+
+    assert normalized not in store._normalizedArtifactCache
+    assert not cache_base.exists()

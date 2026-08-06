@@ -2,6 +2,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from scarf.features.genomic.intervals import (
+    binary_search,
+    create_bed_from_coord_ids,
+    get_feature_mappings,
+)
 from scarf.features.scoring import binned_sampling
 from scarf.features.variability import fit_lowess, select_highly_variable_features
 from scarf.quality_control.hto import (
@@ -643,3 +648,60 @@ def test_hto_demux_rejects_too_few_cells():
     )
     with pytest.raises(ValueError, match="at least 3 selected cells"):
         hto_demux(hto_counts)
+
+
+def test_interval_search_uses_half_open_overlap_boundaries():
+    ranges = np.array([[0, 10], [20, 30], [30, 40]], dtype=np.int64)
+    queries = np.array(
+        [
+            [10, 20],
+            [9, 21],
+            [30, 30],
+            [29, 31],
+        ],
+        dtype=np.int64,
+    )
+
+    np.testing.assert_array_equal(
+        binary_search(ranges, queries),
+        np.array(
+            [
+                [-1, -1],
+                [0, 2],
+                [-1, -1],
+                [1, 3],
+            ]
+        ),
+    )
+
+
+def test_feature_mapping_preserves_half_open_interval_edges():
+    peaks = create_bed_from_coord_ids(["chr1:100-200", "chr1:200-300"])
+    features = pd.DataFrame(
+        [
+            ("chr1", 0, 100, "before", "Before", "+"),
+            ("chr1", 100, 200, "first", "First", "+"),
+            ("chr1", 199, 201, "bridge", "Bridge", "+"),
+        ]
+    )
+
+    feature_ids, _, mapping = get_feature_mappings(peaks, features)
+
+    assert feature_ids.tolist() == ["before", "first", "bridge"]
+    np.testing.assert_array_equal(
+        mapping.toarray(),
+        np.array(
+            [
+                [0.0, 1.0, 1.0],
+                [0.0, 0.0, 1.0],
+            ]
+        ),
+    )
+
+
+def test_feature_mapping_rejects_empty_feature_table():
+    peaks = create_bed_from_coord_ids(["chr1:100-200"])
+    features = pd.DataFrame(columns=range(6))
+
+    with pytest.raises(ValueError, match="None of the features were found"):
+        get_feature_mappings(peaks, features)

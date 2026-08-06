@@ -99,6 +99,280 @@ def test_inspect_and_stream_canonical_mixed_compression(
     np.testing.assert_array_equal(observed, expected)
 
 
+@pytest.mark.parametrize(
+    ("matrix_compressed", "features_compressed", "barcodes_compressed"),
+    [
+        (False, False, False),
+        (False, False, True),
+        (False, True, False),
+        (False, True, True),
+        (True, False, False),
+        (True, False, True),
+        (True, True, False),
+        (True, True, True),
+    ],
+)
+def test_directory_triplet_supports_independent_compression(
+    tmp_path: Path,
+    matrix_compressed: bool,
+    features_compressed: bool,
+    barcodes_compressed: bool,
+) -> None:
+    matrix_name = "matrix.mtx.gz" if matrix_compressed else "matrix.mtx"
+    _write_mex(
+        tmp_path,
+        [(1, 1, 7), (2, 2, 9)],
+        n_features=2,
+        n_cells=2,
+        matrix_name=matrix_name,
+    )
+    for name, compressed in (
+        ("features.tsv", features_compressed),
+        ("barcodes.tsv", barcodes_compressed),
+    ):
+        if not compressed:
+            continue
+        plain_path = tmp_path / name
+        contents = plain_path.read_text()
+        plain_path.unlink()
+        _write_text(tmp_path / f"{name}.gz", contents)
+
+    candidate = inspect_mtx(tmp_path)[0]
+    assert candidate.matrixPath.endswith(".gz") is matrix_compressed
+    assert candidate.featurePath.endswith(".gz") is features_compressed
+    assert candidate.cellPath.endswith(".gz") is barcodes_compressed
+    reader = MtxReader(candidate)
+    try:
+        observed = np.vstack([batch.toarray() for batch in reader.consume(1)])
+    finally:
+        reader.close()
+    np.testing.assert_array_equal(observed, [[7, 0], [0, 9]])
+
+
+def test_explicit_custom_triplet_paths_and_constructor_validation(
+    tmp_path: Path,
+) -> None:
+    _write_mex(
+        tmp_path,
+        [(1, 1, 4), (2, 1, 3), (2, 2, 5)],
+        n_features=2,
+        n_cells=2,
+        matrix_name="quantification.mtx.gz",
+    )
+    feature_path = tmp_path / "measurements.txt"
+    (tmp_path / "features.tsv").replace(feature_path)
+    cell_path = tmp_path / "observations.txt.gz"
+    cell_contents = (tmp_path / "barcodes.tsv").read_text()
+    (tmp_path / "barcodes.tsv").unlink()
+    _write_text(cell_path, cell_contents)
+    matrix_path = tmp_path / "quantification.mtx.gz"
+
+    with pytest.raises(ValueError, match="requires feature_path and cell_path"):
+        MtxReader(str(matrix_path))
+
+    reader = MtxReader(
+        str(matrix_path),
+        str(feature_path),
+        str(cell_path),
+        dtype=np.uint16,
+    )
+    try:
+        observed = np.vstack([batch.toarray() for batch in reader.consume(1)])
+        assert reader.matrix_dtype == np.dtype(np.uint16)
+        assert reader.feature_names() == ["gene-0", "gene-1"]
+        assert reader.cell_names() == ["cell-0", "cell-1"]
+    finally:
+        reader.close()
+    np.testing.assert_array_equal(
+        observed,
+        np.array([[4, 3], [0, 5]], dtype=np.uint16),
+    )
+
+
+def test_directory_discovery_is_sorted_and_direct_file_is_selected(
+    tmp_path: Path,
+) -> None:
+    _write_mex(tmp_path, [(1, 1, 1)], n_features=1, n_cells=1)
+    _write_mex(
+        tmp_path,
+        [(1, 1, 2)],
+        n_features=1,
+        n_cells=1,
+        matrix_name="sample_matrix.mtx",
+        prefix="sample_",
+    )
+    _write_text(
+        tmp_path / "orphan_matrix.mtx",
+        "%%MatrixMarket matrix coordinate integer general\n1 1 0\n",
+    )
+
+    candidates = inspect_mtx(tmp_path)
+    assert [Path(candidate.matrixPath).name for candidate in candidates] == [
+        "matrix.mtx",
+        "sample_matrix.mtx",
+    ]
+
+    selected = inspect_mtx(tmp_path / "sample_matrix.mtx")
+    assert len(selected) == 1
+    assert Path(selected[0].featurePath).name == "sample_features.tsv"
+    assert selected[0].source == str(tmp_path / "sample_matrix.mtx")
+
+
+def test_archive_discovers_nested_compressed_prefixed_members_and_cleans_up(
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "provider.zip"
+    matrix = "%%MatrixMarket matrix coordinate integer general\n2 2 2\n1 1 3\n2 2 4\n"
+    with zipfile.ZipFile(archive_path, mode="w") as archive:
+        archive.writestr(
+            "bundle/sample_matrix.mtx.gz",
+            gzip.compress(matrix.encode()),
+        )
+        archive.writestr(
+            "bundle/sample_genes.tsv.gz",
+            gzip.compress(b"feature-0\tGene 0\nfeature-1\tGene 1\n"),
+        )
+        archive.writestr(
+            "bundle/sample_barcodes.tsv",
+            "cell-0\ncell-1\n",
+        )
+        archive.writestr(
+            "orphan_matrix.mtx",
+            "%%MatrixMarket matrix coordinate integer general\n1 1 0\n",
+        )
+        archive.writestr("features.tsv", "orphan\n")
+
+    candidates = inspect_mtx(archive_path)
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.matrixPath == "bundle/sample_matrix.mtx.gz"
+    assert candidate.featurePath == "bundle/sample_genes.tsv.gz"
+    assert candidate.cellPath == "bundle/sample_barcodes.tsv"
+    assert candidate.archivePath == str(archive_path)
+
+    reader = MtxReader(candidate, temp_dir=str(tmp_path))
+    assert list(tmp_path.glob("scarf-mtx-archive-*"))
+    try:
+        observed = np.vstack([batch.toarray() for batch in reader.consume(1)])
+    finally:
+        reader.close()
+    np.testing.assert_array_equal(observed, [[3, 0], [0, 4]])
+    assert not list(tmp_path.glob("scarf-mtx-archive-*"))
+
+
+@pytest.mark.parametrize(
+    ("sidecar_name", "contents", "expected_names"),
+    [
+        ("features.tsv", "feature-0\nfeature-1\n", ["feature-0", "feature-1"]),
+        (
+            "genes.tsv.gz",
+            "feature-0\tGene zero\nfeature-1\tGene one\n",
+            ["Gene zero", "Gene one"],
+        ),
+        ("peaks.bed.gz", "peak-0\npeak-1\n", ["peak-0", "peak-1"]),
+    ],
+)
+def test_feature_sidecar_suffix_and_column_fallbacks(
+    tmp_path: Path,
+    sidecar_name: str,
+    contents: str,
+    expected_names: list[str],
+) -> None:
+    _write_mex(
+        tmp_path,
+        [(1, 1, 1), (2, 1, 2)],
+        n_features=2,
+        n_cells=1,
+    )
+    original = tmp_path / "features.tsv"
+    if sidecar_name != original.name:
+        original.unlink()
+    _write_text(tmp_path / sidecar_name, contents)
+
+    candidate = inspect_mtx(tmp_path)[0]
+    assert Path(candidate.featurePath).name == sidecar_name
+    reader = MtxReader(candidate)
+    try:
+        assert reader.feature_names() == expected_names
+        assert reader.feature_types() == ["Gene Expression", "Gene Expression"]
+    finally:
+        reader.close()
+
+
+def test_parse_modern_compressed_names_and_feature_name_fallback(
+    tmp_path: Path,
+) -> None:
+    _write_text(
+        tmp_path / "count_matrix.mtx.gz",
+        "%%MatrixMarket matrix coordinate integer general\n2 2 2\n1 1 2\n2 2 3\n",
+    )
+    _write_text(
+        tmp_path / "all_genes.csv.gz",
+        "feature_id\nfeature-0\nfeature-1\n",
+    )
+    _write_text(
+        tmp_path / "cell_metadata.csv.gz",
+        "bc_index,donor\ncell-0,A\ncell-1,B\n",
+    )
+
+    candidate = inspect_mtx(tmp_path)[0]
+    assert candidate.matrixOrientation == "cellsByFeatures"
+    assert Path(candidate.featurePath).name == "all_genes.csv.gz"
+    assert Path(candidate.cellPath).name == "cell_metadata.csv.gz"
+    assert candidate.cellIdKeys == ("bc_index",)
+
+    reader = MtxReader(candidate)
+    try:
+        assert reader.feature_ids() == ["feature-0", "feature-1"]
+        assert reader.feature_names() == ["feature-0", "feature-1"]
+        assert reader.feature_types() == ["Gene Expression", "Gene Expression"]
+        np.testing.assert_array_equal(
+            dict(reader.get_cell_columns())["donor"],
+            ["A", "B"],
+        )
+    finally:
+        reader.close()
+
+
+def test_cells_by_features_real_counts_zero_based_indices_and_dtype(
+    tmp_path: Path,
+) -> None:
+    _write_mex(tmp_path, [], n_features=2, n_cells=3)
+    _write_text(
+        tmp_path / "matrix.mtx",
+        "%%MatrixMarket matrix coordinate real general\n"
+        "% zero-based fixture\n"
+        "3 2 3\n"
+        "0 0 1.0\n"
+        "1 1 2.0\n"
+        "2 0 3.0\n",
+    )
+    candidate = inspect_mtx(tmp_path)[0]
+    assert candidate.matrixOrientation == "cellsByFeatures"
+
+    with pytest.raises(ValueError, match="outside the declared dimensions"):
+        MtxReader(candidate)
+    with pytest.raises(TypeError, match="must be an integer dtype"):
+        MtxReader(candidate, index_offset=0, dtype=np.float32)
+
+    reader = MtxReader(candidate, index_offset=0, dtype=np.uint16)
+    try:
+        batches = list(reader.consume(2, lines_in_mem=1))
+        widened = list(reader.consume(3, lines_in_mem=2, dtype=np.uint64))
+    finally:
+        reader.close()
+    assert all(batch.dtype == np.dtype(np.uint16) for batch in batches)
+    assert widened[0].dtype == np.dtype(np.uint64)
+    np.testing.assert_array_equal(
+        np.vstack([batch.toarray() for batch in batches]),
+        [[1, 0], [0, 2], [3, 0]],
+    )
+    np.testing.assert_array_equal(
+        widened[0].toarray(),
+        [[1, 0], [0, 2], [3, 0]],
+    )
+
+
 def test_filtered_cell_major_stream_does_not_prescan_matrix(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -383,6 +657,175 @@ def test_direct_mex_zip_and_archive_safety(tmp_path: Path) -> None:
             archive.writestr("matrix.mtx", "two")
     with pytest.raises(ValueError, match="Duplicate"):
         inspect_mtx(duplicate)
+
+
+@pytest.mark.parametrize("archive_source", [False, True], ids=["directory", "archive"])
+@pytest.mark.parametrize("missing_name", ["matrix.mtx", "features.tsv", "barcodes.tsv"])
+def test_inspection_rejects_each_missing_triplet_member(
+    tmp_path: Path,
+    archive_source: bool,
+    missing_name: str,
+) -> None:
+    members = {
+        "matrix.mtx": ("%%MatrixMarket matrix coordinate integer general\n1 1 0\n"),
+        "features.tsv": "feature-0\n",
+        "barcodes.tsv": "cell-0\n",
+    }
+    members.pop(missing_name)
+    if archive_source:
+        source = tmp_path / "incomplete.zip"
+        with zipfile.ZipFile(source, mode="w") as archive:
+            for name, contents in members.items():
+                archive.writestr(name, contents)
+    else:
+        source = tmp_path
+        for name, contents in members.items():
+            _write_text(tmp_path / name, contents)
+
+    with pytest.raises(ValueError, match="No complete Matrix Market"):
+        inspect_mtx(source)
+
+
+def test_archive_missing_selected_member_cleans_partial_extraction(
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "changed.zip"
+    _write_zip_mex(archive_path)
+    candidate = inspect_mtx(archive_path)[0]
+
+    with zipfile.ZipFile(archive_path, mode="w") as archive:
+        archive.writestr(
+            candidate.matrixPath,
+            "%%MatrixMarket matrix coordinate integer general\n2 2 2\n1 1 1\n2 2 2\n",
+        )
+        archive.writestr(candidate.cellPath, "cell-0\ncell-1\n")
+
+    with pytest.raises(ValueError, match="missing selected members"):
+        MtxReader(candidate, temp_dir=str(tmp_path))
+    assert not list(tmp_path.glob("scarf-mtx-archive-*"))
+
+
+@pytest.mark.parametrize(
+    ("matrix_text", "message"),
+    [
+        (
+            "not a Matrix Market banner\n1 1 0\n",
+            "coordinate matrix format",
+        ),
+        (
+            "%%MatrixMarket matrix array integer general\n1 1 0\n",
+            "coordinate matrix format",
+        ),
+        (
+            "%%MatrixMarket matrix coordinate complex general\n1 1 0\n",
+            "integer or real coordinate values",
+        ),
+        (
+            "%%MatrixMarket matrix coordinate integer symmetric\n1 1 0\n",
+            "general symmetry",
+        ),
+        (
+            "%%MatrixMarket matrix coordinate integer general\n",
+            "dimensions line must contain three integers",
+        ),
+        (
+            "%%MatrixMarket matrix coordinate integer general\none 1 0\n",
+            "dimensions line must contain three integers",
+        ),
+        (
+            "%%MatrixMarket matrix coordinate integer general\n-1 1 0\n",
+            "dimensions cannot be negative",
+        ),
+    ],
+)
+def test_malformed_matrix_market_headers_are_rejected(
+    tmp_path: Path,
+    matrix_text: str,
+    message: str,
+) -> None:
+    _write_mex(tmp_path, [], n_features=1, n_cells=1)
+    _write_text(tmp_path / "matrix.mtx", matrix_text)
+
+    with pytest.raises(ValueError, match=message):
+        inspect_mtx(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "coordinate", "message"),
+    [
+        ("integer", "1 1", "Could not parse Matrix Market coordinates"),
+        ("integer", "axis 1 1", "Could not parse Matrix Market coordinates"),
+        ("integer", "1 1 1.5", "Could not parse Matrix Market coordinates"),
+        ("integer", "2 1 1", "outside the declared dimensions"),
+        ("integer", "1 2 1", "outside the declared dimensions"),
+        ("real", "1 1 1.5", "finite non-negative integers"),
+        ("real", "1 1 nan", "finite non-negative integers"),
+        ("real", "1 1 inf", "finite non-negative integers"),
+    ],
+)
+def test_malformed_matrix_market_counts_and_indices_are_rejected(
+    tmp_path: Path,
+    field: str,
+    coordinate: str,
+    message: str,
+) -> None:
+    _write_mex(tmp_path, [], n_features=1, n_cells=1)
+    _write_text(
+        tmp_path / "matrix.mtx",
+        f"%%MatrixMarket matrix coordinate {field} general\n1 1 1\n{coordinate}\n",
+    )
+    candidate = inspect_mtx(tmp_path)[0]
+
+    with pytest.raises(ValueError, match=message):
+        MtxReader(candidate)
+
+
+@pytest.mark.parametrize(
+    ("declared_entries", "coordinates", "observed_entries"),
+    [
+        (2, "1 1 1\n", 1),
+        (1, "1 1 1\n1 1 2\n", 2),
+    ],
+)
+def test_matrix_market_coordinate_count_must_match_header(
+    tmp_path: Path,
+    declared_entries: int,
+    coordinates: str,
+    observed_entries: int,
+) -> None:
+    _write_mex(tmp_path, [], n_features=1, n_cells=1)
+    _write_text(
+        tmp_path / "matrix.mtx",
+        "%%MatrixMarket matrix coordinate integer general\n"
+        f"1 1 {declared_entries}\n"
+        f"{coordinates}",
+    )
+    candidate = inspect_mtx(tmp_path)[0]
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            f"header declares {declared_entries} entries, "
+            f"but {observed_entries} were read"
+        ),
+    ):
+        MtxReader(candidate)
+
+
+def test_duplicate_cell_ids_are_rejected_after_dimension_validation(
+    tmp_path: Path,
+) -> None:
+    _write_mex(
+        tmp_path,
+        [(1, 1, 1), (1, 2, 2)],
+        n_features=1,
+        n_cells=2,
+    )
+    (tmp_path / "barcodes.tsv").write_text("cell-0\ncell-0\n")
+    candidate = inspect_mtx(tmp_path)[0]
+
+    with pytest.raises(ValueError, match="Cell IDs must contain unique values"):
+        MtxReader(candidate)
 
 
 @pytest.mark.parametrize(

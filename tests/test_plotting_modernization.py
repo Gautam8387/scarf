@@ -1,5 +1,8 @@
 """Focused behavior tests for publication plotting features."""
 
+from importlib import import_module
+from types import SimpleNamespace
+
 import matplotlib
 import numpy as np
 import pytest
@@ -10,6 +13,27 @@ import matplotlib.pyplot as plt
 
 import scarf.plotting as splt
 from scarf.plotting._style import default_point_size, resolve_legend_loc
+
+
+class _SyntheticCells:
+    def __init__(self, **columns):
+        self._columns = {name: np.asarray(values) for name, values in columns.items()}
+        self.columns = tuple(self._columns)
+
+    def fetch(self, column, key="I"):
+        assert key == "I"
+        return self._columns[column]
+
+    def active_index(self, key="I"):
+        assert key == "I"
+        return np.arange(len(next(iter(self._columns.values()))))
+
+
+def _synthetic_plot_store(**columns):
+    return SimpleNamespace(
+        cells=_SyntheticCells(**columns),
+        _defaultAssay="RNA",
+    )
 
 
 def test_point_size_uses_population_and_panel_area():
@@ -164,6 +188,565 @@ def test_embedding_point_size_uses_final_panel_area(umap, datastore):
     observed = next(iter(result.provenance.extras["point_size_by_panel"].values()))
     assert observed == pytest.approx(expected)
     result.close()
+
+
+def test_embedding_validates_layout_coordinate_and_facet_inputs():
+    store = _synthetic_plot_store(
+        layout1=[0.0, 1.0, 2.0],
+        layout2=[0.0, 1.0, 0.0],
+        other1=[2.0, 1.0, 0.0],
+        other2=[0.0, -1.0, 0.0],
+        score=[1.0, 2.0, 3.0],
+    )
+
+    with pytest.raises(ValueError, match="at least one layout"):
+        splt.embedding(store, layout_key=[], show=False)
+    with pytest.raises(TypeError, match="Every layout_key entry"):
+        splt.embedding(store, layout_key=["layout", 3], show=False)
+    with pytest.raises(ValueError, match="must be unique"):
+        splt.embedding(store, layout_key=["layout", "layout"], show=False)
+    with pytest.raises(ValueError, match="color_by must contain at least one"):
+        splt.embedding(
+            store,
+            layout_key=["layout", "other"],
+            color_by=[],
+            show=False,
+        )
+    with pytest.raises(ValueError, match="panel_keys must be non-empty"):
+        splt.embedding(store, layout_key="layout", color_by=[], show=False)
+
+    mismatched = _synthetic_plot_store(
+        layout1=[0.0, 1.0, 2.0],
+        layout2=[0.0, 1.0],
+    )
+    with pytest.raises(ValueError):
+        splt.embedding(mismatched, layout_key="layout", show=False)
+
+    invalid = _synthetic_plot_store(
+        layout1=[np.nan, np.inf],
+        layout2=[np.nan, -np.inf],
+    )
+    with pytest.raises(ValueError, match="has no finite coordinates"):
+        splt.embedding(invalid, layout_key="layout", show=False)
+
+    bad_facet = _synthetic_plot_store(
+        layout1=[0.0, 1.0, 2.0],
+        layout2=[0.0, 1.0, 0.0],
+        facet=["a", "b"],
+    )
+    with pytest.raises(ValueError):
+        splt.embedding(
+            bad_facet,
+            layout_key="layout",
+            facet_by="facet",
+            facet_order=["a", "b"],
+            show=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"rasterize_threshold": -1}, "rasterize_threshold"),
+        ({"point_size_range": (0.0, 2.0)}, "point_size_range"),
+        ({"point_size_range": (3.0, 2.0)}, "point_size_range"),
+        ({"point_edgewidth": -0.1}, "point_edgewidth"),
+        ({"point_alpha": 1.1}, "point_alpha"),
+        ({"max_on_data_labels": 0}, "max_on_data_labels"),
+        ({"point_size": np.nan}, "point_size must be finite"),
+        ({"point_sizes": [1.0, 2.0]}, "point_sizes length"),
+        ({"point_sizes": [1.0, 2.0, np.inf]}, "finite positive"),
+        ({"clip_fraction": 0.5}, "clip_fraction"),
+    ],
+)
+def test_embedding_validates_limits_and_point_sizes(options, message):
+    store = _synthetic_plot_store(
+        layout1=[0.0, 1.0, 2.0],
+        layout2=[0.0, 1.0, 0.0],
+        score=[1.0, 2.0, 3.0],
+    )
+
+    with pytest.raises(ValueError, match=message):
+        splt.embedding(
+            store,
+            layout_key="layout",
+            color_by=splt.CellField("score", kind="continuous"),
+            show=False,
+            **options,
+        )
+
+
+def test_embedding_categorical_colors_and_scatter_sizes_are_preserved():
+    categories = np.asarray(["b", "a", None, "b"], dtype=object)
+    sizes = np.asarray([4.0, 9.0, 16.0, 25.0])
+    store = _synthetic_plot_store(
+        layout1=[0.0, 1.0, 2.0, 3.0],
+        layout2=[0.0, 1.0, 0.0, 1.0],
+        category=categories,
+    )
+    scale = splt.CategoricalScale(
+        order=("b", "a"),
+        palette={"b": "#ff0000", "a": "#0000ff"},
+        labels={"b": "Beta", "a": "Alpha"},
+        missing_color="#00ff00",
+        missing_label="Missing",
+    )
+
+    result = splt.embedding(
+        store,
+        layout_key="layout",
+        color_by=splt.CellField("category", kind="categorical"),
+        categorical_scale=scale,
+        point_sizes=sizes,
+        point_edgecolor="#111111",
+        point_edgewidth=0.6,
+        point_alpha=0.4,
+        rasterize_threshold=4,
+        show_legend=False,
+        show=False,
+    )
+
+    collection = result.axes["category"].collections[0]
+    np.testing.assert_array_equal(collection.get_sizes(), sizes)
+    assert collection.get_alpha() == pytest.approx(0.4)
+    assert collection.get_linewidths() == pytest.approx([0.6])
+    assert collection.get_rasterized() is True
+    expected_rgb = np.asarray(
+        [
+            matplotlib.colors.to_rgba("#ff0000")[:3],
+            matplotlib.colors.to_rgba("#0000ff")[:3],
+            matplotlib.colors.to_rgba("#00ff00")[:3],
+            matplotlib.colors.to_rgba("#ff0000")[:3],
+        ]
+    )
+    np.testing.assert_allclose(collection.get_facecolors()[:, :3], expected_rgb)
+    resolved = next(
+        value for value in result.scales if isinstance(value, splt.CategoricalScale)
+    )
+    assert resolved.order == ("b", "a")
+    assert resolved.labels == {"b": "Beta", "a": "Alpha"}
+    assert result.provenance.extras["point_size_by_panel"]["category"] == pytest.approx(
+        12.5
+    )
+    result.close()
+
+
+def test_embedding_continuous_sorting_keeps_color_size_and_scatter_options_aligned():
+    scores = np.asarray([2.0, np.nan, 1.0, 3.0])
+    sizes = np.asarray([10.0, 20.0, 30.0, 40.0])
+    store = _synthetic_plot_store(
+        layout1=[0.0, 1.0, 2.0, 3.0],
+        layout2=[0.0, 1.0, 0.0, 1.0],
+        score=scores,
+    )
+
+    result = splt.embedding(
+        store,
+        layout_key="layout",
+        color_by=splt.CellField("score", kind="continuous"),
+        color_scale=splt.ColorScale(
+            cmap="viridis",
+            vmin=1.0,
+            vmax=3.0,
+            missing_color="#ff00ff",
+        ),
+        point_sizes=sizes,
+        point_edgecolor="#222222",
+        point_edgewidth=0.4,
+        point_alpha=0.7,
+        sort_values=True,
+        rasterize_threshold=4,
+        show_legend=False,
+        show=False,
+    )
+
+    collection = result.axes["score"].collections[0]
+    np.testing.assert_allclose(
+        np.asarray(collection.get_offsets()),
+        np.asarray([[1.0, 1.0], [2.0, 0.0], [0.0, 0.0], [3.0, 1.0]]),
+    )
+    np.testing.assert_array_equal(
+        collection.get_sizes(),
+        np.asarray([20.0, 30.0, 10.0, 40.0]),
+    )
+    np.testing.assert_allclose(
+        collection.get_facecolors()[0, :3],
+        matplotlib.colors.to_rgba("#ff00ff")[:3],
+    )
+    assert collection.get_alpha() == pytest.approx(0.7)
+    assert collection.get_linewidths() == pytest.approx([0.4])
+    assert collection.get_rasterized() is True
+    assert result.provenance.extras["color_limits"]["score"] == pytest.approx(
+        (1.0, 3.0)
+    )
+    assert result.provenance.extras["point_size_by_panel"]["score"] == pytest.approx(
+        25.0
+    )
+    result.close()
+
+
+def test_embedding_feature_matrix_prefetch_batches_feature_slots(monkeypatch):
+    embedding_module = import_module("scarf.plotting.embedding")
+    store = _synthetic_plot_store(category=["a", "b", "a", "b"])
+    matrix = np.asarray(
+        [
+            [1.0, 10.0],
+            [2.0, 20.0],
+            [3.0, 30.0],
+            [4.0, 40.0],
+        ]
+    )
+    resolved_items = []
+    fetches = []
+
+    def resolve_feature(_store, item, *, from_assay):
+        resolved_items.append((item, from_assay))
+        label = item.label if isinstance(item, splt.FeatureRef) else str(item)
+        return SimpleNamespace(label=label)
+
+    def fetch_matrix(_store, resolved, cell_idx, *, normalization):
+        fetches.append((resolved, cell_idx.copy(), normalization))
+        return matrix
+
+    monkeypatch.setattr(embedding_module, "resolve_feature", resolve_feature)
+    monkeypatch.setattr(
+        embedding_module,
+        "fetch_normalized_feature_matrix",
+        fetch_matrix,
+    )
+    normalization = splt.NormalizationSpec(transform="log1p")
+
+    prefetched = embedding_module._prefetch_colors(
+        store,
+        [
+            splt.FeatureRef("gene_a", label="Gene A"),
+            splt.CellField("category", kind="categorical"),
+            "gene_b",
+        ],
+        from_assay="RNA",
+        cell_key="I",
+        n_cells=4,
+        normalization=normalization,
+    )
+
+    assert [item for item, _ in resolved_items] == [
+        splt.FeatureRef("gene_a", label="Gene A"),
+        "gene_b",
+    ]
+    assert len(fetches) == 1
+    np.testing.assert_array_equal(fetches[0][1], np.arange(4))
+    assert fetches[0][2] is normalization
+    np.testing.assert_array_equal(prefetched[0][0], matrix[:, 0])
+    assert prefetched[0][1:] == ("Gene A", False, False)
+    np.testing.assert_array_equal(prefetched[1][0], ["a", "b", "a", "b"])
+    assert prefetched[1][1:] == ("category", True, False)
+    np.testing.assert_array_equal(prefetched[2][0], matrix[:, 1])
+    assert prefetched[2][1:] == ("gene_b", False, False)
+
+
+def test_embedding_multi_layout_facets_include_requested_empty_panels():
+    store = _synthetic_plot_store(
+        first1=[0.0, 1.0, 2.0, 3.0],
+        first2=[0.0, 1.0, 0.0, 1.0],
+        second1=[3.0, 2.0, 1.0, 0.0],
+        second2=[1.0, 0.0, 1.0, 0.0],
+        facet=["a", "b", "a", "b"],
+        score=[0.0, 10.0, 1.0, 11.0],
+    )
+    facets = ("b", "a", "missing")
+    layouts = ("first", "second")
+
+    result = splt.embedding(
+        store,
+        layout_key=layouts,
+        color_by=splt.CellField("score", kind="continuous"),
+        facet_by="facet",
+        facet_order=facets,
+        color_scale=splt.ColorScale(scope="panel"),
+        point_size=5.0,
+        show_legend=False,
+        show=False,
+    )
+
+    expected_keys = [(layout, "score", facet) for layout in layouts for facet in facets]
+    assert list(result.axes) == expected_keys
+    assert result.provenance.extras["n_layouts"] == 2
+    for layout in layouts:
+        child = result.provenance.extras["layout_provenance"][layout]
+        assert child.extras["n_facets"] == 3
+        assert child.extras["color_scale_scope"] == "panel"
+        assert result.axes[(layout, "score", "missing")].axison is False
+    result.close()
+
+
+def test_embedding_figure_legend_uses_backend_compatible_fallback(monkeypatch):
+    from matplotlib.figure import Figure
+
+    original_legend = Figure.legend
+    attempted_locations = []
+
+    def reject_outside_location(self, *args, **kwargs):
+        attempted_locations.append(kwargs.get("loc"))
+        if kwargs.get("loc") == "outside right center":
+            raise ValueError("outside legends unsupported")
+        return original_legend(self, *args, **kwargs)
+
+    monkeypatch.setattr(Figure, "legend", reject_outside_location)
+    store = _synthetic_plot_store(
+        layout1=[0.0, 1.0, 2.0, 3.0],
+        layout2=[0.0, 1.0, 0.0, 1.0],
+        category=["a", "b", "a", "b"],
+    )
+
+    result = splt.embedding(
+        store,
+        layout_key="layout",
+        color_by=splt.CellField("category", kind="categorical"),
+        legend_loc="right",
+        show=False,
+    )
+
+    assert attempted_locations == ["outside right center", "center left"]
+    assert len(result.figure.legends) == 1
+    result.close()
+
+
+def test_embedding_multi_layout_derives_facets_from_selected_cells():
+    store = _synthetic_plot_store(
+        first1=[0.0, 1.0, 2.0, 3.0, 4.0],
+        first2=[0.0, 1.0, 0.0, 1.0, 0.0],
+        second1=[4.0, 3.0, 2.0, 1.0, 0.0],
+        second2=[1.0, 0.0, 1.0, 0.0, 1.0],
+        facet=np.asarray(["b", np.nan, "a", np.nan, "ignored"], dtype=object),
+        selected=[True, True, True, True, False],
+    )
+
+    result = splt.embedding(
+        store,
+        layout_key=("first", "second"),
+        color_by=None,
+        facet_by="facet",
+        subset_by="selected",
+        point_size=6.0,
+        frame="axes",
+        show_legend=False,
+        show=False,
+    )
+
+    assert result.owns_figure is True
+    assert len(result.axes) == 6
+    assert result.provenance.n_cells == 4
+    assert result.provenance.extras["n_layouts"] == 2
+    assert all(
+        child.extras["n_facets"] == 3
+        for child in result.provenance.extras["layout_provenance"].values()
+    )
+    figure_number = result.figure.number
+    result.close()
+    assert not plt.fignum_exists(figure_number)
+
+
+def test_embedding_facets_preserve_sizes_filters_and_target_legend():
+    store = _synthetic_plot_store(
+        layout1=np.arange(8, dtype=np.float64),
+        layout2=[0.0, 1.0, 0.2, 1.2, 0.4, 1.4, 0.6, 1.6],
+        facet=["left"] * 4 + ["right"] * 4,
+        category=["a", "b", "a", "b", "a", "b", "a", "b"],
+        highlight_group=["hot", "cold", "hot", "cold"] * 2,
+        density_group=["keep", "keep", "keep", "drop"] * 2,
+    )
+    sizes = np.arange(2, 10, dtype=np.float64)
+    figure, target_axes = plt.subplots(1, 2, figsize=(6, 3))
+    targets = {
+        ("category", "left"): target_axes[0],
+        ("category", "right"): target_axes[1],
+    }
+
+    result = splt.embedding(
+        store,
+        layout_key="layout",
+        color_by=splt.CellField("category", kind="categorical"),
+        facet_by="facet",
+        groups=("left", "right"),
+        point_sizes=sizes,
+        legend_loc="right",
+        highlight=splt.Highlight(by="highlight_group", groups=("hot",)),
+        density_overlay=splt.DensityOverlay(
+            group_by="density_group",
+            groups=("keep",),
+            pixels=16,
+            sigma=1,
+            levels=2,
+        ),
+        target=targets,
+        show=False,
+    )
+
+    assert result.owns_figure is False
+    np.testing.assert_array_equal(
+        target_axes[0].collections[0].get_sizes(),
+        sizes[:4],
+    )
+    np.testing.assert_array_equal(
+        target_axes[1].collections[0].get_sizes(),
+        sizes[4:],
+    )
+    assert target_axes[0].get_legend() is None
+    assert target_axes[1].get_legend() is not None
+    assert result.provenance.extras["highlight"]["n_highlighted"] == 4
+    result.close()
+    assert plt.fignum_exists(figure.number)
+    plt.close(figure)
+
+
+def test_embedding_on_data_legend_reports_omitted_labels():
+    store = _synthetic_plot_store(
+        layout1=[0.0, 0.2, 1.0, 1.2, 2.0, 2.2],
+        layout2=[0.0, 0.1, 1.0, 1.1, 0.0, 0.1],
+        category=["a", "a", "b", "b", "b", "b"],
+    )
+    scale = splt.CategoricalScale(
+        order=("a", "b", "not observed"),
+        palette={
+            "a": "#111111",
+            "b": "#777777",
+            "not observed": "#dddddd",
+        },
+    )
+
+    result = splt.embedding(
+        store,
+        layout_key="layout",
+        color_by=splt.CellField("category", kind="categorical"),
+        categorical_scale=scale,
+        legend_loc="on_data",
+        max_on_data_labels=1,
+        point_size=5,
+        show=False,
+    )
+
+    assert [text.get_text() for text in result.axes["category"].texts] == ["b"]
+    assert result.provenance.extras["omitted_labels"]["category"] == ["a"]
+    result.close()
+
+
+@pytest.mark.parametrize(
+    ("scale", "values"),
+    [
+        ("log", [0.25, 0.5, 1.0, 2.0]),
+        ("symlog", [-2.0, -0.5, 0.5, 3.0]),
+    ],
+)
+def test_embedding_renders_non_linear_continuous_scales(scale, values):
+    store = _synthetic_plot_store(
+        layout1=[0.0, 1.0, 0.0, 1.0],
+        layout2=[0.0, 0.0, 1.0, 1.0],
+        score=values,
+    )
+
+    result = splt.embedding(
+        store,
+        layout_key="layout",
+        color_by=splt.CellField("score", kind="continuous"),
+        color_scale=splt.ColorScale(scale=scale),
+        point_size=5,
+        show_legend=False,
+        show=False,
+    )
+
+    collection = result.axes["score"].collections[0]
+    assert np.isfinite(collection.get_facecolors()).all()
+    assert result.scales[0].scale == scale
+    result.close()
+
+
+def test_embedding_continuous_limits_handle_degenerate_ranges():
+    from scarf.plotting.embedding import _continuous_limits
+
+    assert _continuous_limits(
+        np.asarray([np.nan, np.inf]),
+        splt.ColorScale(),
+    ) == (0.0, 1.0)
+
+    values = np.asarray([0.0, 1.0, 2.0, 100.0])
+    quantile_scale = splt.ColorScale(quantiles=(0.25, 0.75))
+    assert _continuous_limits(values, quantile_scale) == pytest.approx(
+        tuple(np.quantile(values, (0.25, 0.75)))
+    )
+    assert _continuous_limits(
+        values,
+        splt.ColorScale(vmin=4.0, vmax=4.0),
+    ) == pytest.approx((3.5, 4.5))
+    assert _continuous_limits(
+        values,
+        splt.ColorScale(vmin=2.0, vmax=2.0, scale="log"),
+    ) == pytest.approx((1.98, 2.02))
+    with pytest.raises(ValueError, match="positive values"):
+        _continuous_limits(
+            values,
+            splt.ColorScale(vmin=0.0, vmax=0.0, scale="log"),
+        )
+
+
+def test_imported_embedding_reuse_guard_and_validator_reject_damage():
+    from scarf.embeddings.imported import (
+        _payloads_match,
+        validate_imported_embedding_artifact,
+    )
+    from scarf.graph.state import ImportedArtifactStorage
+    from scarf.storage.artifacts import fingerprint_array
+    from tests.test_imported_coordinates import (
+        _root_with_selection,
+        _tamper_artifact_attribute,
+        _write_embedding_fixture,
+    )
+
+    root, selection, cell_ids, mask = _root_with_selection()
+    ref, coordinates = _write_embedding_fixture(root, selection, cell_ids, mask)
+    storage = ImportedArtifactStorage(root)
+    group = storage.artifact_group(ref)
+    fingerprint = fingerprint_array(coordinates)
+
+    assert not _payloads_match(
+        storage,
+        group,
+        shapes={"missing": coordinates.shape},
+        fingerprints={"missing": fingerprint},
+    )
+    assert not _payloads_match(
+        storage,
+        group,
+        shapes={"values": (len(coordinates) + 1, coordinates.shape[1])},
+        fingerprints={"values": fingerprint},
+    )
+    group.create_group("not_an_array")
+    assert not _payloads_match(
+        storage,
+        group,
+        shapes={"not_an_array": coordinates.shape},
+        fingerprints={"not_an_array": fingerprint},
+    )
+
+    del group["values"]
+    with pytest.raises(ValueError, match="has no values array"):
+        validate_imported_embedding_artifact(root, ref)
+
+    other_root, other_selection, other_ids, other_mask = _root_with_selection()
+    other_ref, _ = _write_embedding_fixture(
+        other_root,
+        other_selection,
+        other_ids,
+        other_mask,
+    )
+    _tamper_artifact_attribute(
+        other_root,
+        other_ref,
+        "provenance",
+        ("inputs", "source_digest"),
+        {"bytes_hex": "a" * 63},
+    )
+    with pytest.raises(ValueError, match="source digest is missing"):
+        validate_imported_embedding_artifact(other_root, other_ref)
 
 
 def test_dotplot_feature_brackets_and_axis_swap(umap, leiden_clustering, datastore):

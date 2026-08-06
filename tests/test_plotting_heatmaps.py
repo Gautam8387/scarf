@@ -8,6 +8,11 @@ matplotlib.use("Agg")
 
 import scarf.plotting as splt
 from scarf.plotting.cluster_tree import _hierarchy_positions
+from scarf.plotting._heatmap_utils import (
+    annotation_colors,
+    normalize_annotations,
+    order_heatmap,
+)
 
 
 def test_hierarchy_positions_are_pure_and_complete():
@@ -69,6 +74,8 @@ def test_marker_heatmap_returns_owned_result(
     marker_search,
     datastore,
 ):
+    import matplotlib.pyplot as plt
+
     result = splt.marker_heatmap(
         datastore,
         group_key="RNA_cluster",
@@ -88,7 +95,10 @@ def test_marker_heatmap_returns_owned_result(
     assert result.legends
     assert result.scales
     assert result.provenance.notes[0] == "marker_heatmap"
+    figure_number = result.figure.number
+    assert plt.fignum_exists(figure_number)
     result.close()
+    assert not plt.fignum_exists(figure_number)
 
 
 def test_marker_heatmap_selects_features_by_named_score(
@@ -406,6 +416,46 @@ def test_clustermap_annotation_legend_reserves_space_with_column_tree(
     result.close()
 
 
+def test_clustermap_annotation_legend_without_dendrogram_is_owned_and_closed(
+    marker_search,
+    datastore,
+):
+    import matplotlib.pyplot as plt
+
+    baseline = splt.marker_heatmap(
+        datastore,
+        group_key="RNA_cluster",
+        topn=2,
+        cluster_rows=False,
+        cluster_columns=False,
+        show_legend=False,
+        show=False,
+    )
+    features = baseline.tables["matrix"].index.tolist()
+    baseline.close()
+    annotations = {
+        feature: "first" if index % 2 == 0 else "second"
+        for index, feature in enumerate(features)
+    }
+
+    result = splt.marker_heatmap(
+        datastore,
+        group_key="RNA_cluster",
+        topn=2,
+        cluster_rows=False,
+        cluster_columns=False,
+        row_annotations={"set": annotations},
+        show=False,
+    )
+
+    assert result.owns_figure is True
+    assert result.figure.legends
+    assert result.provenance.extras["cluster_columns"] is False
+    figure_number = result.figure.number
+    result.close()
+    assert not plt.fignum_exists(figure_number)
+
+
 def test_cluster_tree_prepares_cache_and_returns_tables(
     paris_clustering,
     datastore,
@@ -524,3 +574,607 @@ def test_pseudotime_heatmap_rejects_malformed_artifact_link(
             )
     finally:
         column.attrs["source_artifact"] = original_ref
+
+
+def test_pseudotime_heatmap_validates_artifact_link_identity(
+    pseudotime_aggregation,
+    datastore,
+):
+    column = datastore.RNA.z["featureData/pseudotime_clusters"]
+    original_ref = dict(column.attrs["source_artifact"])
+    original_source_value = column.attrs["source_value"]
+    try:
+        column.attrs["source_artifact"] = {"scope": "assay"}
+        with pytest.raises(ValueError, match="invalid source artifact"):
+            splt.pseudotime_heatmap(
+                datastore,
+                cell_key="I",
+                feat_key="I",
+                feature_cluster_key="pseudotime_clusters",
+                pseudotime_key="RNA_pseudotime",
+                show=False,
+            )
+
+        column.attrs["source_artifact"] = original_ref
+        column.attrs["source_value"] = "not_cluster_values"
+        with pytest.raises(ValueError, match="not linked to a complete"):
+            splt.pseudotime_heatmap(
+                datastore,
+                cell_key="I",
+                feat_key="I",
+                feature_cluster_key="pseudotime_clusters",
+                pseudotime_key="RNA_pseudotime",
+                show=False,
+            )
+    finally:
+        column.attrs["source_artifact"] = original_ref
+        column.attrs["source_value"] = original_source_value
+
+
+def test_pseudotime_heatmap_validates_artifact_payload(
+    pseudotime_aggregation,
+    datastore,
+):
+    from scarf.plotting.heatmaps import _prepare_pseudotime_heatmap
+    from scarf.storage.artifacts import ArtifactRef, inspect_artifact
+
+    column = datastore.RNA.z["featureData/pseudotime_clusters"]
+    ref = ArtifactRef.from_dict(dict(column.attrs["source_artifact"]))
+    status = inspect_artifact(datastore.zw, ref)
+    group = datastore.zw[status.path]
+    valid_features = np.asarray(group["valid_features"][:], dtype=bool)
+
+    def prepare():
+        return _prepare_pseudotime_heatmap(
+            datastore,
+            from_assay="RNA",
+            cell_key="I",
+            feat_key="I",
+            feature_cluster_key="pseudotime_clusters",
+            pseudotime_key="RNA_pseudotime",
+        )
+
+    del group["valid_features"]
+    try:
+        with pytest.raises(ValueError, match="is incomplete"):
+            prepare()
+    finally:
+        group.create_array("valid_features", data=valid_features)
+
+    del group["valid_features"]
+    group.create_array("valid_features", data=valid_features[:-1])
+    try:
+        with pytest.raises(ValueError, match="validity mask are misaligned"):
+            prepare()
+    finally:
+        del group["valid_features"]
+        group.create_array("valid_features", data=valid_features)
+
+    data = group["data"]
+    original_value = data[0, 0]
+    data[0, 0] = np.nan
+    try:
+        with pytest.raises(ValueError, match="contains non-finite values"):
+            prepare()
+    finally:
+        data[0, 0] = original_value
+
+
+def test_heatmap_ordering_is_stable_for_empty_explicit_and_clustered_inputs():
+    empty = pd.DataFrame(dtype=np.float64)
+    ordered_empty, row_linkage, column_linkage = order_heatmap(
+        empty,
+        row_order=None,
+        column_order=None,
+        cluster_rows=True,
+        cluster_columns=True,
+        method="average",
+        metric="euclidean",
+    )
+    assert ordered_empty.empty
+    assert row_linkage is None
+    assert column_linkage is None
+
+    matrix = pd.DataFrame(
+        [
+            [0.0, 0.1, 2.0],
+            [0.2, np.nan, 2.2],
+            [3.0, 2.9, 0.0],
+        ],
+        index=["r1", "r2", "r3"],
+        columns=["c1", "c2", "c3"],
+    )
+    explicit, row_linkage, column_linkage = order_heatmap(
+        matrix,
+        row_order=["r3", "r1", "r2"],
+        column_order=["c2", "c3", "c1"],
+        cluster_rows=True,
+        cluster_columns=True,
+        method="average",
+        metric="euclidean",
+    )
+    assert explicit.index.tolist() == ["r3", "r1", "r2"]
+    assert explicit.columns.tolist() == ["c2", "c3", "c1"]
+    assert row_linkage is None
+    assert column_linkage is None
+
+    first, first_rows, first_columns = order_heatmap(
+        matrix,
+        row_order=None,
+        column_order=None,
+        cluster_rows=True,
+        cluster_columns=True,
+        method="average",
+        metric="euclidean",
+    )
+    second, second_rows, second_columns = order_heatmap(
+        matrix,
+        row_order=None,
+        column_order=None,
+        cluster_rows=True,
+        cluster_columns=True,
+        method="average",
+        metric="euclidean",
+    )
+    assert first.index.tolist() == second.index.tolist()
+    assert first.columns.tolist() == second.columns.tolist()
+    assert first_rows is not None
+    assert first_columns is not None
+    np.testing.assert_allclose(first_rows, second_rows)
+    np.testing.assert_allclose(first_columns, second_columns)
+    pd.testing.assert_frame_equal(first, second)
+
+
+@pytest.mark.parametrize(
+    ("row_order", "column_order", "message"),
+    [
+        (["r1", "r1"], None, "row_order cannot contain duplicates"),
+        (None, ["c1"], "column_order must contain every observed label"),
+        (
+            None,
+            ["c1", "c2", "unexpected"],
+            "column_order must contain every observed label",
+        ),
+    ],
+)
+def test_heatmap_ordering_rejects_malformed_orders(
+    row_order,
+    column_order,
+    message,
+):
+    matrix = pd.DataFrame(
+        [[0.0, 1.0], [2.0, 3.0]],
+        index=["r1", "r2"],
+        columns=["c1", "c2"],
+    )
+
+    with pytest.raises(ValueError, match=message):
+        order_heatmap(
+            matrix,
+            row_order=row_order,
+            column_order=column_order,
+            cluster_rows=False,
+            cluster_columns=False,
+            method="average",
+            metric="euclidean",
+        )
+
+
+def test_heatmap_clustering_rejects_infinite_values():
+    matrix = pd.DataFrame(
+        [[0.0, np.inf], [1.0, 2.0], [3.0, 4.0]],
+        index=["r1", "r2", "r3"],
+        columns=["c1", "c2"],
+    )
+
+    with pytest.raises(ValueError, match="finite values"):
+        order_heatmap(
+            matrix,
+            row_order=None,
+            column_order=None,
+            cluster_rows=True,
+            cluster_columns=False,
+            method="average",
+            metric="euclidean",
+        )
+
+
+def test_heatmap_annotations_validate_empty_alignment_and_scales():
+    empty = normalize_annotations(
+        [],
+        {"program": []},
+        axis_name="row",
+    )
+    assert empty.shape == (0, 1)
+
+    with pytest.raises(ValueError, match="missing labels: r2"):
+        normalize_annotations(
+            ["r1", "r2"],
+            {"program": {"r1": "A"}},
+            axis_name="row",
+        )
+    with pytest.raises(ValueError, match="must have 2 values"):
+        normalize_annotations(
+            ["r1", "r2"],
+            {"program": ["A"]},
+            axis_name="row",
+        )
+
+    annotations = normalize_annotations(
+        ["r1", "r2"],
+        {"program": ["A", "B"]},
+        axis_name="row",
+    )
+    with pytest.raises(ValueError, match="scale 'program' is missing values: B"):
+        annotation_colors(
+            annotations,
+            {"program": splt.CategoricalScale(order=("A",))},
+        )
+    with pytest.raises(KeyError, match="Category 'B' missing from palette"):
+        annotation_colors(
+            annotations,
+            {
+                "program": splt.CategoricalScale(
+                    order=("A", "B"),
+                    palette={"A": "#111111"},
+                )
+            },
+        )
+
+
+def test_marker_heatmap_rejects_empty_marker_groups(datastore_ephemeral):
+    assay = datastore_ephemeral.RNA
+    markers = (
+        assay.z["markers"] if "markers" in assay.z else assay.z.create_group("markers")
+    )
+    slot = markers.create_group("I__empty_heatmap_groups")
+    slot.create_group("0")
+
+    with pytest.raises(ValueError, match="Marker list is empty"):
+        splt.marker_heatmap(
+            datastore_ephemeral,
+            group_key="empty_heatmap_groups",
+            show=False,
+        )
+
+
+def test_marker_heatmap_categorical_legend_serializes_and_preserves_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    import json
+
+    import matplotlib.pyplot as plt
+
+    import scarf.plotting.heatmaps as heatmap_plotting
+
+    matrix = pd.DataFrame(
+        [[0.0, 1.0], [1.0, 0.0]],
+        index=["gene1", "gene2"],
+        columns=["group1", "group2"],
+    )
+    monkeypatch.setattr(
+        heatmap_plotting,
+        "_prepare_marker_heatmap",
+        lambda *_args, **_kwargs: {
+            "matrix": matrix,
+            "markers": pd.DataFrame(
+                {
+                    "group": ["group1", "group2"],
+                    "rank": [1, 1],
+                    "feature_index": [0, 1],
+                    "score": [1.0, 0.9],
+                    "feature": ["gene1", "gene2"],
+                }
+            ),
+            "assay": "RNA",
+            "cell_key": "I",
+            "group_key": "cluster",
+            "n_cells": 4,
+        },
+    )
+    annotation_scale = splt.CategoricalScale(
+        order=("late", "early"),
+        palette={"late": "#222222", "early": "#dddddd"},
+        labels={"late": "Late", "early": "Early"},
+    )
+    figure, ax = plt.subplots()
+
+    result = heatmap_plotting.marker_heatmap(
+        object(),
+        group_key="cluster",
+        cluster_rows=False,
+        cluster_columns=False,
+        row_annotations={
+            "program": {
+                "gene1": "early",
+                "gene2": "late",
+            }
+        },
+        annotation_scales={"program": annotation_scale},
+        target=ax,
+        show=False,
+    )
+
+    legend = ax.get_legend()
+    assert legend is not None
+    assert [text.get_text() for text in legend.get_texts()] == [
+        "program: Late",
+        "program: Early",
+    ]
+    payload = json.loads(
+        result.save_provenance(tmp_path / "marker_heatmap.json").read_text()
+    )
+    categorical_orders = [
+        scale["values"]["order"]
+        for scale in payload["scales"]
+        if scale["type"] == "CategoricalScale"
+    ]
+    assert ["late", "early"] in categorical_orders
+    assert payload["tables"]["matrix"] == {
+        "columns": ["group1", "group2"],
+        "rows": 2,
+    }
+
+    result.close()
+    assert plt.fignum_exists(figure.number)
+    plt.close(figure)
+
+
+def test_marker_heatmap_validates_cluster_kwargs_and_target_layout(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import matplotlib.pyplot as plt
+
+    import scarf.plotting.heatmaps as heatmap_plotting
+
+    with pytest.raises(ValueError, match="clustering controls"):
+        heatmap_plotting.marker_heatmap(
+            object(),
+            group_key="cluster",
+            row_linkage=np.eye(2),
+            show=False,
+        )
+    with pytest.raises(ValueError, match="already standardizes"):
+        heatmap_plotting.marker_heatmap(
+            object(),
+            group_key="cluster",
+            z_score=0,
+            show=False,
+        )
+
+    matrix = pd.DataFrame(
+        [[0.0, 1.0], [1.0, 0.0]],
+        index=["gene1", "gene2"],
+        columns=["group1", "group2"],
+    )
+    monkeypatch.setattr(
+        heatmap_plotting,
+        "_prepare_marker_heatmap",
+        lambda *_args, **_kwargs: {
+            "matrix": matrix,
+            "markers": pd.DataFrame(),
+            "assay": "RNA",
+            "cell_key": "I",
+            "group_key": "cluster",
+            "n_cells": 4,
+        },
+    )
+    figure, ax = plt.subplots()
+    with pytest.raises(TypeError, match="Unsupported heatmap keyword"):
+        heatmap_plotting.marker_heatmap(
+            object(),
+            group_key="cluster",
+            cluster_rows=False,
+            cluster_columns=False,
+            target=ax,
+            unsupported_option=True,
+            show=False,
+        )
+    with pytest.raises(ValueError, match="figsize is invalid"):
+        heatmap_plotting.marker_heatmap(
+            object(),
+            group_key="cluster",
+            cluster_rows=False,
+            cluster_columns=False,
+            target=ax,
+            figsize=(3, 3),
+            show=False,
+        )
+    plt.close(figure)
+
+
+def test_pseudotime_heatmap_validates_orders_and_target_layout(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import matplotlib.pyplot as plt
+
+    import scarf.plotting.heatmaps as heatmap_plotting
+
+    prepared = {
+        "matrix": np.arange(12, dtype=np.float64).reshape(3, 4),
+        "feature_indices": np.array([0, 1, 2]),
+        "feature_clusters": np.array(["B", "A", "B"]),
+        "feature_labels": np.array(["gene1", "gene2", "gene3"]),
+        "pseudotime": np.array([0.0, 0.25, 0.5, 0.75]),
+        "assay": "RNA",
+        "cell_key": "I",
+        "feat_key": "I",
+        "feature_cluster_key": "clusters",
+        "pseudotime_key": "pseudotime",
+        "aggregation_location": "artifact",
+    }
+    monkeypatch.setattr(
+        heatmap_plotting,
+        "_prepare_pseudotime_heatmap",
+        lambda *_args, **_kwargs: prepared,
+    )
+
+    with pytest.raises(ValueError, match="feature_order cannot contain duplicates"):
+        heatmap_plotting.pseudotime_heatmap(
+            object(),
+            cell_key="I",
+            feat_key="I",
+            feature_cluster_key="clusters",
+            pseudotime_key="pseudotime",
+            feature_order=["gene1", "gene1", "gene3"],
+            show=False,
+        )
+    with pytest.raises(ValueError, match="contain every observed feature cluster"):
+        heatmap_plotting.pseudotime_heatmap(
+            object(),
+            cell_key="I",
+            feat_key="I",
+            feature_cluster_key="clusters",
+            pseudotime_key="pseudotime",
+            feature_cluster_order=["A"],
+            show=False,
+        )
+
+    first_figure, first_axes = plt.subplots(1, 2)
+    second_figure, second_axis = plt.subplots()
+    with pytest.raises(ValueError, match="target is missing axes: pseudotime"):
+        heatmap_plotting.pseudotime_heatmap(
+            object(),
+            cell_key="I",
+            feat_key="I",
+            feature_cluster_key="clusters",
+            pseudotime_key="pseudotime",
+            target={
+                "heatmap": first_axes[0],
+                "feature_clusters": first_axes[1],
+            },
+            show=False,
+        )
+    with pytest.raises(ValueError, match="target axes must share a figure"):
+        heatmap_plotting.pseudotime_heatmap(
+            object(),
+            cell_key="I",
+            feat_key="I",
+            feature_cluster_key="clusters",
+            pseudotime_key="pseudotime",
+            target={
+                "heatmap": first_axes[0],
+                "feature_clusters": first_axes[1],
+                "pseudotime": second_axis,
+            },
+            show=False,
+        )
+    plt.close(first_figure)
+    plt.close(second_figure)
+
+
+def test_pseudotime_heatmap_applies_explicit_order_scales_and_target_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import matplotlib.pyplot as plt
+
+    import scarf.plotting.heatmaps as heatmap_plotting
+
+    prepared = {
+        "matrix": np.arange(12, dtype=np.float64).reshape(3, 4),
+        "feature_indices": np.array([10, 11, 12]),
+        "feature_clusters": np.array(["B", "A", "B"]),
+        "feature_labels": np.array(["gene1", "gene2", "gene3"]),
+        "pseudotime": np.array([0.0, 0.2, 0.4, 0.6, 0.8, 1.0]),
+        "assay": "RNA",
+        "cell_key": "I",
+        "feat_key": "I",
+        "feature_cluster_key": "clusters",
+        "pseudotime_key": "pseudotime",
+        "aggregation_location": "artifact",
+    }
+    monkeypatch.setattr(
+        heatmap_plotting,
+        "_prepare_pseudotime_heatmap",
+        lambda *_args, **_kwargs: prepared,
+    )
+    figure, target_axes = plt.subplots(1, 4, figsize=(8, 3))
+    target = {
+        "heatmap": target_axes[0],
+        "feature_clusters": target_axes[1],
+        "pseudotime": target_axes[2],
+        "colorbar": target_axes[3],
+    }
+
+    result = heatmap_plotting.pseudotime_heatmap(
+        object(),
+        cell_key="I",
+        feat_key="I",
+        feature_cluster_key="clusters",
+        pseudotime_key="pseudotime",
+        feature_order=("gene3", "gene1", "gene2"),
+        feature_cluster_order=("B", "A"),
+        feature_cluster_scale=splt.CategoricalScale(
+            order=("B", "A"),
+            palette={"B": "#222222", "A": "#dddddd"},
+            labels={"B": "Beta", "A": "Alpha"},
+        ),
+        color_scale=splt.ColorScale(
+            cmap="magma",
+            vmin=-1,
+            vmax=12,
+            vcenter=5,
+        ),
+        pseudotime_scale=splt.ColorScale(
+            cmap="plasma",
+            vmin=0,
+            vmax=1,
+        ),
+        show_features=["GENE2", "absent"],
+        target=target,
+        show_legend=False,
+        show=False,
+    )
+
+    assert result.owns_figure is False
+    assert result.tables["matrix"].index.tolist() == ["gene3", "gene1", "gene2"]
+    assert result.tables["features"]["feature_index"].tolist() == [12, 10, 11]
+    assert result.tables["features"]["cluster"].tolist() == ["B", "B", "A"]
+    assert target_axes[3].axison is False
+    assert result.scales[1].order == ("B", "A")
+    assert [tick.get_text() for tick in target_axes[0].get_yticklabels()] == ["GENE2"]
+    result.close()
+    assert plt.fignum_exists(figure.number)
+    plt.close(figure)
+
+
+def test_marker_heatmap_surfaces_missing_seaborn_without_opening_a_figure(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import matplotlib.pyplot as plt
+
+    import scarf.plotting.heatmaps as heatmap_plotting
+
+    matrix = pd.DataFrame(
+        [[0.0, 1.0], [1.0, 0.0]],
+        index=["gene1", "gene2"],
+        columns=["group1", "group2"],
+    )
+    monkeypatch.setattr(
+        heatmap_plotting,
+        "_prepare_marker_heatmap",
+        lambda *_args, **_kwargs: {
+            "matrix": matrix,
+            "markers": pd.DataFrame(),
+            "assay": "RNA",
+            "cell_key": "I",
+            "group_key": "cluster",
+            "n_cells": 4,
+        },
+    )
+
+    def missing_seaborn():
+        raise ImportError("Scarf plotting requires seaborn")
+
+    monkeypatch.setattr(heatmap_plotting, "require_seaborn", missing_seaborn)
+    open_figures = plt.get_fignums()
+    with pytest.raises(ImportError, match="requires seaborn"):
+        heatmap_plotting.marker_heatmap(
+            object(),
+            group_key="cluster",
+            cluster_rows=False,
+            cluster_columns=False,
+            show=False,
+        )
+    assert plt.get_fignums() == open_figures

@@ -1,16 +1,24 @@
 import numpy as np
 import pandas as pd
 import pytest
+import zarr
+from zarr.storage import MemoryStore
 
+import scarf.metadata.artifacts as metadata_artifacts_module
 import scarf.plotting as splt
 from scarf.datastore.datastore import DataStore
 from scarf.metadata.artifacts import (
     categorical_display,
+    continuous_display,
+    feature_column_display,
+    link_feature_data_column,
+    plan_cell_data_artifact,
     validate_display_metadata,
+    write_cell_data_artifact,
 )
 from scarf.plotting._contracts import CategoricalScale, ColorScale
 from scarf.plotting.embedding import _continuous_limits
-from scarf.storage.artifacts import ArtifactRef, artifact_path
+from scarf.storage.artifacts import ArtifactRef, artifact_path, inspect_artifact
 from scarf.storage.selections import resolve_selection_artifact
 from tests.fixtures_datastore import build_neighbourhood_graph
 
@@ -42,6 +50,258 @@ def _ensure_graph(datastore) -> None:
 def _column_ref(datastore, column: str) -> ArtifactRef:
     raw_ref = datastore.zw["cellData"][column].attrs["source_artifact"]
     return ArtifactRef.from_dict(raw_ref)
+
+
+def _memory_metadata_root() -> tuple[zarr.Group, ArtifactRef]:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    root.create_group("RNA").create_group("featureData")
+    cell_data = root.create_group("cellData")
+    cell_ids = np.asarray(["cell-0", "cell-1", "cell-2"])
+    selection = np.asarray([True, False, True])
+    cell_data.create_array("ids", data=cell_ids)
+    cell_data.create_array("I", data=selection)
+    selection_ref = resolve_selection_artifact(
+        root,
+        scope="datastore",
+        kind="cell_selection",
+        values=selection,
+        row_ids=cell_ids,
+        operation="manual_selection",
+        parameters={},
+        inputs={},
+        source_column="I",
+    )
+    return root, selection_ref
+
+
+def test_cell_data_artifact_cache_hit_miss_and_payload_validation(
+    monkeypatch,
+) -> None:
+    root, selection = _memory_metadata_root()
+    common = {
+        "scope": "datastore",
+        "kind": "metadata_snapshot",
+        "operation": "cache_metadata",
+        "parameters": {"label": "batch"},
+        "inputs": {},
+        "execution_options": {"source_column": "batch"},
+        "cell_selection": selection,
+        "arrays": {"values": ((2,), "f")},
+    }
+    values = np.asarray([0.25, 0.75], dtype=np.float64)
+    first = plan_cell_data_artifact(root, **common)
+    first_group = write_cell_data_artifact(root, first, {"values": values})
+
+    assert first.reused is False
+    assert inspect_artifact(root, first.ref).complete
+    np.testing.assert_array_equal(first_group["values"][:], values)
+
+    cached = plan_cell_data_artifact(root, **common)
+    assert cached.reused is True
+    assert cached.ref == first.ref
+
+    def fail_if_written(*_args, **_kwargs):
+        raise AssertionError("a cached metadata artifact was rewritten")
+
+    with monkeypatch.context() as cache_hit:
+        cache_hit.setattr(
+            metadata_artifacts_module,
+            "create_zarr_dataset",
+            fail_if_written,
+        )
+        reused_group = write_cell_data_artifact(root, cached, {"values": values})
+    assert reused_group.path == first_group.path
+
+    changed = plan_cell_data_artifact(
+        root,
+        **{
+            **common,
+            "parameters": {"label": "condition"},
+        },
+    )
+    invalidated = plan_cell_data_artifact(
+        root,
+        **{
+            **common,
+            "invalidate_cache": True,
+        },
+    )
+    assert changed.reused is False
+    assert changed.ref != first.ref
+    assert invalidated.reused is False
+    assert invalidated.ref != first.ref
+
+    del first_group["values"]
+    corrupt_miss = plan_cell_data_artifact(root, **common)
+    assert inspect_artifact(root, first.ref).complete
+    assert corrupt_miss.reused is False
+    assert corrupt_miss.ref != first.ref
+
+
+def test_cell_data_artifact_validation_and_failed_write_status() -> None:
+    root, selection = _memory_metadata_root()
+    wrong_selection = ArtifactRef(
+        scope="datastore",
+        kind="metadata_snapshot",
+        artifact_id="f" * 64,
+    )
+    common = {
+        "scope": "datastore",
+        "kind": "metadata_snapshot",
+        "operation": "validate_metadata",
+        "parameters": {},
+        "inputs": {},
+        "execution_options": {},
+    }
+
+    with pytest.raises(ValueError, match="cell-selection"):
+        plan_cell_data_artifact(
+            root,
+            **common,
+            cell_selection=wrong_selection,
+            arrays={"values": ((2,), None)},
+        )
+    with pytest.raises(ValueError, match="selected cell count"):
+        plan_cell_data_artifact(
+            root,
+            **common,
+            cell_selection=selection,
+            arrays={"values": ((1,), None)},
+        )
+
+    planned = plan_cell_data_artifact(
+        root,
+        **common,
+        cell_selection=selection,
+        arrays={"values": ((2, 1), None)},
+    )
+    with pytest.raises(ValueError, match="one-dimensional"):
+        write_cell_data_artifact(
+            root,
+            planned,
+            {"values": np.asarray([["a"], ["b"]])},
+        )
+
+    failed_status = inspect_artifact(root, planned.ref)
+    assert failed_status.exists
+    assert failed_status.complete is False
+    retry = plan_cell_data_artifact(
+        root,
+        **common,
+        cell_selection=selection,
+        arrays={"values": ((2, 1), None)},
+    )
+    assert retry.reused is False
+    assert retry.ref != planned.ref
+
+
+def test_corrupt_metadata_links_and_incomplete_artifacts_are_rebuilt(
+    datastore_ephemeral,
+) -> None:
+    datastore = datastore_ephemeral
+    column_name = "imported_metadata"
+    values = np.asarray([f"batch-{index % 2}" for index in range(datastore.cells.N)])
+    datastore.cells.insert(column_name, values, overwrite=True)
+    column = datastore.zw["cellData"][column_name]
+    column.attrs["source_artifact"] = {
+        "type": "artifact",
+        "scope": "datastore",
+    }
+    column.attrs["source_value"] = "values"
+
+    first = datastore._resolve_cell_data_input(column_name, cell_key="I")
+
+    assert first.kind == "metadata_snapshot"
+    linked = datastore.zw["cellData"][column_name]
+    assert ArtifactRef.from_dict(linked.attrs["source_artifact"]) == first
+    np.testing.assert_array_equal(
+        datastore.load_artifact(first)["values"][:],
+        datastore.cells.fetch(column_name, key="I"),
+    )
+
+    datastore.zw[artifact_path(first)].attrs["complete"] = False
+    replacement = datastore._resolve_cell_data_input(column_name, cell_key="I")
+
+    assert replacement != first
+    assert datastore.inspect_artifact(first).complete is False
+    assert datastore.inspect_artifact(replacement).complete
+    linked = datastore.zw["cellData"][column_name]
+    assert ArtifactRef.from_dict(linked.attrs["source_artifact"]) == replacement
+    np.testing.assert_array_equal(
+        datastore.load_artifact(replacement)["values"][:],
+        datastore.cells.fetch(column_name, key="I"),
+    )
+
+
+def test_datastore_rejects_incomplete_import_status(datastore_ephemeral) -> None:
+    datastore = datastore_ephemeral
+    datastore.zw.attrs["scarf:import_source"] = "synthetic"
+    datastore.zw.attrs["scarf:import_complete"] = False
+
+    with pytest.raises(RuntimeError, match="synthetic import is incomplete"):
+        DataStore(
+            datastore.zarr_loc,
+            default_assay="RNA",
+        )
+
+
+def test_datastore_rejects_corrupt_imported_metadata(datastore_ephemeral) -> None:
+    datastore = datastore_ephemeral
+    datastore.zw.attrs["scarf:import_source"] = "synthetic"
+    datastore.zw.attrs["scarf:import_complete"] = True
+    datastore.zw["cellData"].create_array(
+        "truncated_imported_metadata",
+        data=np.asarray(["only-one-row"]),
+    )
+
+    with pytest.raises(ValueError, match="Metadata table is corrupted"):
+        DataStore(
+            datastore.zarr_loc,
+            default_assay="RNA",
+        )
+
+
+def test_feature_link_validation_preserves_existing_provenance() -> None:
+    root, _selection = _memory_metadata_root()
+    feature_data = root["RNA"]["featureData"]
+    values = np.asarray([0.25, 0.75])
+    feature_data.create_array("score", data=values)
+    first = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="feature_selection",
+        artifact_id="a" * 64,
+    )
+    display = continuous_display(values)
+    link_feature_data_column(
+        root["RNA"],
+        "score",
+        first,
+        value_name="values",
+        default_display=display,
+    )
+    assert feature_column_display(root["RNA"], "score") == display
+
+    target = feature_data["score"]
+    target.attrs["display"] = "invalid"
+    before = dict(target.attrs)
+    replacement = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="feature_selection",
+        artifact_id="b" * 64,
+    )
+    with pytest.raises(TypeError, match="mapping"):
+        link_feature_data_column(
+            root["RNA"],
+            "score",
+            replacement,
+            value_name="replacement",
+            value_index=1,
+        )
+
+    persisted = root["RNA"]["featureData"]["score"]
+    assert dict(persisted.attrs) == before
 
 
 def test_umap_matrix_and_leiden_columns_link_authoritative_artifacts(
@@ -384,6 +644,123 @@ def test_multicolumn_display_validation_is_atomic(
 
     assert dict(first.attrs["source_artifact"]) == first_ref
     assert dict(second.attrs["source_artifact"]) == second_ref
+
+
+@pytest.mark.parametrize(
+    ("display", "error_type", "message"),
+    [
+        (
+            {"kind": "continuous"},
+            ValueError,
+            "incomplete",
+        ),
+        (
+            {
+                "kind": "continuous",
+                "colormap": 1,
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "scale": "linear",
+            },
+            TypeError,
+            "colormap",
+        ),
+        (
+            {
+                "kind": "continuous",
+                "colormap": "viridis",
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "scale": "square-root",
+            },
+            ValueError,
+            "scale",
+        ),
+        (
+            {
+                "kind": "continuous",
+                "colormap": "viridis",
+                "minimum": 2.0,
+                "maximum": 1.0,
+                "scale": "linear",
+            },
+            ValueError,
+            "exceeds",
+        ),
+        (
+            {"kind": "categorical", "categories": "not-a-list"},
+            TypeError,
+            "must be a list",
+        ),
+        (
+            {"kind": "categorical", "categories": ["not-a-mapping"]},
+            TypeError,
+            "must be a mapping",
+        ),
+        (
+            {
+                "kind": "categorical",
+                "categories": [{"value": 1, "label": "one"}],
+            },
+            ValueError,
+            "requires value, label, and color",
+        ),
+        (
+            {
+                "kind": "categorical",
+                "categories": [{"value": None, "label": "none", "color": "#123456"}],
+            },
+            TypeError,
+            "JSON scalar",
+        ),
+        (
+            {
+                "kind": "categorical",
+                "categories": [{"value": 1, "label": 1, "color": "#123456"}],
+            },
+            TypeError,
+            "label must be a string",
+        ),
+        (
+            {
+                "kind": "categorical",
+                "categories": [{"value": 1, "label": "one", "color": "red"}],
+            },
+            ValueError,
+            "hex color",
+        ),
+        (
+            {
+                "kind": "categorical",
+                "categories": [],
+                "missing_label": 1,
+            },
+            TypeError,
+            "missing_label",
+        ),
+        (
+            {
+                "kind": "categorical",
+                "categories": [],
+                "missing_color": "red",
+            },
+            ValueError,
+            "missing_color",
+        ),
+        (
+            {"kind": "unknown"},
+            ValueError,
+            "continuous or categorical",
+        ),
+    ],
+)
+def test_display_validation_rejects_malformed_contracts(
+    display: dict[str, object],
+    error_type: type[Exception],
+    message: str,
+) -> None:
+    with pytest.raises(error_type, match=message):
+        validate_display_metadata(display)
 
 
 def test_display_validation_rejects_nonfinite_and_duplicate_values() -> None:

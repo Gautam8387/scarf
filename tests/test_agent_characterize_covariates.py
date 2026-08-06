@@ -1,16 +1,35 @@
 """Tests for characterize_covariates."""
 
 from collections.abc import Mapping
+from importlib import import_module
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from scipy.sparse import csr_matrix
+import zarr
+from zarr.storage import MemoryStore
 
 from scarf.agent import CovariateCharacterization, characterize_covariates
-from scarf.agent.characterize_covariates import _is_embedding_column
-from scarf.agent.types import Decision
+from scarf.agent.characterize_covariates import (
+    _Run,
+    _assign_domain,
+    _characterize_coefficient,
+    _has_source_artifact,
+    _infer_kind,
+    _is_embedding_column,
+    _profile_column,
+    _resolve_units,
+    _summarize,
+    _technical_nesting_reports,
+    _triage_columns,
+    _validate_directions,
+)
+from scarf.agent.decide import DecisionValidationError
+from scarf.agent.types import Decision, EvidenceItem
 from scarf.datastore.datastore import DataStore
 from scarf.writers import SparseToZarr
 
@@ -537,3 +556,273 @@ def test_characterize_covariates_avoids_bulk_metadata_loads(
     assert direct_full_fetches == []
     assert block_widths
     assert max(block_widths) < len(store.cells.columns)
+
+
+@pytest.mark.parametrize(
+    ("directions", "message"),
+    [
+        ({"coefficientsOfInterest": "disease"}, "must be a sequence"),
+        ({"columnKinds": []}, "columnKinds must be a mapping"),
+        ({"columnDomains": []}, "columnDomains must be a mapping"),
+        ({"unitsOfInference": []}, "unitsOfInference must be a mapping"),
+        (
+            {"unitsOfInference": {"missing": {}}},
+            "unknown coefficient 'missing'",
+        ),
+        (
+            {"unitsOfInference": {"disease": []}},
+            "unitsOfInference['disease'] must be a mapping",
+        ),
+        (
+            {
+                "unitsOfInference": {
+                    "disease": {
+                        "observationUnit": "missing",
+                        "independentUnit": "also_missing",
+                    }
+                }
+            },
+            "cites unknown column",
+        ),
+    ],
+)
+def test_covariate_direction_validation_reports_structural_errors(
+    directions,
+    message,
+) -> None:
+    errors = _validate_directions(
+        directions,
+        {"I", "disease", "sample"},
+    )
+    assert any(message in error for error in errors)
+
+
+def test_run_ask_audits_invalid_mocked_decision(monkeypatch) -> None:
+    characterize_covariates_module = import_module(
+        "scarf.agent.characterize_covariates"
+    )
+    run = _Run(
+        store=object(),
+        cell_key="I",
+        n_rows=2,
+        context="",
+        model=object(),
+    )
+
+    def invalid_decision(**_kwargs):
+        raise DecisionValidationError("unknown evidence")
+
+    monkeypatch.setattr(
+        characterize_covariates_module,
+        "decide",
+        invalid_decision,
+    )
+    decision = run.ask(
+        task="columnDomain",
+        question="Choose a domain",
+        evidence=[
+            EvidenceItem(id="domain:design", label="design", summary="sampling"),
+            EvidenceItem(id="domain:ignore", label="ignore", summary="unused"),
+        ],
+        column="sample",
+    )
+
+    assert decision is None
+    assert run.audit == [
+        {
+            "kind": "decisionInvalid",
+            "detail": "unknown evidence",
+            "task": "columnDomain",
+            "column": "sample",
+        }
+    ]
+
+
+def test_covariate_kind_and_summary_handle_non_numeric_and_nonfinite_values() -> None:
+    assert _infer_kind(np.array([b"not-a-number"], dtype="S")) == "categorical"
+    assert (
+        _summarize(np.array([np.nan, np.inf]), "continuous")
+        == "continuous missing=1 finite=0"
+    )
+
+
+def test_source_artifact_detection_and_triage_use_metadata_links() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    cell_data = root.create_group("cellData")
+    derived = cell_data.create_array("derived", shape=(2,), dtype="f8")
+    derived.attrs["source_artifact"] = {"artifact_id": "artifact-1"}
+    store = SimpleNamespace(
+        zw=root,
+        assay_names=["RNA"],
+        cells=SimpleNamespace(
+            columns=["I", "RNA_nCounts", "derived", "donor"],
+        ),
+    )
+
+    assert _has_source_artifact(store, "derived")
+    assert not _has_source_artifact(store, "missing")
+    assert not _has_source_artifact(SimpleNamespace(zw={}), "derived")
+    candidates, dropped = _triage_columns(store, cell_key="I", exclude=set())
+    assert candidates == ["donor"]
+    assert dropped == [
+        ("RNA_nCounts", "dropAssayStat"),
+        ("derived", "dropProvenance"),
+    ]
+
+
+def test_assign_domain_rejects_unsupported_mock_choice(monkeypatch) -> None:
+    run = _Run(
+        store=object(),
+        cell_key="I",
+        n_rows=2,
+        context="",
+        model=object(),
+        profiles={
+            "batch": SimpleNamespace(
+                summary="categorical levels=2",
+            )
+        },
+    )
+    monkeypatch.setattr(
+        run,
+        "ask",
+        lambda **_kwargs: Decision(
+            selectedId="domain:not-real",
+            rationale="invalid",
+            evidenceIds=["domain:not-real"],
+        ),
+    )
+
+    assert _assign_domain(run, "batch", {}) == "unknown"
+    assert run.audit[0]["kind"] == "domainUnknown"
+    assert "Unsupported domain" in run.audit[0]["detail"]
+
+
+def test_resolve_units_audits_missing_directed_units(tmp_path: Path) -> None:
+    store = _store_with_design(tmp_path)
+    profiles = {
+        name: _profile_column(store, name, cell_key="I")
+        for name in ("disease", "sample", "donor")
+    }
+    run = _Run(
+        store=store,
+        cell_key="I",
+        n_rows=store.cells.N,
+        context="",
+        model=None,
+        profiles=profiles,
+        domains={
+            "disease": "biological",
+            "sample": "design",
+            "donor": "design",
+        },
+    )
+
+    assert _resolve_units(
+        run,
+        "disease",
+        directed={"disease": {"observationUnit": "missing"}},
+        design_columns=["sample", "donor"],
+        unit_candidates=["sample", "donor"],
+    ) == (None, None)
+    assert run.audit[-1]["kind"] == "invalidObservationUnit"
+
+    observation, independent = _resolve_units(
+        run,
+        "disease",
+        directed={
+            "disease": {
+                "observationUnit": "sample",
+                "independentUnit": "missing",
+            }
+        },
+        design_columns=["sample", "donor"],
+        unit_candidates=["sample", "donor"],
+    )
+    assert observation == "sample"
+    assert independent is None
+    assert run.audit[-1]["kind"] == "invalidIndependentUnit"
+
+
+def test_characterize_covariates_auto_selects_single_observation_unit(
+    tmp_path: Path,
+) -> None:
+    store = _store_with_design(tmp_path)
+    result = characterize_covariates(
+        store,
+        directions={
+            "columnDomains": {
+                "sample": "design",
+                "disease": "biological",
+            },
+            "coefficientsOfInterest": ["disease"],
+        },
+    )
+
+    assert result.status == "done"
+    coefficient = next(
+        item for item in result.coefficients if item["name"] == "disease"
+    )
+    assert coefficient["observationUnit"] == "sample"
+    assert coefficient["scope"] == "betweenUnit"
+    assert "observationUnit:disease->sample" in result.actions
+
+
+def test_technical_nesting_reports_only_directional_relationships(
+    tmp_path: Path,
+) -> None:
+    store = _store_with_design(tmp_path)
+
+    reports = _technical_nesting_reports(
+        store,
+        ["batch", "sample", "cell_type"],
+        cell_key="I",
+    )
+
+    assert len(reports) == 1
+    assert {reports[0]["left"], reports[0]["right"]} == {"batch", "sample"}
+    assert reports[0]["nesting"] != "none"
+
+
+def test_characterize_coefficient_rejects_cell_level_observation_unit(
+    tmp_path: Path,
+) -> None:
+    store = _store_with_design(tmp_path)
+    store.cells.insert(
+        "barcode",
+        np.array([f"cell-{index}" for index in range(store.cells.N)]),
+        overwrite=True,
+    )
+    run = _Run(
+        store=store,
+        cell_key="I",
+        n_rows=store.cells.N,
+        context="",
+        model=None,
+        profiles={
+            name: _profile_column(store, name, cell_key="I")
+            for name in ("disease", "barcode")
+        },
+        domains={"disease": "biological", "barcode": "design"},
+    )
+
+    record, report = _characterize_coefficient(
+        run,
+        "disease",
+        observation_unit="barcode",
+        independent_unit=None,
+        technical=[],
+    )
+
+    assert record["scope"] == "unresolvedUnit"
+    assert report is None
+    assert run.audit[-1]["kind"] == "invalidObservationUnit"
+    assert run.audit[-1]["designRows"] == store.cells.N
+
+
+def test_characterize_covariates_rejects_missing_cell_key(tmp_path: Path) -> None:
+    store = _store_with_design(tmp_path)
+    result = characterize_covariates(store, cellKey="missing")
+
+    assert result.status == "failed"
+    assert result.notes == ["cellKey 'missing' is not present in cell metadata"]

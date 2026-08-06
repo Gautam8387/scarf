@@ -9,6 +9,7 @@ import pytest
 import scarf.datastore._operations.mapping as mapping_operations
 import scarf.mapping.projection as projection_storage
 from scarf.datastore.datastore import DataStore
+from scarf.mapping.confidence import conformal_prediction_sets, distance_weights
 from scarf.mapping.models import MappingResult
 from scarf.mapping.projection import (
     NO_QUERY_BATCH_FINGERPRINT,
@@ -340,6 +341,43 @@ def test_mapping_scores_exclude_uninformative_rows_and_preserve_groups(
         list(query.get_mapping_score(result, weighted=1))
 
 
+def test_mapping_scores_keep_missing_target_groups_distinct(
+    mapping_consumer_context,
+):
+    _, reference, query = mapping_consumer_context
+    result = _write_projection(
+        query,
+        reference,
+        mapping_name="missing_groups",
+        indices=np.array([[0, 1], [2, 0], [1, 2]]),
+        distances=np.ones((3, 2)),
+        uninformative=np.zeros(3, dtype=bool),
+    )
+    groups = pd.Categorical(
+        ["present", None, "present"],
+        categories=["present", "unused"],
+    )
+
+    scores = list(
+        query.get_mapping_score(
+            result,
+            target_groups=np.asarray(groups),
+            log_transform=False,
+            multiplier=1.0,
+            weighted=False,
+            fixed_weight=1.0,
+        )
+    )
+
+    assert len(scores) == 2
+    assert scores[0][0] == "present"
+    assert pd.isna(scores[1][0])
+    np.testing.assert_allclose(scores[0][1][:3], [0.25, 0.5, 0.25])
+    np.testing.assert_allclose(scores[1][1][:3], [0.5, 0.0, 0.5])
+    np.testing.assert_array_equal(scores[0][1][3:], 0.0)
+    np.testing.assert_array_equal(scores[1][1][3:], 0.0)
+
+
 def test_labels_and_evidence_abstain_without_fabricating_metrics(
     mapping_consumer_context,
 ):
@@ -385,6 +423,141 @@ def test_labels_and_evidence_abstain_without_fabricating_metrics(
     np.testing.assert_allclose(evidence.loc[[0, 2], "voteFraction"], [0.9, 0.9])
     assert evidence.loc[1, "predictionSet"] == ()
     assert "reference_labels" not in query.cells.columns
+
+
+def test_label_transfer_handles_ties_thresholds_distance_and_subsets(
+    mapping_consumer_context,
+):
+    _, reference, query = mapping_consumer_context
+    _write_reference_labels(reference)
+    result = _write_projection(
+        query,
+        reference,
+        mapping_name="label_edges",
+        indices=np.array([[0, 1], [0, 1], [1, 0]]),
+        distances=np.array([[1.0, 1.0], [0.0, 4.0], [1.0, 3.0]]),
+        uninformative=np.zeros(3, dtype=bool),
+    )
+
+    labels = query.get_target_classes(
+        result,
+        reference_class_group="reference_labels",
+        threshold_fraction=0.75,
+    )
+    subset = query.get_target_classes(
+        result,
+        reference_class_group="reference_labels",
+        threshold_fraction=0.75,
+        target_subset=[2],
+    )
+    empty = query.get_target_classes(
+        result,
+        reference_class_group="reference_labels",
+        target_subset=[],
+    )
+    evidence = query.get_target_label_evidence(
+        result,
+        reference_class_group="reference_labels",
+        threshold_fraction=0.75,
+        max_distance=0.5,
+    )
+
+    assert labels.tolist() == ["NA", "winner", "runner_up"]
+    assert subset.index.tolist() == [2]
+    assert subset.tolist() == ["runner_up"]
+    assert empty.empty
+    assert evidence["label"].tolist() == ["NA", "winner", "NA"]
+    assert evidence["isUnknown"].tolist() == [True, False, True]
+    assert evidence.loc[0, "voteFraction"] == pytest.approx(0.5)
+    assert evidence.loc[0, "voteEntropy"] == pytest.approx(np.log(2.0))
+    assert evidence.loc[0, "topTwoMargin"] == pytest.approx(0.0)
+    assert evidence.loc[2, "voteFraction"] == pytest.approx(0.75)
+    assert np.isfinite(evidence.loc[2, "referenceDistancePercentile"])
+
+    with pytest.raises(TypeError, match="target_subset must be a list"):
+        query.get_target_classes(
+            result,
+            reference_class_group="reference_labels",
+            target_subset=(0,),  # type: ignore[arg-type]
+        )
+    with pytest.raises(TypeError, match="entries must be integers"):
+        query.get_target_classes(
+            result,
+            reference_class_group="reference_labels",
+            target_subset=[True],
+        )
+    with pytest.raises(ValueError, match="out-of-range"):
+        query.get_target_classes(
+            result,
+            reference_class_group="reference_labels",
+            target_subset=[result.n_cells],
+        )
+    with pytest.raises(TypeError, match="reference_class_group"):
+        query.get_target_classes(result, reference_class_group="")
+    with pytest.raises(TypeError, match="na_val"):
+        query.get_target_label_evidence(
+            result,
+            reference_class_group="reference_labels",
+            na_val=None,  # type: ignore[arg-type]
+        )
+
+
+def test_label_transfer_calibration_is_deterministic_and_validated() -> None:
+    calibrated = DataStore.calibrate_label_transfer_threshold(
+        vote_fractions=np.array([0.2, 0.6, 0.8, 0.9]),
+        correct=np.array([False, True, True, False]),
+        target_coverage=0.5,
+    )
+
+    assert calibrated == {
+        "voteThreshold": pytest.approx(0.7),
+        "validationCoverage": pytest.approx(0.5),
+        "validationAccuracy": pytest.approx(0.5),
+    }
+
+    with pytest.raises(ValueError, match="matching vectors"):
+        DataStore.calibrate_label_transfer_threshold(
+            np.ones((1, 2)),
+            np.ones(2, dtype=bool),
+        )
+    for coverage in (0.0, 1.1):
+        with pytest.raises(ValueError, match="target_coverage"):
+            DataStore.calibrate_label_transfer_threshold(
+                np.array([0.5]),
+                np.array([True]),
+                target_coverage=coverage,
+            )
+    with pytest.raises(ValueError, match="correct held-out prediction"):
+        DataStore.calibrate_label_transfer_threshold(
+            np.array([0.2, 0.8]),
+            np.array([False, False]),
+        )
+
+
+def test_confidence_helpers_reject_invalid_shapes_calibration_and_alpha() -> None:
+    with pytest.raises(ValueError, match="two-dimensional distance"):
+        distance_weights(np.array([1.0, 2.0]))
+    with pytest.raises(ValueError, match="two-dimensional array"):
+        conformal_prediction_sets(
+            np.array([0.8, 0.2]),
+            np.array([0.1]),
+        )
+    with pytest.raises(ValueError, match="non-empty vector"):
+        conformal_prediction_sets(
+            np.array([[0.8, 0.2]]),
+            np.array([]),
+        )
+    with pytest.raises(ValueError, match="strictly between"):
+        conformal_prediction_sets(
+            np.array([[0.8, 0.2]]),
+            np.array([0.1]),
+            alpha=1.0,
+        )
+    with pytest.raises(ValueError, match="finite"):
+        conformal_prediction_sets(
+            np.array([[np.nan, 0.2]]),
+            np.array([0.1]),
+        )
 
 
 def test_mapping_consumers_stream_projection_arrays(

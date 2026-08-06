@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import numpy as np
 import pytest
 from scipy.sparse import csr_matrix
@@ -67,6 +69,12 @@ def _canonical_graph(
     graph.eliminate_zeros()
     graph.sort_indices()
     return graph
+
+
+def _changed(values: np.ndarray, index: int, value: int) -> np.ndarray:
+    changed = values.copy()
+    changed[index] = value
+    return changed
 
 
 def _erdos_renyi_null_graph(seed: int) -> csr_matrix:
@@ -409,3 +417,244 @@ def test_aggregate_plateau_statistics_rejects_inconsistent_topology() -> None:
                 component_edge_counts=component_counts,
             ),
         )
+
+
+def test_event_aggregation_rejects_mismatched_forest_metadata() -> None:
+    hierarchy = _balanced_four_hierarchy()
+    forest = collapse_equal_height_plateaus(hierarchy)
+    topology = collect_topology_statistics(
+        _canonical_graph(4, [(0, 1), (2, 3)]),
+        hierarchy,
+    )
+
+    with pytest.raises(ValueError, match="different leaf counts"):
+        aggregate_plateau_statistics(
+            hierarchy,
+            replace(forest, n_leaves=5),
+            topology,
+        )
+    with pytest.raises(ValueError, match="wrong number of components"):
+        aggregate_plateau_statistics(
+            hierarchy,
+            replace(forest, component_roots=np.empty(0, dtype=np.int32)),
+            topology,
+        )
+    with pytest.raises(ValueError, match="finite internal node"):
+        aggregate_plateau_statistics(
+            hierarchy,
+            replace(
+                forest,
+                representatives=_changed(forest.representatives, 0, 0),
+            ),
+            topology,
+        )
+    with pytest.raises(ValueError, match="size does not match"):
+        aggregate_plateau_statistics(
+            hierarchy,
+            replace(forest, sizes=_changed(forest.sizes, 0, 3)),
+            topology,
+        )
+
+
+def test_event_aggregation_rejects_invalid_child_links() -> None:
+    hierarchy = _balanced_four_hierarchy()
+    forest = collapse_equal_height_plateaus(hierarchy)
+    topology = collect_topology_statistics(
+        _canonical_graph(4, [(0, 1), (2, 3)]),
+        hierarchy,
+    )
+
+    with pytest.raises(ValueError, match="child leaf lies outside"):
+        aggregate_plateau_statistics(
+            hierarchy,
+            replace(forest, child_refs=_changed(forest.child_refs, 0, -5)),
+            topology,
+        )
+    with pytest.raises(ValueError, match="child events must precede"):
+        aggregate_plateau_statistics(
+            hierarchy,
+            replace(forest, child_refs=_changed(forest.child_refs, 0, 0)),
+            topology,
+        )
+    with pytest.raises(ValueError, match="parent and child references disagree"):
+        aggregate_plateau_statistics(
+            hierarchy,
+            replace(
+                forest,
+                parent_events=_changed(forest.parent_events, 0, 1),
+            ),
+            topology,
+        )
+    root_child = int(forest.child_offsets[2])
+    with pytest.raises(ValueError, match="non-root plateau event"):
+        aggregate_plateau_statistics(
+            hierarchy,
+            replace(
+                forest,
+                child_refs=_changed(forest.child_refs, root_child, -1),
+            ),
+            topology,
+        )
+
+
+def test_event_aggregation_rejects_invalid_roots_and_uncovered_events() -> None:
+    hierarchy = _balanced_four_hierarchy()
+    forest = collapse_equal_height_plateaus(hierarchy)
+    topology = collect_topology_statistics(
+        _canonical_graph(4, [(0, 1), (2, 3)]),
+        hierarchy,
+    )
+
+    with pytest.raises(ValueError, match="component roots disagree"):
+        aggregate_plateau_statistics(
+            hierarchy,
+            replace(
+                forest,
+                component_roots=np.asarray([0], dtype=np.int32),
+            ),
+            topology,
+        )
+
+    root_node = int(hierarchy.component_roots[0])
+    non_root_component = replace(
+        forest,
+        representatives=_changed(forest.representatives, 0, root_node),
+        sizes=_changed(forest.sizes, 0, hierarchy.n_leaves),
+        component_roots=np.asarray([0], dtype=np.int32),
+    )
+    with pytest.raises(ValueError, match="component root is not a root event"):
+        aggregate_plateau_statistics(
+            hierarchy,
+            non_root_component,
+            topology,
+        )
+
+    root_child = int(forest.child_offsets[2])
+    uncovered = replace(
+        forest,
+        parent_events=_changed(forest.parent_events, 0, -1),
+        child_refs=_changed(forest.child_refs, root_child, -1),
+    )
+    with pytest.raises(ValueError, match="do not cover every event"):
+        aggregate_plateau_statistics(hierarchy, uncovered, topology)
+
+
+def test_disconnected_topology_includes_an_isolated_component() -> None:
+    graph = _canonical_graph(3, [(0, 1)])
+    hierarchy = fit_paris_hierarchy(graph)
+    forest = collapse_equal_height_plateaus(hierarchy)
+
+    topology = collect_topology_statistics(graph, hierarchy)
+    events = aggregate_plateau_statistics(hierarchy, forest, topology)
+    gains = modularity_split_gains(hierarchy, forest, graph)
+
+    assert hierarchy.component_roots.tolist() == [3, 2]
+    assert forest.component_roots.tolist() == [0, -3]
+    assert topology.leaf_degrees.tolist() == [1, 1, 0]
+    assert topology.lca_edge_counts.tolist() == [1, 0]
+    assert topology.component_edge_counts.tolist() == [1, 0]
+    assert events.cross_edges.tolist() == [1]
+    assert events.volumes.tolist() == [2]
+    np.testing.assert_allclose(gains, [-0.5])
+
+
+def test_aggregate_rejects_component_counts_and_volumes_that_disagree() -> None:
+    hierarchy = _hierarchy(
+        [(0, 1), (2, 3), (4, 5)],
+        [1.0, 1.0, np.inf],
+        component_roots=[4, 5],
+        synthetic_joins=[False, False, True],
+    )
+    forest = collapse_equal_height_plateaus(hierarchy)
+    topology = collect_topology_statistics(
+        _canonical_graph(4, [(0, 1), (2, 3)]),
+        hierarchy,
+    )
+
+    shifted_lca_counts = np.asarray(topology.lca_edge_counts).copy()
+    shifted_lca_counts[:2] = [2, 0]
+    with pytest.raises(ValueError, match="does not contain its declared edges"):
+        aggregate_plateau_statistics(
+            hierarchy,
+            forest,
+            TopologyStatistics(
+                leaf_degrees=np.asarray(topology.leaf_degrees).copy(),
+                lca_edge_counts=shifted_lca_counts,
+                component_edge_counts=np.asarray(topology.component_edge_counts).copy(),
+            ),
+        )
+
+    inconsistent_degrees = np.asarray(topology.leaf_degrees).copy()
+    inconsistent_degrees[0] += 1
+    with pytest.raises(ValueError, match="volume is not twice"):
+        aggregate_plateau_statistics(
+            hierarchy,
+            forest,
+            TopologyStatistics(
+                leaf_degrees=inconsistent_degrees,
+                lca_edge_counts=np.asarray(topology.lca_edge_counts).copy(),
+                component_edge_counts=np.asarray(topology.component_edge_counts).copy(),
+            ),
+        )
+
+
+def test_aggregate_rejects_cross_component_and_nonpartitioning_children() -> None:
+    disconnected = _hierarchy(
+        [(0, 1), (2, 3), (4, 5)],
+        [1.0, 1.0, np.inf],
+        component_roots=[4, 5],
+        synthetic_joins=[False, False, True],
+    )
+    disconnected_forest = collapse_equal_height_plateaus(disconnected)
+    disconnected_topology = collect_topology_statistics(
+        _canonical_graph(4, [(0, 1), (2, 3)]),
+        disconnected,
+    )
+    crossing_children = _changed(disconnected_forest.child_refs, 0, -3)
+    with pytest.raises(ValueError, match="crosses hierarchy components"):
+        aggregate_plateau_statistics(
+            disconnected,
+            replace(disconnected_forest, child_refs=crossing_children),
+            disconnected_topology,
+        )
+
+    hierarchy = _balanced_four_hierarchy()
+    forest = collapse_equal_height_plateaus(hierarchy)
+    topology = collect_topology_statistics(
+        _canonical_graph(4, [(0, 1), (2, 3), (0, 2), (1, 2)]),
+        hierarchy,
+    )
+    repeated_leaf = _changed(forest.child_refs, 3, int(forest.child_refs[2]))
+    with pytest.raises(ValueError, match="do not partition"):
+        aggregate_plateau_statistics(
+            hierarchy,
+            replace(forest, child_refs=repeated_leaf),
+            topology,
+        )
+
+
+def test_collect_rejects_empty_graph_and_noninteger_component_roots() -> None:
+    hierarchy = _balanced_four_hierarchy()
+    with pytest.raises(ValueError, match="at least one vertex"):
+        collect_topology_statistics(csr_matrix((0, 0)), hierarchy)
+
+    float_roots = replace(
+        hierarchy,
+        component_roots=hierarchy.component_roots.astype(np.float64),
+    )
+    with pytest.raises(TypeError, match="component roots must contain integers"):
+        collect_topology_statistics(
+            _canonical_graph(4, [(0, 1), (2, 3)]),
+            float_roots,
+        )
+
+
+def test_modularity_split_gains_are_empty_without_topology_edges() -> None:
+    graph = csr_matrix((3, 3), dtype=np.float64)
+    hierarchy = fit_paris_hierarchy(graph)
+    forest = collapse_equal_height_plateaus(hierarchy)
+
+    gains = modularity_split_gains(hierarchy, forest, graph)
+
+    assert gains.dtype == np.float64
+    assert gains.shape == (0,)

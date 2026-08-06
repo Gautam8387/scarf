@@ -24,7 +24,7 @@ from ._style import (
     theme_context,
 )
 
-_MISSING_CATEGORY = "\x00scarf_missing_category\x00"
+_MISSING_CATEGORY = object()
 
 
 def _constant_within_sample(
@@ -376,7 +376,7 @@ def composition(
     missing_mask = pd.isna(cats)
     cats[missing_mask] = _MISSING_CATEGORY
     observed_categories = [
-        value for value in pd.unique(cats) if value != _MISSING_CATEGORY
+        value for value in pd.unique(cats) if value is not _MISSING_CATEGORY
     ]
     if categorical_scale and categorical_scale.order is not None:
         cat_order = list(categorical_scale.order)
@@ -494,7 +494,7 @@ def composition(
             )
 
     nonmissing_order = [
-        category for category in cat_order if category != _MISSING_CATEGORY
+        category for category in cat_order if category is not _MISSING_CATEGORY
     ]
     palette = categorical_color_map(
         nonmissing_order,
@@ -515,7 +515,7 @@ def composition(
     )
 
     def category_label(value: Any) -> str:
-        if value == _MISSING_CATEGORY:
+        if value is _MISSING_CATEGORY:
             return missing_label
         return display_labels.get(value, str(value))
 

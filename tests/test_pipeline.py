@@ -183,6 +183,105 @@ def test_pipeline_emits_failed_stage_and_reraises_original_error(
     assert events[-1].error is expected_error
 
 
+def test_pipeline_retry_reuses_completed_artifacts_after_stage_failure(
+    datastore_ephemeral,
+    monkeypatch,
+) -> None:
+    datastore = datastore_ephemeral
+    expected_error = RuntimeError("transient neighbor query failure")
+    observed: dict[str, list[ArtifactRef]] = {
+        "normalized": [],
+        "pca": [],
+        "ann_index": [],
+    }
+    original_methods = {
+        "normalized": type(datastore).run_normalization,
+        "pca": type(datastore).run_pca,
+        "ann_index": type(datastore).build_ann_index,
+    }
+
+    def recording_method(stage: str):
+        original = original_methods[stage]
+
+        def wrapped(self, *args, **kwargs):
+            ref = original(self, *args, **kwargs)
+            observed[stage].append(ref)
+            return ref
+
+        return wrapped
+
+    for stage, method_name in (
+        ("normalized", "run_normalization"),
+        ("pca", "run_pca"),
+        ("ann_index", "build_ann_index"),
+    ):
+        monkeypatch.setattr(
+            type(datastore),
+            method_name,
+            recording_method(stage),
+        )
+
+    original_query_neighbors = type(datastore).query_neighbors
+    query_attempts = 0
+
+    def fail_first_neighbor_query(self, *args, **kwargs):
+        nonlocal query_attempts
+        query_attempts += 1
+        if query_attempts == 1:
+            raise expected_error
+        return original_query_neighbors(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        type(datastore),
+        "query_neighbors",
+        fail_first_neighbor_query,
+    )
+    options = {
+        "filtering": False,
+        "cell_cycle_scoring": False,
+        "highly_variable_features": {
+            "top_n": 50,
+            "hvg_key_name": "pipeline_resume_hvgs",
+        },
+        "pca": {"dims": 3, "n_centroids": 5},
+        "neighbors": {"k": 3},
+        "umap": False,
+        "leiden": {},
+        "paris": False,
+        "doublet_scoring": False,
+        "markers": False,
+    }
+    failed_events: list[PipelineEvent] = []
+
+    with pytest.raises(
+        RuntimeError, match="transient neighbor query failure"
+    ) as raised:
+        datastore.pipeline.run(**options, callback=failed_events.append)
+
+    assert raised.value is expected_error
+    assert [(event.kind, event.stage) for event in failed_events[-2:]] == [
+        ("stage_started", "neighbors"),
+        ("stage_failed", "neighbors"),
+    ]
+    assert failed_events[-1].error is expected_error
+    assert not {
+        "connectivity",
+        "embedding_initialization",
+    }.intersection(event.stage for event in failed_events)
+    first_refs = {stage: refs[0] for stage, refs in observed.items()}
+    assert all(datastore.inspect_artifact(ref).complete for ref in first_refs.values())
+
+    retry_events: list[PipelineEvent] = []
+    artifacts = datastore.pipeline.run(**options, callback=retry_events.append)
+
+    assert query_attempts == 2
+    assert all(event.kind != "stage_failed" for event in retry_events)
+    assert artifacts["normalized"] == first_refs["normalized"]
+    assert artifacts["pca"] == first_refs["pca"]
+    assert artifacts["ann_index"] == first_refs["ann_index"]
+    assert {stage: refs[1] for stage, refs in observed.items()} == first_refs
+
+
 def test_pipeline_logs_callback_errors_and_continues(
     datastore_ephemeral,
     monkeypatch,

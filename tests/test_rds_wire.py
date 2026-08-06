@@ -24,6 +24,7 @@ from scarf.readers._rds import (
     PairValue,
     PersistentValue,
     PromiseValue,
+    R_INT_NA,
     RdsClosedError,
     RdsCompression,
     RdsFormatError,
@@ -527,3 +528,400 @@ def test_rejects_rdata_headers_and_bad_references() -> None:
         match=r"reference index 3 is out of range at \$",
     ):
         open_rds(io.BytesIO(bad_reference))
+
+
+def test_ascii_octal_and_string_escapes_are_decoded() -> None:
+    wire = Wire("ascii", version=2)
+    octal_value = b"AB\x07C!G"
+    octal_char = (
+        wire.integer(wire.flags(RType.CHAR, gp=1 << 6))
+        + wire.integer(len(octal_value))
+        + b"\\101B\\7C\\41G\n"
+    )
+    escaped_value = b"\n\t\v\b\r\f\a\\?'\"q"
+    escaped_char = (
+        wire.integer(wire.flags(RType.CHAR, gp=1 << 6))
+        + wire.integer(len(escaped_value))
+        + b"\\n\\t\\v\\b\\r\\f\\a\\\\\\?\\'\\\"\\q\n"
+    )
+    root = wire.integer(RType.STRING) + wire.integer(2) + octal_char + escaped_char
+
+    with open_rds(io.BytesIO(wire.document(root))) as document:
+        strings = document.root.value
+        assert isinstance(strings, LazyStringVector)
+        assert strings.raw(0) == octal_value
+        assert strings.raw(1) == escaped_value
+        assert strings[:] == [
+            octal_value.decode("ascii"),
+            escaped_value.decode("ascii"),
+        ]
+
+
+def test_ascii_numeric_special_tokens_are_parsed() -> None:
+    wire = Wire("ascii", version=2)
+    integer = wire.integer(RType.INTEGER) + wire.integer(2) + b"NA\n7\n"
+    with open_rds(io.BytesIO(wire.document(integer))) as document:
+        np.testing.assert_array_equal(document.root.value[:], [R_INT_NA, 7])
+
+    real = (
+        wire.integer(RType.REAL) + wire.integer(5) + b"NA\nNaN\nInf\n-Inf\n0x1.8p+1\n"
+    )
+    with open_rds(io.BytesIO(wire.document(real))) as document:
+        values = document.root.value[:]
+        assert np.isnan(values[0])
+        assert np.isnan(values[1])
+        assert np.isposinf(values[2])
+        assert np.isneginf(values[3])
+        assert values[4] == 3.0
+
+    complex_vector = (
+        wire.integer(RType.COMPLEX) + wire.integer(2) + b"1.5\n-2.25\nNA\nInf\n"
+    )
+    with open_rds(io.BytesIO(wire.document(complex_vector))) as document:
+        values = document.root.value[:]
+        assert values[0] == complex(1.5, -2.25)
+        assert np.isnan(values[1].real)
+        assert np.isposinf(values[1].imag)
+
+
+@pytest.mark.parametrize("case", ["header", "root", "vector"])
+def test_truncated_binary_payloads_report_object_paths(case: str) -> None:
+    wire = Wire()
+    cases = {
+        "header": (b"X\n\x00\x00", "$header.formatVersion"),
+        "root": (wire.header(), "$"),
+        "vector": (
+            wire.document(wire.integer_vector([1, 2]))[:-1],
+            "$",
+        ),
+    }
+    payload, expected_path = cases[case]
+
+    with pytest.raises(
+        RdsFormatError,
+        match="unexpected end of stream",
+    ) as caught:
+        open_rds(io.BytesIO(payload))
+    assert caught.value.path == expected_path
+
+
+@pytest.mark.parametrize("case", ["token", "escape"])
+def test_ascii_eof_inside_token_or_escape_is_rejected(case: str) -> None:
+    wire = Wire("ascii", version=2)
+    roots = {
+        "token": wire.integer(RType.NIL_VALUE).rstrip(b"\n"),
+        "escape": (
+            wire.integer(wire.flags(RType.CHAR, gp=1 << 6)) + wire.integer(1) + b"\\"
+        ),
+    }
+
+    with pytest.raises(
+        RdsFormatError,
+        match="unexpected end of stream",
+    ) as caught:
+        open_rds(io.BytesIO(wire.header() + roots[case]))
+    assert caught.value.path == "$"
+
+
+def test_ascii_tokens_enforce_the_127_byte_boundary() -> None:
+    wire = Wire("ascii", version=2)
+    accepted = b"0." + b"0" * 124 + b"1"
+    assert len(accepted) == 127
+    root = wire.integer(RType.REAL) + wire.integer(1) + accepted + b"\n"
+    with open_rds(io.BytesIO(wire.document(root))) as document:
+        assert document.root.value[0] == float(accepted)
+
+    rejected = accepted + b"0"
+    assert len(rejected) == 128
+    root = wire.integer(RType.REAL) + wire.integer(1) + rejected + b"\n"
+    with pytest.raises(
+        RdsFormatError,
+        match="ASCII token exceeds 127 bytes",
+    ) as caught:
+        open_rds(io.BytesIO(wire.document(root)))
+    assert caught.value.path == "$[0]"
+
+
+@pytest.mark.parametrize("index", [0, -1, 2])
+def test_extended_reference_indices_are_validated(index: int) -> None:
+    wire = Wire()
+    reference = wire.integer(RType.REFERENCE) + wire.integer(index)
+
+    with pytest.raises(
+        RdsFormatError,
+        match=rf"reference index {index} is out of range",
+    ) as caught:
+        open_rds(io.BytesIO(wire.document(reference)))
+    assert caught.value.path == "$"
+
+
+def test_character_vector_reference_requires_a_char_target() -> None:
+    wire = Wire()
+    referenced_symbol = wire.integer((1 << 8) | RType.REFERENCE)
+    strings = wire.integer(RType.STRING) + wire.integer(1) + referenced_symbol
+    root = wire.vector([wire.symbol("not-a-char"), strings])
+
+    with pytest.raises(
+        RdsFormatError,
+        match="character vector reference does not target CHAR",
+    ) as caught:
+        open_rds(io.BytesIO(wire.document(root)))
+    assert caught.value.path == "$[1][0]"
+
+
+def test_undefined_bytecode_reference_is_rejected() -> None:
+    wire = Wire()
+    bytecode = (
+        wire.integer(RType.BYTECODE)
+        + wire.integer(1)
+        + wire.integer_vector([12])
+        + wire.integer(1)
+        + wire.integer(RType.BYTECODE_REFERENCE)
+        + wire.integer(0)
+    )
+
+    with pytest.raises(
+        RdsFormatError,
+        match="bytecode reference 0 is out of range",
+    ) as caught:
+        open_rds(io.BytesIO(wire.document(bytecode)))
+    assert caught.value.path == "$.constants[0]"
+
+
+@pytest.mark.parametrize("case", ["marker", "version", "native-order"])
+def test_malformed_headers_are_rejected(case: str) -> None:
+    version_one = Wire(version=1)
+    cases = {
+        "marker": (
+            b"Q\n",
+            "unknown R serialization format marker",
+            "$header",
+        ),
+        "version": (
+            version_one.document(version_one.nil()),
+            "unsupported R serialization version 1",
+            "$header.formatVersion",
+        ),
+        "native-order": (
+            b"B\n\x00\x00\x00\x00",
+            "cannot determine native binary byte order",
+            "$header",
+        ),
+    }
+    payload, message, expected_path = cases[case]
+
+    with pytest.raises(RdsFormatError, match=message) as caught:
+        open_rds(io.BytesIO(payload))
+    assert caught.value.path == expected_path
+
+
+def test_non_ascii_native_encoding_header_is_rejected() -> None:
+    wire = Wire()
+    payload = wire.header()[:-5] + b"\xffTF-8" + wire.nil()
+
+    with pytest.raises(
+        RdsFormatError,
+        match="native encoding name is not ASCII",
+    ) as caught:
+        open_rds(io.BytesIO(payload))
+    assert caught.value.path == "$header.nativeEncoding"
+
+
+def test_character_vector_rejects_tagged_char_nodes() -> None:
+    wire = Wire()
+    tagged_char = (
+        wire.integer(wire.flags(RType.CHAR, tag=True, gp=1 << 6))
+        + wire.integer(1)
+        + wire.string(b"x")
+        + wire.nil()
+    )
+    root = wire.integer(RType.STRING) + wire.integer(1) + tagged_char
+
+    with pytest.raises(
+        RdsFormatError,
+        match="CHAR node cannot have a tag",
+    ) as caught:
+        open_rds(io.BytesIO(wire.document(root)))
+    assert caught.value.path == "$[0]"
+
+
+@pytest.mark.parametrize(
+    ("type_code", "message"),
+    [
+        (127, "unknown R node type 127"),
+        (
+            RType.CLASS_REFERENCE,
+            "class_reference is not a readable R serialization node",
+        ),
+        (
+            RType.GENERIC_REFERENCE,
+            "generic_reference is not a readable R serialization node",
+        ),
+    ],
+)
+def test_invalid_node_type_tags_are_rejected(
+    type_code: int,
+    message: str,
+) -> None:
+    wire = Wire()
+
+    with pytest.raises(RdsFormatError, match=message) as caught:
+        open_rds(io.BytesIO(wire.document(wire.integer(type_code))))
+    assert caught.value.path == "$"
+
+
+def test_scalar_and_empty_container_nodes_are_preserved() -> None:
+    wire = Wire()
+    special = wire.integer(RType.SPECIAL) + wire.integer(3) + wire.string(b"sum")
+    builtin = wire.integer(RType.BUILTIN) + wire.integer(1) + wire.string(b"+")
+    expression = wire.integer(RType.EXPRESSION) + wire.integer(0)
+    root = wire.vector(
+        [
+            wire.char(None),
+            wire.char(b""),
+            special,
+            builtin,
+            wire.integer(RType.ANY),
+            wire.integer_vector([]),
+            wire.string_vector([]),
+            wire.vector([]),
+            expression,
+        ]
+    )
+
+    with open_rds(io.BytesIO(wire.document(root))) as document:
+        (
+            missing_char,
+            empty_char,
+            special_node,
+            builtin_node,
+            any_node,
+            empty_integer,
+            empty_string,
+            empty_vector,
+            empty_expression,
+        ) = document.root.value
+        assert missing_char.value is None
+        assert empty_char.value == ""
+        assert special_node.value == "sum"
+        assert builtin_node.value == "+"
+        assert any_node.value is None
+        assert empty_integer.value[:].size == 0
+        assert empty_string.value[:] == []
+        assert empty_vector.value == ()
+        assert empty_expression.value == ()
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["negative-vector", "long-upper", "char-length", "string-child"],
+)
+def test_invalid_container_shapes_are_rejected(case: str) -> None:
+    wire = Wire()
+    cases = {
+        "negative-vector": (
+            wire.integer(RType.VECTOR) + wire.integer(-2),
+            "negative vector length -2",
+            "$.length",
+        ),
+        "long-upper": (
+            wire.integer(RType.INTEGER)
+            + wire.integer(-1)
+            + wire.integer(65_537)
+            + wire.integer(0),
+            "long-vector upper length 65537 exceeds R's wire limit",
+            "$.length",
+        ),
+        "char-length": (
+            wire.integer(RType.CHAR) + wire.integer(-2),
+            "invalid string length -2",
+            "$",
+        ),
+        "string-child": (
+            wire.integer(RType.STRING) + wire.integer(1) + wire.integer(RType.INTEGER),
+            "character vector element has type INTEGER",
+            "$[0]",
+        ),
+    }
+    root, message, expected_path = cases[case]
+
+    with pytest.raises(RdsFormatError, match=message) as caught:
+        open_rds(io.BytesIO(wire.document(root)))
+    assert caught.value.path == expected_path
+
+
+def test_trailing_data_rules_follow_the_wire_encoding() -> None:
+    wire = Wire()
+    with pytest.raises(
+        RdsFormatError,
+        match="1 trailing bytes after root object",
+    ) as caught:
+        open_rds(io.BytesIO(wire.document(wire.nil()) + b"\x00"))
+    assert caught.value.path == "$"
+
+    ascii_wire = Wire("ascii", version=2)
+    whitespace = ascii_wire.document(ascii_wire.nil()) + b" \t\r\n"
+    with open_rds(io.BytesIO(whitespace)) as document:
+        assert document.root.is_null
+
+    non_whitespace = ascii_wire.document(ascii_wire.nil()) + b" !"
+    with pytest.raises(
+        RdsFormatError,
+        match="non-whitespace data follows the root object",
+    ) as caught:
+        open_rds(io.BytesIO(non_whitespace))
+    assert caught.value.path == "$"
+
+
+def test_seekable_stream_range_and_position_are_preserved() -> None:
+    wire = Wire()
+    payload = wire.document(wire.integer_vector([4, 5]))
+    prefix = b"ignored-prefix"
+    stream = io.BytesIO(prefix + payload)
+    start = stream.seek(len(prefix))
+
+    with open_rds(stream) as document:
+        assert document.source.source_bytes == len(payload)
+        assert document.source.source_sha256 == hashlib.sha256(payload).hexdigest()
+        np.testing.assert_array_equal(document.root.value[:], [4, 5])
+
+    assert stream.tell() == start
+    assert stream.closed is False
+
+
+def test_failed_stream_parse_restores_the_input_position() -> None:
+    prefix = b"ignored-prefix"
+    stream = io.BytesIO(prefix + b"Q\n")
+    start = stream.seek(len(prefix))
+
+    with pytest.raises(
+        RdsFormatError,
+        match="unknown R serialization format marker",
+    ):
+        open_rds(stream)
+
+    assert stream.tell() == start
+    assert stream.closed is False
+
+
+def test_extended_references_and_singletons_preserve_identity() -> None:
+    wire = Wire()
+    extended_reference = wire.integer(RType.REFERENCE) + wire.integer(1)
+    root = wire.vector(
+        [
+            wire.symbol("shared"),
+            extended_reference,
+            wire.nil(),
+            wire.nil(),
+            wire.integer(RType.BASE_ENVIRONMENT),
+            wire.integer(RType.BASE_ENVIRONMENT),
+        ]
+    )
+
+    with open_rds(io.BytesIO(wire.document(root))) as document:
+        symbol, reference, first_nil, second_nil, first_base, second_base = (
+            document.root.value
+        )
+        assert symbol is reference
+        assert first_nil is second_nil
+        assert first_base is second_base

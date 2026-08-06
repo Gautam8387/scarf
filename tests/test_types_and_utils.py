@@ -4,6 +4,7 @@ import weakref
 import numpy as np
 import pytest
 import zarr
+from scipy.sparse import coo_matrix
 from zarr.storage import MemoryStore
 
 from scarf.storage.types import (
@@ -22,6 +23,7 @@ from scarf.utils import (
     show_dask_progress,
     tqdmbar,
 )
+from scarf.utils.arrays import canonicalize_sparse, checked_sparse_cast
 from scarf.utils.progress import iter_progress
 
 
@@ -214,3 +216,85 @@ def test_permute_into_chunks_preserves_all_indices():
     chunks = permute_into_chunks(10, 3, seed=7)
     merged = np.concatenate(chunks)
     assert np.array_equal(np.sort(merged), np.arange(10))
+
+
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [
+        (
+            np.array([1 + 0j]),
+            "Complex sparse values cannot use an integer destination",
+        ),
+        (
+            np.array([1.5]),
+            "cannot be represented by the destination dtype",
+        ),
+        (
+            np.array([np.nan]),
+            "cannot be represented by the destination dtype",
+        ),
+    ],
+)
+def test_checked_sparse_cast_rejects_lossy_integer_conversions(values, message):
+    with pytest.raises(OverflowError, match=message):
+        checked_sparse_cast(values, np.int32)
+
+
+def test_canonicalize_sparse_handles_empty_and_already_canonical_inputs():
+    empty = coo_matrix(
+        (
+            np.array([], dtype=np.int64),
+            (
+                np.array([], dtype=np.int64),
+                np.array([], dtype=np.int64),
+            ),
+        ),
+        shape=(2, 2),
+    )
+    empty.has_canonical_format = False
+
+    canonical_empty = canonicalize_sparse(empty)
+
+    assert canonical_empty.shape == (2, 2)
+    assert canonical_empty.nnz == 0
+    assert canonical_empty.has_canonical_format
+
+    canonical = coo_matrix(
+        (
+            np.array([1.0, 2.0]),
+            (
+                np.array([0, 1]),
+                np.array([0, 1]),
+            ),
+        ),
+        shape=(2, 2),
+    )
+    canonical.sum_duplicates()
+
+    returned = canonicalize_sparse(canonical, dtype=np.int16)
+
+    assert returned is canonical
+    assert returned.dtype == np.dtype(np.int16)
+    np.testing.assert_array_equal(returned.data, [1, 2])
+
+
+def test_canonicalize_sparse_detects_int64_duplicate_overflow():
+    maximum = np.iinfo(np.int64).max
+    duplicated = coo_matrix(
+        (
+            np.array([maximum, 1], dtype=np.int64),
+            (
+                np.array([0, 0]),
+                np.array([0, 0]),
+            ),
+        ),
+        shape=(1, 1),
+    )
+
+    with pytest.raises(OverflowError, match="Duplicate sparse values exceed"):
+        canonicalize_sparse(duplicated)
+
+
+def test_array_digest_rejects_object_values():
+    with pytest.raises(TypeError, match="object arrays"):
+        array_digest(np.array([object()], dtype=object))

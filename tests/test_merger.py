@@ -1453,7 +1453,7 @@ def test_dataset_merge_plan_blocks_counts_t_for_zarr_v2(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("case", "counts_t", "error", "expected"),
+    ("case", "counts_t", "error", "expected", "completion"),
     [
         (
             "cell_metadata",
@@ -1464,6 +1464,7 @@ def test_dataset_merge_plan_blocks_counts_t_for_zarr_v2(tmp_path):
                 "counts:RNA": "resume",
                 "countsT:RNA": "skip",
             },
+            {"cellData": False, "RNA": None},
         ),
         (
             "counts",
@@ -1474,6 +1475,7 @@ def test_dataset_merge_plan_blocks_counts_t_for_zarr_v2(tmp_path):
                 "counts:RNA": "resume",
                 "countsT:RNA": "skip",
             },
+            {"cellData": True, "RNA": False},
         ),
         (
             "counts_t",
@@ -1484,6 +1486,7 @@ def test_dataset_merge_plan_blocks_counts_t_for_zarr_v2(tmp_path):
                 "counts:RNA": "skip",
                 "countsT:RNA": "resume",
             },
+            {"cellData": True, "RNA": True, "RNA/countsT": False},
         ),
         (
             "later_assay",
@@ -1493,6 +1496,7 @@ def test_dataset_merge_plan_blocks_counts_t_for_zarr_v2(tmp_path):
                 "counts:RNA": "skip",
                 "counts:ADT": "resume",
             },
+            {"cellData": True, "RNA": True, "ADT": False},
         ),
     ],
 )
@@ -1503,8 +1507,24 @@ def test_dataset_merge_resumes_after_component_interruption(
     counts_t,
     error,
     expected,
+    completion,
 ):
     path = str(tmp_path / f"resume_{case}.zarr")
+
+    def assert_interrupted_completion_boundaries():
+        interrupted = zarr.open_group(path, mode="r")
+        assert interrupted.attrs["scarf:import_complete"] is False
+        assert interrupted.attrs["complete"] is False
+        for component_path, expected_complete in completion.items():
+            if expected_complete is None:
+                assert component_path not in interrupted
+            else:
+                assert component_path in interrupted
+                assert (
+                    interrupted[component_path].attrs.get("complete")
+                    is expected_complete
+                )
+
     if case == "later_assay":
         left, right = _two_assay_sources()
         original = merge_datasets.write_assay_counts
@@ -1525,6 +1545,7 @@ def test_dataset_merge_resumes_after_component_interruption(
         }
         with pytest.raises(RuntimeError, match=error):
             DataStoreMerge(**dump_kwargs).dump()
+        assert_interrupted_completion_boundaries()
         monkeypatch.setattr(merge_datasets, "write_assay_counts", original)
         result = DataStoreMerge(**dump_kwargs).dump()
         actions = {component.name: component.action for component in result.components}
@@ -1569,6 +1590,7 @@ def test_dataset_merge_resumes_after_component_interruption(
             overwrite=False,
             counts_t=counts_t,
         ).dump()
+    assert_interrupted_completion_boundaries()
     monkeypatch.setattr(merge_datasets, restore[0], restore[1])
 
     if case == "cell_metadata":
@@ -2576,3 +2598,514 @@ def test_dataset_merge_rejects_insufficient_counts_budget(tmp_path):
     with pytest.raises(MemoryError):
         merger.plan()
     assert not (tmp_path / "counts_budget.zarr").exists()
+
+
+@pytest.mark.parametrize(
+    ("left_values", "right_values", "expected_dtype", "expected"),
+    [
+        (
+            np.array([True, False]),
+            np.array([2, 3], dtype=np.int16),
+            np.dtype(np.int16),
+            {
+                "left__c0": 1,
+                "left__c1": 0,
+                "right__c0": 2,
+                "right__c1": 3,
+            },
+        ),
+        (
+            np.array([-2, 3], dtype=np.int16),
+            np.array([1.5, 2.5], dtype=np.float32),
+            np.dtype(np.float64),
+            {
+                "left__c0": -2.0,
+                "left__c1": 3.0,
+                "right__c0": 1.5,
+                "right__c1": 2.5,
+            },
+        ),
+        (
+            np.array([1, 2], dtype=np.int16),
+            np.array(["three", "four"]),
+            np.dtype("U5"),
+            {
+                "left__c0": "1",
+                "left__c1": "2",
+                "right__c0": "three",
+                "right__c1": "four",
+            },
+        ),
+    ],
+)
+def test_dataset_merge_promotes_metadata_types(
+    left_values,
+    right_values,
+    expected_dtype,
+    expected,
+):
+    destination = MemoryStore()
+    merger = _merge_two_rna(zarr_path=destination, overwrite=False)
+    for source, values in zip(
+        merger.datasets,
+        (left_values, right_values),
+        strict=True,
+    ):
+        metadata = _MergeMeta(
+            ids=["c0", "c1"],
+            names=["c0", "c1"],
+            I=np.ones(2, dtype=bool),
+            score=values,
+        )
+        source.cells = metadata
+        source.get_assay("RNA").cells = metadata
+
+    merger.dump()
+
+    root = zarr.open_group(destination, mode="r")
+    ids = np.asarray(root["cellData/ids"][:]).astype(str)
+    values = np.asarray(root["cellData/score"][:])
+    assert values.dtype == expected_dtype
+    assert dict(zip(ids, values.tolist(), strict=True)) == expected
+
+
+def test_dataset_merge_preserves_typed_fill_values_and_missing_masks():
+    destination = MemoryStore()
+    merger = _merge_two_rna(zarr_path=destination, overwrite=False)
+    left, right = merger.datasets
+    left.cells = _MergeMeta(
+        ids=["c0", "c1"],
+        names=["c0", "c1"],
+        I=np.ones(2, dtype=bool),
+        passed=np.array([True, False]),
+        score=np.array([1.25, 2.5], dtype=np.float32),
+    )
+    right.cells = _MergeMeta(
+        ids=["c0", "c1"],
+        names=["c0", "c1"],
+        I=np.ones(2, dtype=bool),
+    )
+    left.get_assay("RNA").cells = left.cells
+    right.get_assay("RNA").cells = right.cells
+
+    merger.dump()
+
+    root = zarr.open_group(destination, mode="r")
+    cell_data = root["cellData"]
+    ids = np.asarray(cell_data["ids"][:]).astype(str)
+    positions = {cell_id: index for index, cell_id in enumerate(ids)}
+    passed = np.asarray(cell_data["passed"][:])
+    passed_missing = np.asarray(cell_data["__scarf_missing__passed"][:])
+    score = np.asarray(cell_data["score"][:])
+    score_missing = np.asarray(cell_data["__scarf_missing__score"][:])
+    assert passed.dtype == np.dtype(bool)
+    assert score.dtype == np.dtype(np.float32)
+    for cell_id in ("left__c0", "left__c1"):
+        assert bool(passed_missing[positions[cell_id]]) is False
+        assert bool(score_missing[positions[cell_id]]) is False
+    for cell_id in ("right__c0", "right__c1"):
+        position = positions[cell_id]
+        assert bool(passed_missing[position]) is True
+        assert bool(score_missing[position]) is True
+        assert bool(passed[position]) is False
+        assert np.isnan(score[position])
+
+
+def test_dataset_merge_widens_signed_counts_before_feature_consolidation():
+    left = _MergeDataStore(
+        [
+            _MergeAssay(
+                "RNA",
+                np.array([[100, 100]], dtype=np.int8),
+                ["c0"],
+                ["gene_0", "gene_1"],
+                ["gene_0", "gene_1"],
+                block_size=1,
+            )
+        ],
+        zarr_loc="memory://left",
+    )
+    right = _MergeDataStore(
+        [
+            _MergeAssay(
+                "RNA",
+                np.array([[-100, -100]], dtype=np.int8),
+                ["c0"],
+                ["gene_0", "gene_1"],
+                ["gene_0", "gene_1"],
+                block_size=1,
+            )
+        ],
+        zarr_loc="memory://right",
+    )
+    destination = MemoryStore()
+    merger = DataStoreMerge(
+        datasets=[left, right],
+        zarr_path=destination,
+        names=["left", "right"],
+        prepend_text="",
+        counts_t="none",
+        seed=0,
+    )
+
+    plan = merger.plan()
+    assert plan.assays[0].dtype == "int16"
+    assert plan.assays[0].nFeatures == 1
+    merger.dump()
+
+    root = zarr.open_group(destination, mode="r")
+    ids = np.asarray(root["cellData/ids"][:]).astype(str)
+    counts = np.asarray(root["RNA/counts"][:])
+    assert counts.dtype == np.dtype(np.int16)
+    assert {cell_id: int(row[0]) for cell_id, row in zip(ids, counts, strict=True)} == {
+        "left__c0": 200,
+        "right__c0": -200,
+    }
+
+
+def test_dataset_merge_uses_float_counts_for_mixed_source_dtypes():
+    destination = MemoryStore()
+    merger = _merge_two_rna(zarr_path=destination, overwrite=False)
+    merger.datasets[0].get_assay("RNA").rawData = ChunkedArray.from_numpy(
+        np.array([[1, 10], [2, 20]], dtype=np.int16),
+        block_size=2,
+    )
+    merger.datasets[1].get_assay("RNA").rawData = ChunkedArray.from_numpy(
+        np.array([[3, 30], [4, 40]], dtype=np.uint16),
+        block_size=2,
+    )
+
+    plan = merger.plan()
+    assert plan.assays[0].dtype == "float"
+    merger.dump()
+
+    root = zarr.open_group(destination, mode="r")
+    counts = np.asarray(root["RNA/counts"][:])
+    assert counts.dtype == np.dtype(np.float64)
+    assert int(counts.sum()) == 110
+
+
+@pytest.mark.parametrize(
+    ("left_ids", "left_names", "right_ids", "right_names"),
+    [
+        (
+            ["gene_0", "gene_1"],
+            ["gene_0", "gene_1"],
+            ["right_a", "right_b"],
+            ["gene", "gene"],
+        ),
+        (
+            ["gene_1", "gene_2"],
+            ["gene_1", "gene_2"],
+            ["gene_0", "gene_1"],
+            ["gene_0", "gene_1"],
+        ),
+    ],
+)
+def test_dataset_merge_normalizes_duplicate_feature_suffixes(
+    left_ids,
+    left_names,
+    right_ids,
+    right_names,
+):
+    left = _MergeDataStore(
+        [
+            _MergeAssay(
+                "RNA",
+                [[1, 10]],
+                ["c0"],
+                left_ids,
+                left_names,
+                block_size=1,
+            )
+        ],
+        zarr_loc="memory://left",
+    )
+    right = _MergeDataStore(
+        [
+            _MergeAssay(
+                "RNA",
+                [[2, 20]],
+                ["c0"],
+                right_ids,
+                right_names,
+                block_size=1,
+            )
+        ],
+        zarr_loc="memory://right",
+    )
+    destination = MemoryStore()
+    merger = DataStoreMerge(
+        datasets=[left, right],
+        zarr_path=destination,
+        names=["left", "right"],
+        prepend_text="",
+        counts_t="none",
+        seed=0,
+    )
+
+    plan = merger.plan()
+    assert plan.assays[0].nFeatures == 1
+    assert plan.assays[0].featureOverlapFraction == 1.0
+    merger.dump()
+
+    root = zarr.open_group(destination, mode="r")
+    assert np.asarray(root["RNA/featureData/ids"][:]).astype(str).tolist() == ["gene"]
+    ids = np.asarray(root["cellData/ids"][:]).astype(str)
+    counts = np.asarray(root["RNA/counts"][:])
+    assert {cell_id: int(row[0]) for cell_id, row in zip(ids, counts, strict=True)} == {
+        "left__c0": 11,
+        "right__c0": 22,
+    }
+
+
+def test_dataset_merge_rejects_feature_numbering_that_starts_at_two():
+    left = _MergeDataStore(
+        [
+            _MergeAssay(
+                "RNA",
+                [[1]],
+                ["c0"],
+                ["gene_2"],
+                ["gene_2"],
+                block_size=1,
+            )
+        ],
+        zarr_loc="memory://left",
+    )
+    right = _MergeDataStore(
+        [
+            _MergeAssay(
+                "RNA",
+                [[2]],
+                ["c0"],
+                ["gene_0"],
+                ["gene_0"],
+                block_size=1,
+            )
+        ],
+        zarr_loc="memory://right",
+    )
+    with pytest.raises(ValueError, match="Feature Numbering starts with 2"):
+        DataStoreMerge(
+            datasets=[left, right],
+            zarr_path=MemoryStore(),
+            names=["left", "right"],
+            counts_t="none",
+        ).plan()
+
+
+def test_dataset_merge_namespaces_duplicate_cell_ids_across_sources():
+    destination = MemoryStore()
+    _merge_two_rna(zarr_path=destination, overwrite=False).dump()
+
+    ids = (
+        np.asarray(zarr.open_group(destination, mode="r")["cellData/ids"][:])
+        .astype(str)
+        .tolist()
+    )
+    assert len(ids) == len(set(ids))
+    assert {cell_id.split("__", maxsplit=1)[0] for cell_id in ids} == {
+        "left",
+        "right",
+    }
+    assert sorted(cell_id.split("__", maxsplit=1)[1] for cell_id in ids) == [
+        "c0",
+        "c0",
+        "c1",
+        "c1",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"names": ["left"]}, "same length"),
+        ({"assays": ["ADT"]}, "Requested assays were not found"),
+        ({"counts_t": "sometimes"}, "counts_t must be one of"),
+        ({"missing_assay_policy": "ignore"}, "missing_assay_policy must be one of"),
+    ],
+)
+def test_dataset_merge_rejects_invalid_source_and_assay_matching(overrides, error):
+    sources = _merge_two_rna(zarr_path=MemoryStore(), overwrite=False).datasets
+    destination = MemoryStore()
+    kwargs = {
+        "datasets": sources,
+        "zarr_path": destination,
+        "names": ["left", "right"],
+        "counts_t": "none",
+    }
+    kwargs.update(overrides)
+
+    with pytest.raises(ValueError, match=error):
+        DataStoreMerge(**kwargs)
+    with pytest.raises(GroupNotFoundError):
+        zarr.open_group(destination, mode="r")
+
+
+def test_dataset_merge_rejects_feature_metadata_width_mismatch():
+    destination = MemoryStore()
+    merger = _merge_two_rna(zarr_path=destination, overwrite=False)
+    merger.datasets[1].get_assay("RNA").rawData = ChunkedArray.from_numpy(
+        np.array([[3], [4]], dtype=np.uint16),
+        block_size=2,
+    )
+
+    with pytest.raises(ValueError, match="rawData has 1 columns"):
+        merger.plan()
+    with pytest.raises(GroupNotFoundError):
+        zarr.open_group(destination, mode="r")
+
+
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    [
+        ("cell_id", "order of cells"),
+        ("feature_id", "featureData/ids"),
+        ("feature_name", "featureData/names"),
+    ],
+)
+def test_dataset_merge_resume_validates_current_source_identity(case, reason):
+    destination = MemoryStore()
+    _merge_two_rna(zarr_path=destination, overwrite=False).dump()
+    candidate = _merge_two_rna(zarr_path=destination, overwrite=False)
+
+    if case == "cell_id":
+        candidate.datasets[0].cells._columns["ids"] = np.array(["x0", "c1"])
+    elif case == "feature_id":
+        for source in candidate.datasets:
+            source.get_assay("RNA").feats._columns["ids"] = np.array(["id_x", "id_b"])
+    else:
+        candidate.datasets[0].get_assay("RNA").feats._columns["names"] = np.array(
+            ["X", "B"]
+        )
+
+    plan = candidate.plan()
+    assert plan.canDump is False
+    assert plan.blockedReason is not None
+    assert reason in plan.blockedReason
+
+
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    [
+        ("missing_column", "column 'names' is missing"),
+        ("wrong_shape", "column 'names' has the wrong shape"),
+        ("wrong_dtype", "column 'I' has dtype"),
+        ("wrong_chunks", "column 'ids' has the wrong chunks"),
+        ("wrong_role", "column 'RNA_I' has the wrong role"),
+        ("wrong_assay", "column 'RNA_I' has the wrong assay"),
+    ],
+)
+def test_dataset_merge_blocks_tampered_completed_cell_metadata(case, reason):
+    destination = MemoryStore()
+    _merge_two_rna(zarr_path=destination, overwrite=False).dump()
+    root = zarr.open_group(destination, mode="r+")
+    cell_data = root["cellData"]
+
+    if case == "missing_column":
+        del cell_data["names"]
+    elif case == "wrong_shape":
+        values = np.asarray(cell_data["names"][:])[:3]
+        del cell_data["names"]
+        cell_data.create_array("names", data=values, chunks=(2,))
+    elif case == "wrong_dtype":
+        values = np.asarray(cell_data["I"][:], dtype=np.uint8)
+        del cell_data["I"]
+        cell_data.create_array("I", data=values, chunks=(2,))
+    elif case == "wrong_chunks":
+        values = np.asarray(cell_data["ids"][:])
+        del cell_data["ids"]
+        cell_data.create_array("ids", data=values, chunks=(1,))
+    elif case == "wrong_role":
+        cell_data["RNA_I"].attrs["role"] = "other"
+    else:
+        cell_data["RNA_I"].attrs["assay"] = "ADT"
+
+    plan = _merge_two_rna(zarr_path=destination, overwrite=False).plan()
+    assert plan.canDump is False
+    assert plan.cellDataAction == "blocked"
+    assert plan.blockedReason is not None
+    assert reason in plan.blockedReason
+
+
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    [
+        ("mask_link", "has no missing mask"),
+        ("mask_missing", "is missing"),
+        ("mask_shape", "has the wrong shape"),
+        ("mask_dtype", "has the wrong dtype"),
+    ],
+)
+def test_dataset_merge_blocks_tampered_completed_missing_masks(case, reason):
+    def with_partial_quality(merger):
+        merger.datasets[0].cells._columns["quality"] = np.array([1, 2])
+        merger.datasets[0].cells.columns.append("quality")
+        return merger
+
+    destination = MemoryStore()
+    with_partial_quality(_merge_two_rna(zarr_path=destination, overwrite=False)).dump()
+    root = zarr.open_group(destination, mode="r+")
+    cell_data = root["cellData"]
+    missing_name = "__scarf_missing__quality"
+
+    if case == "mask_link":
+        cell_data["quality"].attrs["missing_mask"] = "wrong"
+    elif case == "mask_missing":
+        del cell_data[missing_name]
+    elif case == "mask_shape":
+        values = np.asarray(cell_data[missing_name][:])[:3]
+        del cell_data[missing_name]
+        cell_data.create_array(missing_name, data=values, chunks=(2,))
+    else:
+        values = np.asarray(cell_data[missing_name][:], dtype=np.uint8)
+        del cell_data[missing_name]
+        cell_data.create_array(missing_name, data=values, chunks=(2,))
+
+    plan = with_partial_quality(
+        _merge_two_rna(zarr_path=destination, overwrite=False)
+    ).plan()
+    assert plan.canDump is False
+    assert plan.blockedReason is not None
+    assert reason in plan.blockedReason
+
+
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    [
+        ("counts_missing", "counts array is missing"),
+        ("feature_data_missing", "featureData is missing"),
+        ("feature_ids_missing", "featureData/ids is missing"),
+        ("selection_shape", "featureData/I has the wrong shape"),
+        ("selection_dtype", "featureData/I has the wrong dtype"),
+    ],
+)
+def test_dataset_merge_blocks_tampered_completed_assay_components(case, reason):
+    destination = MemoryStore()
+    _merge_two_rna(zarr_path=destination, overwrite=False).dump()
+    root = zarr.open_group(destination, mode="r+")
+
+    if case == "counts_missing":
+        del root["RNA/counts"]
+    elif case == "feature_data_missing":
+        del root["RNA/featureData"]
+    elif case == "feature_ids_missing":
+        del root["RNA/featureData/ids"]
+    elif case == "selection_shape":
+        del root["RNA/featureData/I"]
+        root["RNA/featureData"].create_array(
+            "I",
+            data=np.ones(1, dtype=bool),
+            chunks=(1,),
+        )
+    else:
+        values = np.asarray(root["RNA/featureData/I"][:], dtype=np.uint8)
+        del root["RNA/featureData/I"]
+        root["RNA/featureData"].create_array("I", data=values, chunks=(2,))
+
+    plan = _merge_two_rna(zarr_path=destination, overwrite=False).plan()
+    assert plan.canDump is False
+    assert plan.assays[0].countsAction == "blocked"
+    assert plan.blockedReason is not None
+    assert reason in plan.blockedReason

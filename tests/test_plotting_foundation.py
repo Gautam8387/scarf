@@ -15,6 +15,111 @@ import pytest
 import scarf.plotting as splt
 
 
+class _ArrayCells:
+    def __init__(self, columns):
+        self._columns = {name: np.asarray(values) for name, values in columns.items()}
+        lengths = {len(values) for values in self._columns.values()}
+        if len(lengths) != 1:
+            raise ValueError("Synthetic cell columns must have matching lengths")
+        self.N = lengths.pop()
+        self.columns = tuple(self._columns)
+
+    def active_index(self, key):
+        return np.flatnonzero(np.asarray(self._columns[key], dtype=bool))
+
+    def fetch(self, column, key="I"):
+        return self._columns[column][self.active_index(key)]
+
+    def fetch_all(self, column):
+        return self._columns[column]
+
+
+class _ArrayFeatures:
+    def __init__(self, names):
+        self._names = np.asarray(names, dtype=object)
+        self._ids = np.asarray(
+            [f"feature-{index}" for index in range(len(names))],
+            dtype=object,
+        )
+        self.N = len(names)
+
+    def fetch_all(self, column):
+        return self._names if column == "names" else self._ids
+
+    def get_index_by(self, values, column):
+        source = self._names if column == "names" else self._ids
+        indices = []
+        for value in values:
+            indices.extend(np.flatnonzero(source == value).tolist())
+        return np.asarray(indices, dtype=np.int64)
+
+
+class _ArrayAssay:
+    def __init__(self, values, names):
+        self._values = np.asarray(values, dtype=np.float64)
+        self.rawData = self._values
+        self.feats = _ArrayFeatures(names)
+
+    def normed(self, *, cell_idx, feat_idx):
+        return self._values[
+            np.ix_(
+                np.asarray(cell_idx, dtype=np.int64),
+                np.asarray(feat_idx, dtype=np.int64),
+            )
+        ]
+
+
+class _ArrayStore:
+    _defaultAssay = "RNA"
+    nthreads = 1
+
+    def __init__(self, columns, feature_values):
+        self.cells = _ArrayCells(columns)
+        self.RNA = _ArrayAssay(feature_values, ["GeneA", "GeneB"])
+
+    def _get_assay(self, name):
+        if name != "RNA":
+            raise KeyError(name)
+        return self.RNA
+
+
+@pytest.fixture
+def synthetic_plot_store():
+    sample = np.repeat(["s1", "s2", "s3", "s4"], 3).astype(object)
+    subject = np.repeat(["donor1", "donor2", "donor1", "donor2"], 3).astype(object)
+    sample_with_missing = sample.copy()
+    sample_with_missing[0] = None
+    inconsistent_subject = subject.copy()
+    inconsistent_subject[1] = "donor3"
+    columns = {
+        "I": np.ones(12, dtype=bool),
+        "none_selected": np.zeros(12, dtype=bool),
+        "metricA": np.array(
+            [10.0, 11.0, 9.0, 10.5, 4.0, 5.0, 6.0, 5.5, 1.0, 2.0, 3.0, 2.5]
+        ),
+        "metricB": np.linspace(20.0, 31.0, 12),
+        "group": np.repeat(["group10", "group2", "group1"], 4),
+        "category": np.array(["B", "A", None] * 4, dtype=object),
+        "category_complete": np.array(["B", "A"] * 6, dtype=object),
+        "split": np.array(["left", "right"] * 6, dtype=object),
+        "split3": np.array(["left", "middle", "right"] * 4, dtype=object),
+        "sample": sample,
+        "sample_with_missing": sample_with_missing,
+        "invalid_sample": np.full(12, "", dtype=object),
+        "condition": np.repeat(["control", "control", "treated", "treated"], 3),
+        "invalid_condition": np.full(12, "", dtype=object),
+        "subject": subject,
+        "inconsistent_subject": inconsistent_subject,
+    }
+    feature_values = np.column_stack(
+        (
+            np.linspace(0.0, 5.5, 12),
+            np.array([0.0, 1.0, 0.0, 2.0, 4.0, 2.0, 8.0, 4.0, 8.0, 16.0, 8.0, 4.0]),
+        )
+    )
+    return _ArrayStore(columns, feature_values)
+
+
 def test_import_plotting_exports():
     function_names = (
         "cluster_connectivity",
@@ -1127,3 +1232,788 @@ def test_distribution_hist_and_ecdf(umap, leiden_clustering, datastore):
     )
     assert set(duplicates.tables) == {"0:RNA_nCounts", "1:RNA_nCounts"}
     duplicates.close()
+
+
+def _ordered_group_scale():
+    return splt.CategoricalScale(
+        order=("group2", "group1", "group10"),
+        palette={
+            "group1": "#3366cc",
+            "group2": "#dc3912",
+            "group10": "#109618",
+        },
+    )
+
+
+def test_grouped_violin_and_horizontal_box_follow_explicit_order(
+    synthetic_plot_store,
+):
+    scale = _ordered_group_scale()
+    violin = splt.distribution(
+        synthetic_plot_store,
+        keys="metricA",
+        group_by="group",
+        categorical_scale=scale,
+        kind="violin",
+        max_points=0,
+        show=False,
+    )
+    box = splt.distribution(
+        synthetic_plot_store,
+        keys="metricB",
+        group_by="group",
+        categorical_scale=scale,
+        kind="box",
+        orientation="horizontal",
+        max_points=0,
+        show=False,
+    )
+
+    assert [tick.get_text() for tick in violin.axes["metricA"].get_xticklabels()] == [
+        "group2",
+        "group1",
+        "group10",
+    ]
+    assert [tick.get_text() for tick in box.axes["metricB"].get_yticklabels()] == [
+        "group2",
+        "group1",
+        "group10",
+    ]
+    assert box.axes["metricB"].get_xlabel() == "value"
+    assert box.axes["metricB"].get_ylabel() == "group"
+    assert violin.scales == (scale,)
+    assert box.scales == (scale,)
+    violin.close()
+    box.close()
+
+
+def test_grouped_ecdf_uses_order_palette_and_probability_limits(
+    synthetic_plot_store,
+):
+    scale = _ordered_group_scale()
+    result = splt.distribution(
+        synthetic_plot_store,
+        keys="metricA",
+        group_by="group",
+        categorical_scale=scale,
+        kind="ecdf",
+        max_points=0,
+        show=False,
+    )
+
+    axis = result.axes["metricA"]
+    assert [line.get_label() for line in axis.lines] == [
+        "group2",
+        "group1",
+        "group10",
+    ]
+    assert [matplotlib.colors.to_hex(line.get_color()) for line in axis.lines] == [
+        scale.palette[group] for group in scale.order
+    ]
+    for line in axis.lines:
+        assert np.all(np.diff(line.get_xdata()) >= 0)
+        assert line.get_ydata()[-1] == pytest.approx(1.0)
+    assert axis.get_ylim() == pytest.approx((-0.02, 1.02))
+    result.close()
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        pytest.param({"kind": "density"}, "kind must be", id="kind"),
+        pytest.param({"orientation": "diagonal"}, "orientation", id="orientation"),
+        pytest.param(
+            {"kind": "hist", "orientation": "horizontal"},
+            "orientation applies",
+            id="hist-orientation",
+        ),
+        pytest.param(
+            {"row_standardize": True},
+            "row_standardize",
+            id="row-standardize",
+        ),
+        pytest.param(
+            {"kind": "hist", "share_y": True},
+            "share_y applies",
+            id="share-y",
+        ),
+        pytest.param(
+            {"violin_linewidth": -0.1},
+            "violin_linewidth",
+            id="linewidth",
+        ),
+        pytest.param({"violin_alpha": 1.1}, "alpha", id="violin-alpha"),
+        pytest.param({"point_alpha": -0.1}, "alpha", id="point-alpha"),
+        pytest.param({"groups": ["group1"]}, "groups requires", id="groups"),
+        pytest.param({"split_by": "split"}, "split_by requires", id="split"),
+        pytest.param(
+            {"group_by": "group", "split_by": "split", "kind": "box"},
+            "only for violin",
+            id="split-kind",
+        ),
+        pytest.param(
+            {"group_by": "group", "split_by": "group"},
+            "different columns",
+            id="split-same-column",
+        ),
+        pytest.param({"sample_stat": "sum"}, "sample_stat", id="sample-stat"),
+        pytest.param({"bins": 0}, "bins", id="bins"),
+        pytest.param({"keys": []}, "non-empty", id="empty-keys"),
+        pytest.param(
+            {"max_figure_width": 0},
+            "max_figure_width",
+            id="figure-width",
+        ),
+        pytest.param(
+            {
+                "sample_by": "sample",
+                "study_design": splt.StudyDesign(sample_by="other_sample"),
+            },
+            "conflicts",
+            id="study-design-conflict",
+        ),
+    ],
+)
+def test_distribution_rejects_invalid_grouped_options(
+    synthetic_plot_store,
+    kwargs,
+    message,
+):
+    options = dict(kwargs)
+    keys = options.pop("keys", "metricA")
+    with pytest.raises(ValueError, match=message):
+        splt.distribution(
+            synthetic_plot_store,
+            keys=keys,
+            show=False,
+            **options,
+        )
+
+
+def test_distribution_rejects_missing_groups_and_incomplete_scales(
+    synthetic_plot_store,
+):
+    with pytest.raises(ValueError, match="not present"):
+        splt.distribution(
+            synthetic_plot_store,
+            keys="metricA",
+            group_by="group",
+            groups=["group1", "absent"],
+            show=False,
+        )
+    with pytest.raises(ValueError, match="order is missing observed values"):
+        splt.distribution(
+            synthetic_plot_store,
+            keys="metricA",
+            group_by="group",
+            categorical_scale=splt.CategoricalScale(order=("group1", "group2")),
+            show=False,
+        )
+    with pytest.raises(KeyError, match="group2.*missing from palette"):
+        splt.distribution(
+            synthetic_plot_store,
+            keys="metricA",
+            group_by="group",
+            categorical_scale=splt.CategoricalScale(
+                order=("group1", "group2", "group10"),
+                palette={"group1": "#111111", "group10": "#333333"},
+            ),
+            show=False,
+        )
+    with pytest.raises(ValueError, match="split_scale.order"):
+        splt.distribution(
+            synthetic_plot_store,
+            keys="metricA",
+            group_by="group",
+            split_by="split",
+            split_scale=splt.CategoricalScale(order=("left",)),
+            show=False,
+        )
+    with pytest.raises(ValueError, match="exactly two observed categories"):
+        splt.distribution(
+            synthetic_plot_store,
+            keys="metricA",
+            group_by="group",
+            split_by="split3",
+            show=False,
+        )
+
+
+def test_sample_fraction_distribution_drops_missing_sample_ids(
+    synthetic_plot_store,
+):
+    result = splt.distribution(
+        synthetic_plot_store,
+        keys="metricA",
+        group_by="group",
+        sample_by="sample_with_missing",
+        sample_stat="fraction",
+        expression_cutoff=5.0,
+        kind="box",
+        max_points=0,
+        show=False,
+    )
+
+    table = result.tables["metricA"]
+    assert {"sample", "group", "value", "display_value", "nCells"} <= set(table)
+    assert table["value"].between(0, 1).all()
+    assert result.provenance.n_samples == 4
+    assert result.provenance.extras["dropped_sample_cells"] == 1
+    assert result.axes["metricA"].get_ylabel() == "Sample fraction > 5"
+    result.close()
+
+
+def test_sample_distribution_adapter_rejects_all_missing_sample_ids():
+    from scarf.plotting.distribution import _sample_aggregate
+
+    frame = pd.DataFrame(
+        {
+            "sample": [None, ""],
+            "group": ["a", "a"],
+            "raw_value": [1.0, 2.0],
+        }
+    )
+    with pytest.raises(ValueError, match="valid sample value"):
+        _sample_aggregate(
+            frame,
+            statistic="mean",
+            expression_cutoff=0.0,
+            split=False,
+        )
+
+
+def test_distribution_rejects_malformed_cell_column_lengths(
+    synthetic_plot_store,
+    monkeypatch,
+):
+    original_fetch = synthetic_plot_store.cells.fetch
+    cases = [
+        ("group", {"group_by": "group"}, "group_by length"),
+        (
+            "split",
+            {"group_by": "group", "split_by": "split"},
+            "split_by length",
+        ),
+        (
+            "sample",
+            {"group_by": "group", "sample_by": "sample"},
+            "sample_by length",
+        ),
+    ]
+    for malformed_column, kwargs, message in cases:
+
+        def malformed_fetch(column, key="I", *, _malformed=malformed_column):
+            values = original_fetch(column, key=key)
+            return values[:-1] if column == _malformed else values
+
+        monkeypatch.setattr(synthetic_plot_store.cells, "fetch", malformed_fetch)
+        with pytest.raises(ValueError, match=message):
+            splt.distribution(
+                synthetic_plot_store,
+                keys="metricA",
+                max_points=0,
+                show=False,
+                **kwargs,
+            )
+
+
+def test_cell_selection_adapter_validates_masks_groups_and_natural_order():
+    from scarf.plotting._data import resolve_cell_selection
+
+    categories = np.array(["group10", "group2", "group1"], dtype=object)
+    mask, order = resolve_cell_selection(3, category_values=categories)
+    np.testing.assert_array_equal(mask, np.ones(3, dtype=bool))
+    assert order == ["group1", "group2", "group10"]
+
+    with pytest.raises(TypeError, match="must be boolean"):
+        resolve_cell_selection(3, subset=np.array([1, 0, 1]))
+    with pytest.raises(ValueError, match="length must match"):
+        resolve_cell_selection(3, subset=np.array([True, False]))
+    with pytest.raises(ValueError, match="category values length"):
+        resolve_cell_selection(3, category_values=np.array(["a", "b"]))
+    with pytest.raises(ValueError, match="groups must be non-empty"):
+        resolve_cell_selection(3, category_values=categories, groups=[])
+    with pytest.raises(ValueError, match="not present"):
+        resolve_cell_selection(3, category_values=categories, groups=["absent"])
+    with pytest.raises(ValueError, match="No cells remain"):
+        resolve_cell_selection(3, subset=np.zeros(3, dtype=bool))
+
+
+def test_summary_adapter_validates_group_sample_and_condition_inputs(
+    synthetic_plot_store,
+):
+    from scarf.plotting._data import summarize_features_by_group
+
+    with pytest.raises(ValueError, match="Too many features"):
+        summarize_features_by_group(
+            synthetic_plot_store,
+            features=["GeneA", "GeneB"],
+            group_by="group",
+            max_features=1,
+        )
+    for group_by in ((), ("group", "category", "condition")):
+        with pytest.raises(ValueError, match="group_by must have 1 or 2 keys"):
+            summarize_features_by_group(
+                synthetic_plot_store,
+                features=["GeneA"],
+                group_by=group_by,
+            )
+    with pytest.raises(ValueError, match="Too many groups"):
+        summarize_features_by_group(
+            synthetic_plot_store,
+            features=["GeneA"],
+            group_by="group",
+            max_groups=2,
+        )
+    with pytest.raises(ValueError, match="No cells with valid sample_by"):
+        summarize_features_by_group(
+            synthetic_plot_store,
+            features=["GeneA"],
+            group_by="group",
+            sample_by="invalid_sample",
+        )
+    with pytest.raises(ValueError, match="Too many samples"):
+        summarize_features_by_group(
+            synthetic_plot_store,
+            features=["GeneA"],
+            group_by="group",
+            sample_by="sample",
+            max_samples=2,
+        )
+    with pytest.raises(ValueError, match="condition_by is not constant"):
+        summarize_features_by_group(
+            synthetic_plot_store,
+            features=["GeneA"],
+            group_by="category",
+            study_design=splt.StudyDesign(
+                sample_by="sample",
+                condition_by="group",
+            ),
+        )
+
+
+def test_composition_orders_missing_category_and_labels_segments(
+    synthetic_plot_store,
+):
+    import matplotlib.pyplot as plt
+
+    scale = splt.CategoricalScale(
+        order=("B", "A"),
+        palette={"A": "#3366cc", "B": "#dc3912"},
+        missing_color="#777777",
+        missing_label="Unknown",
+    )
+    existing_figures = set(plt.get_fignums())
+    try:
+        result = splt.composition(
+            synthetic_plot_store,
+            category_by="category",
+            categorical_scale=scale,
+            show_percent_labels=True,
+            label_min_fraction=0.2,
+            show=False,
+        )
+
+        aggregate = result.tables["aggregate"]
+        assert aggregate["category"].tolist() == ["B", "A", None]
+        np.testing.assert_allclose(aggregate["proportion"], np.full(3, 1 / 3))
+        assert result.scales[0].order == ("B", "A")
+        assert result.scales[0].missing_color == "#777777"
+        assert [text.get_text() for text in result.axes["composition"].texts] == [
+            "33%",
+            "33%",
+            "33%",
+        ]
+        assert [text.get_text() for text in result.figure.legends[0].get_texts()] == [
+            "B",
+            "A",
+            "Unknown",
+        ]
+        figure_number = result.figure.number
+        result.close()
+        assert not plt.fignum_exists(figure_number)
+    finally:
+        for figure_number in set(plt.get_fignums()) - existing_figures:
+            plt.close(figure_number)
+
+
+def test_per_sample_composition_preserves_missing_categories(
+    synthetic_plot_store,
+):
+    scale = splt.CategoricalScale(
+        order=("B", "A"),
+        palette={"A": "#3366cc", "B": "#dc3912"},
+        missing_color="#777777",
+        missing_label="Unknown",
+    )
+
+    result = splt.composition(
+        synthetic_plot_store,
+        category_by="category",
+        sample_by="sample",
+        categorical_scale=scale,
+        show=False,
+    )
+
+    assert result.tables["aggregate"]["category"].tolist() == ["B", "A", None]
+    per_sample = result.tables["per_sample"]
+    for _, rows in per_sample.groupby("sample", sort=False):
+        assert rows["category"].tolist() == ["B", "A", None]
+        np.testing.assert_allclose(rows["proportion"], np.full(3, 1 / 3))
+    assert [text.get_text() for text in result.figure.legends[0].get_texts()] == [
+        "B",
+        "A",
+        "Unknown",
+    ]
+    result.close()
+
+
+def test_per_sample_composition_uses_foreign_panel_and_condition_summary(
+    synthetic_plot_store,
+):
+    import matplotlib.pyplot as plt
+    from matplotlib.legend import Legend
+
+    figure, axis = plt.subplots()
+    result = splt.composition(
+        synthetic_plot_store,
+        category_by="category_complete",
+        sample_by="sample",
+        condition_by="condition",
+        kind="per_sample",
+        uncertainty="se",
+        target=axis,
+        show=False,
+    )
+
+    assert result.owns_figure is False
+    assert result.figure is figure
+    assert set(result.tables) == {"aggregate", "per_sample", "summary"}
+    assert set(result.tables["summary"]["condition"]) == {"control", "treated"}
+    assert result.provenance.extras["uncertainty"] == "se"
+    assert any(legend.kind == "marker" for legend in result.legends)
+    assert (
+        len([artist for artist in axis.get_children() if isinstance(artist, Legend)])
+        == 3
+    )
+    result.close()
+    assert plt.fignum_exists(figure.number)
+    plt.close(figure)
+
+
+def test_composition_summary_uncertainty_handles_singleton_groups():
+    from scarf.plotting.composition import _summarize_proportions
+
+    per_sample = pd.DataFrame(
+        {
+            "sample": ["s1", "s2", "s3"],
+            "category": ["A", "A", "B"],
+            "proportion": [0.2, 0.6, 1.0],
+        }
+    )
+    standard_deviation = _summarize_proportions(
+        per_sample,
+        by_condition=False,
+        uncertainty="sd",
+    ).set_index("category")
+    standard_error = _summarize_proportions(
+        per_sample,
+        by_condition=False,
+        uncertainty="se",
+    ).set_index("category")
+    no_interval = _summarize_proportions(
+        per_sample,
+        by_condition=False,
+        uncertainty="none",
+    ).set_index("category")
+
+    assert standard_deviation.loc["A", "mean_proportion"] == pytest.approx(0.4)
+    assert standard_deviation.loc["A", "lower"] < 0.4
+    assert standard_deviation.loc["A", "upper"] > 0.4
+    assert standard_error.loc["A", "lower"] == pytest.approx(0.2)
+    assert standard_error.loc["A", "upper"] == pytest.approx(0.6)
+    assert standard_error.loc["B", "lower"] == pytest.approx(1.0)
+    assert standard_error.loc["B", "upper"] == pytest.approx(1.0)
+    assert no_interval["lower"].tolist() == pytest.approx([0.4, 1.0])
+    assert no_interval["upper"].tolist() == pytest.approx([0.4, 1.0])
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        pytest.param({"kind": "pie"}, "kind must be", id="kind"),
+        pytest.param({"uncertainty": "iqr"}, "uncertainty", id="uncertainty"),
+        pytest.param(
+            {"kind": "stacked", "uncertainty": "sd"},
+            "only for kind='per_sample'",
+            id="stacked-uncertainty",
+        ),
+        pytest.param({"bar_width": 0}, "bar_width", id="bar-width"),
+        pytest.param({"bar_gap": -0.1}, "bar_width", id="bar-gap"),
+        pytest.param(
+            {"segment_linewidth": -0.1},
+            "segment_linewidth",
+            id="segment-linewidth",
+        ),
+        pytest.param(
+            {"label_min_fraction": 1.1},
+            "label_min_fraction",
+            id="label-min-fraction",
+        ),
+        pytest.param(
+            {"kind": "per_sample"},
+            "requires sample_by",
+            id="per-sample-needs-sample",
+        ),
+        pytest.param(
+            {"subject_by": "subject", "condition_by": "condition"},
+            "require sample_by",
+            id="subject-needs-sample",
+        ),
+        pytest.param(
+            {"cell_key": "none_selected"},
+            "No cells selected",
+            id="empty-selection",
+        ),
+        pytest.param(
+            {"sample_by": "invalid_sample"},
+            "No cells have valid values",
+            id="invalid-samples",
+        ),
+        pytest.param(
+            {
+                "sample_by": "sample",
+                "subject_by": "inconsistent_subject",
+                "condition_by": "condition",
+            },
+            "not constant within sample",
+            id="inconsistent-subject",
+        ),
+    ],
+)
+def test_composition_rejects_invalid_panel_inputs(
+    synthetic_plot_store,
+    kwargs,
+    message,
+):
+    with pytest.raises((TypeError, ValueError), match=message):
+        splt.composition(
+            synthetic_plot_store,
+            category_by="category",
+            show=False,
+            **kwargs,
+        )
+
+
+def test_composition_rejects_category_order_missing_observed_value(
+    synthetic_plot_store,
+):
+    with pytest.raises(ValueError, match="order is missing observed values"):
+        splt.composition(
+            synthetic_plot_store,
+            category_by="category",
+            categorical_scale=splt.CategoricalScale(order=("A",)),
+            show=False,
+        )
+
+
+def test_summary_panels_use_explicit_feature_group_orders(
+    synthetic_plot_store,
+):
+    group_order = ["group2", "group1", "group10"]
+    feature_order = ["GeneA", "GeneB"]
+    dot = splt.dotplot(
+        synthetic_plot_store,
+        features=["GeneB", "GeneA"],
+        group_by="group",
+        group_order=group_order,
+        feature_order=feature_order,
+        standardize="feature",
+        color_scale=splt.ColorScale(cmap="magma", vmin=-2, vmax=2),
+        size_scale=splt.SizeScale(size_min=5, size_max=50),
+        show_legend=False,
+        show=False,
+    )
+    matrix = splt.matrixplot(
+        synthetic_plot_store,
+        features=["GeneA", "GeneB"],
+        group_by="group",
+        group_order=group_order,
+        feature_order=list(reversed(feature_order)),
+        value="fraction",
+        color_scale=splt.ColorScale(cmap="viridis", vmin=0, vmax=1),
+        show_legend=False,
+        show=False,
+    )
+
+    dot_axis = dot.axes["dotplot"]
+    assert [tick.get_text() for tick in dot_axis.get_xticklabels()] == group_order
+    assert [tick.get_text() for tick in dot_axis.get_yticklabels()] == feature_order
+    assert dot.provenance.extras["group_order"] == group_order
+    assert dot.provenance.extras["feature_order"] == feature_order
+    standardized = dot.tables["aggregate"]
+    for _, rows in standardized.groupby("feature", observed=False):
+        assert rows["mean"].mean() == pytest.approx(0.0, abs=1e-12)
+
+    matrix_table = matrix.tables["matrix"]
+    assert matrix_table["feature"].tolist() == ["GeneB", "GeneA"]
+    assert matrix_table.columns[1:].tolist() == group_order
+    np.testing.assert_array_less(
+        matrix_table[group_order].to_numpy(dtype=float),
+        np.full((2, 3), 1.0 + 1e-12),
+    )
+    dot.close()
+    matrix.close()
+
+
+def test_summary_helpers_validate_labels_standardization_and_color_limits():
+    from scarf.plotting.summary import (
+        _color_limits,
+        _group_axis_labels,
+        _standardize_feature,
+        _wrap_tick_labels,
+    )
+
+    assert _wrap_tick_labels(["long label"], 4) == ["long\nlabe\nl"]
+    with pytest.raises(ValueError, match="label_wrap"):
+        _wrap_tick_labels(["value"], 0)
+
+    grouped = pd.DataFrame({"first": ["a"], "second": ["b"]})
+    assert _group_axis_labels(grouped, ("first", "second")).tolist() == ["a | b"]
+
+    values = pd.DataFrame(
+        {
+            "feature": ["a", "a", "b", "b"],
+            "mean": [1.0, 3.0, 2.0, 2.0],
+        }
+    )
+    standardized = _standardize_feature(values)
+    assert standardized.loc[standardized["feature"] == "a", "mean"].mean() == (
+        pytest.approx(0.0)
+    )
+    assert standardized.loc[standardized["feature"] == "b", "mean"].isna().all()
+
+    assert _color_limits(
+        np.array([np.nan, np.inf]),
+        splt.ColorScale(),
+    ) == (0.0, 1.0)
+    assert _color_limits(
+        np.arange(5, dtype=float),
+        splt.ColorScale(quantiles=(0.25, 0.75)),
+    ) == pytest.approx((1.0, 3.0))
+    with pytest.raises(ValueError, match="vmin < vmax"):
+        _color_limits(
+            np.array([1.0, 1.0]),
+            splt.ColorScale(vmin=1.0, vmax=1.0),
+        )
+
+
+def test_summary_panels_reject_incomplete_orders_and_unsupported_scales(
+    synthetic_plot_store,
+):
+    with pytest.raises(NotImplementedError, match="linear color scales"):
+        splt.dotplot(
+            synthetic_plot_store,
+            features=["GeneA"],
+            group_by="group",
+            color_scale=splt.ColorScale(scale="log"),
+            show=False,
+        )
+    with pytest.raises(NotImplementedError, match="linear color scales"):
+        splt.matrixplot(
+            synthetic_plot_store,
+            features=["GeneA"],
+            group_by="group",
+            color_scale=splt.ColorScale(scale="symlog"),
+            show=False,
+        )
+    with pytest.raises(ValueError, match="marker_linewidth"):
+        splt.dotplot(
+            synthetic_plot_store,
+            features=["GeneA"],
+            group_by="group",
+            marker_linewidth=-0.1,
+            show=False,
+        )
+    with pytest.raises(ValueError, match="feature_order is missing"):
+        splt.dotplot(
+            synthetic_plot_store,
+            features=["GeneA", "GeneB"],
+            group_by="group",
+            feature_order=["GeneA"],
+            show=False,
+        )
+    with pytest.raises(ValueError, match="group order is missing"):
+        splt.dotplot(
+            synthetic_plot_store,
+            features=["GeneA"],
+            group_by="group",
+            group_order=["group1", "group2"],
+            show=False,
+        )
+    with pytest.raises(ValueError, match="standardize"):
+        splt.dotplot(
+            synthetic_plot_store,
+            features=["GeneA"],
+            group_by="group",
+            standardize="group",
+            show=False,
+        )
+    with pytest.raises(ValueError, match="value must be"):
+        splt.matrixplot(
+            synthetic_plot_store,
+            features=["GeneA"],
+            group_by="group",
+            value="median",
+            show=False,
+        )
+    with pytest.raises(ValueError, match="standardize"):
+        splt.matrixplot(
+            synthetic_plot_store,
+            features=["GeneA"],
+            group_by="group",
+            standardize="group",
+            show=False,
+        )
+
+
+def test_owned_distribution_composition_and_summary_results_close_after_show(
+    synthetic_plot_store,
+):
+    import matplotlib.pyplot as plt
+
+    results = [
+        splt.distribution(
+            synthetic_plot_store,
+            keys="metricA",
+            group_by="group",
+            kind="box",
+            max_points=0,
+        ),
+        splt.composition(
+            synthetic_plot_store,
+            category_by="category_complete",
+            show_legend=False,
+        ),
+        splt.dotplot(
+            synthetic_plot_store,
+            features=["GeneA"],
+            group_by="group",
+            show_legend=False,
+        ),
+        splt.matrixplot(
+            synthetic_plot_store,
+            features=["GeneA"],
+            group_by="group",
+            show_legend=False,
+        ),
+    ]
+
+    assert all(result.owns_figure for result in results)
+    assert all(not plt.fignum_exists(result.figure.number) for result in results)
+    assert [result.provenance.notes[0] for result in results] == [
+        "distribution",
+        "composition",
+        "dotplot",
+        "matrixplot",
+    ]

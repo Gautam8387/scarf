@@ -3,6 +3,7 @@ import pytest
 from scipy.sparse import csr_matrix
 from sknetwork.hierarchy import Paris
 
+import scarf.clustering._paris_core as paris_core
 from scarf.clustering._paris_core import (
     ParisHierarchy,
     _contract_graph,
@@ -318,3 +319,88 @@ def test_canonicalize_rejects_symmetrization_overflow() -> None:
     )
     with pytest.raises(ValueError, match="overflowed during symmetrization"):
         canonicalize_paris_graph(graph)
+
+
+def test_compact_weighted_path_contracts_parallel_pairs_before_root() -> None:
+    graph = csr_matrix(
+        np.asarray(
+            [
+                [0.0, 4.0, 0.0, 0.0],
+                [4.0, 0.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0, 4.0],
+                [0.0, 0.0, 4.0, 0.0],
+            ]
+        )
+    )
+
+    hierarchy = fit_paris_hierarchy(graph, n_threads=2)
+
+    assert hierarchy.children.tolist() == [[0, 1], [2, 3], [4, 5]]
+    assert hierarchy.sizes.tolist() == [2, 2, 4]
+    np.testing.assert_allclose(hierarchy.heights, [10.0 / 36.0, 10.0 / 36.0, 4.5])
+    assert hierarchy.diagnostics is not None
+    assert [round_.active_vertices for round_ in hierarchy.diagnostics.rounds] == [4, 2]
+    assert [round_.merges for round_ in hierarchy.diagnostics.rounds] == [2, 1]
+
+
+def test_edgeless_graph_uses_only_deterministic_synthetic_joins() -> None:
+    hierarchy = fit_paris_hierarchy(csr_matrix((4, 4), dtype=np.float64))
+
+    assert hierarchy.children.tolist() == [[0, 1], [4, 2], [5, 3]]
+    assert hierarchy.sizes.tolist() == [2, 3, 4]
+    assert hierarchy.component_roots.tolist() == [0, 1, 2, 3]
+    assert hierarchy.synthetic_joins.tolist() == [True, True, True]
+    assert np.isinf(hierarchy.heights).all()
+    assert hierarchy.total_weight == 0.0
+    assert hierarchy.diagnostics is not None
+    assert hierarchy.diagnostics.rounds == ()
+
+
+def test_fit_rejects_finite_edges_whose_total_weight_overflows() -> None:
+    graph = csr_matrix(
+        (
+            np.asarray([9.0e307, 9.0e307]),
+            (np.asarray([0, 1]), np.asarray([1, 2])),
+        ),
+        shape=(3, 3),
+    )
+
+    with np.errstate(over="ignore"):
+        with pytest.raises(ValueError, match="total weight must be finite"):
+            fit_paris_hierarchy(graph)
+
+
+def test_fit_stops_when_neighbor_scan_cannot_make_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scan_count = 0
+
+    def no_neighbors(
+        indptr: np.ndarray,
+        indices: np.ndarray,
+        data: np.ndarray,
+        volumes: np.ndarray,
+        logical_ids: np.ndarray,
+        n_workers: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        nonlocal scan_count
+        scan_count += 1
+        return (
+            np.full(volumes.size, -1, dtype=np.int64),
+            np.zeros(volumes.size, dtype=np.float64),
+        )
+
+    monkeypatch.setattr(paris_core, "_nearest_neighbors", no_neighbors)
+    graph = csr_matrix(
+        np.asarray(
+            [
+                [0.0, 1.0, 0.0],
+                [1.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0],
+            ]
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="made no progress"):
+        fit_paris_hierarchy(graph, n_threads=2)
+    assert scan_count == 1

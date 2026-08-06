@@ -6,6 +6,7 @@ import pytest
 import zarr
 from zarr.storage import MemoryStore
 
+import scarf.mapping.projection as projection_storage
 from scarf.mapping.models import ScaledPCAProjectionModel
 from scarf.mapping.projection import (
     NO_QUERY_BATCH_FINGERPRINT,
@@ -148,6 +149,8 @@ def _plan(
     mapping_name: str = "atlas",
     n_cells: int = 4,
     save_k: int = 2,
+    missing_feature_policy: str = "reference_mean",
+    correction_method: str = "none",
     invalidate_cache: bool = False,
 ):
     return plan_projection(
@@ -156,8 +159,8 @@ def _plan(
         mapping_name=mapping_name,
         n_cells=n_cells,
         save_k=save_k,
-        missing_feature_policy="reference_mean",
-        correction_method="none",
+        missing_feature_policy=missing_feature_policy,
+        correction_method=correction_method,
         cell_selection=cell_selection,
         feature_selection=feature_selection,
         selected_expression_fingerprint="e" * 64,
@@ -205,6 +208,16 @@ def _write(
     return ref
 
 
+def _replace_array(
+    group: zarr.Group,
+    name: str,
+    values: np.ndarray,
+) -> None:
+    del group[name]
+    chunks = tuple(max(1, min(int(size), 2)) for size in values.shape)
+    group.create_array(name, data=values, chunks=chunks)
+
+
 def test_projection_writer_persists_exact_contract_and_loads_copies() -> None:
     root, cell_selection, feature_selection = _query_inputs()
     reference, reference_root = _mapping_reference()
@@ -216,12 +229,19 @@ def test_projection_writer_persists_exact_contract_and_loads_copies() -> None:
     assert not inspect_artifact(root, plan.ref).exists
     indices, distances, uninformative = _blocks()
     writer = ProjectionWriter(root, plan, chunk_rows=2)
+    assert writer.ref == plan.ref
+    assert writer.next_row == 0
     assert not inspect_artifact(root, plan.ref).complete
     writer.write_block(0, indices[:1], distances[:1], uninformative[:1])
     writer.write_block(1, indices[1:3], distances[1:3], uninformative[1:3])
     writer.write_block(3, indices[3:], distances[3:], uninformative[3:])
+    assert writer.next_row == 4
     assert writer.finish(_diagnostics()) == plan.ref
     assert writer.finished
+    with pytest.raises(RuntimeError, match="already finished"):
+        writer.write_block(4, indices[:1], distances[:1], uninformative[:1])
+    with pytest.raises(RuntimeError, match="cannot be aborted"):
+        writer.abort()
 
     status = inspect_artifact(root, plan.ref)
     assert status.complete
@@ -285,6 +305,42 @@ def test_projection_writer_persists_exact_contract_and_loads_copies() -> None:
         ),
         (
             np.ones((2, 2), dtype=np.uint32),
+            np.ones((2, 2), dtype=np.int64),
+            np.zeros(2, dtype=bool),
+            "floating",
+        ),
+        (
+            np.ones((2, 2), dtype=np.uint32),
+            np.ones((2, 2), dtype=np.float64),
+            np.zeros(2, dtype=np.uint8),
+            "boolean",
+        ),
+        (
+            np.ones((2, 2), dtype=np.uint32),
+            np.ones((2, 1), dtype=np.float64),
+            np.zeros(2, dtype=bool),
+            "match the index block shape",
+        ),
+        (
+            np.ones((2, 2), dtype=np.uint32),
+            np.ones((2, 2), dtype=np.float64),
+            np.zeros((2, 1), dtype=bool),
+            "one value per row",
+        ),
+        (
+            np.ones((0, 2), dtype=np.uint32),
+            np.ones((0, 2), dtype=np.float64),
+            np.zeros(0, dtype=bool),
+            "cannot be empty",
+        ),
+        (
+            np.zeros((5, 2), dtype=np.uint32),
+            np.ones((5, 2), dtype=np.float64),
+            np.zeros(5, dtype=bool),
+            "exceeds the declared cell count",
+        ),
+        (
+            np.ones((2, 2), dtype=np.uint32),
             np.array([[0.0, np.nan], [1.0, 2.0]]),
             np.zeros(2, dtype=bool),
             "finite",
@@ -327,6 +383,44 @@ def test_projection_writer_aborts_after_invalid_block(
     assert not inspect_artifact(root, plan.ref).complete
     with pytest.raises(RuntimeError, match="aborted"):
         writer.finish(_diagnostics())
+
+
+def test_projection_writer_constructor_and_start_failures_leave_incomplete_artifacts(
+    monkeypatch,
+) -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+    first = _plan(root, cell_selection, feature_selection, reference.external_ref)
+    original_create = projection_storage.create_zarr_dataset
+
+    def fail_distances(group, name, *args, **kwargs):
+        if name == "distances":
+            raise RuntimeError("injected array creation failure")
+        return original_create(group, name, *args, **kwargs)
+
+    monkeypatch.setattr(
+        projection_storage,
+        "create_zarr_dataset",
+        fail_distances,
+    )
+    with pytest.raises(RuntimeError, match="injected array creation failure"):
+        ProjectionWriter(root, first, chunk_rows=2)
+    assert not inspect_artifact(root, first.ref).complete
+
+    monkeypatch.undo()
+    second = _plan(
+        root,
+        cell_selection,
+        feature_selection,
+        reference.external_ref,
+        invalidate_cache=True,
+    )
+    writer = ProjectionWriter(root, second, chunk_rows=2)
+    indices, distances, uninformative = _blocks()
+    with pytest.raises(TypeError, match="start must be an integer"):
+        writer.write_block(True, indices[:1], distances[:1], uninformative[:1])
+    assert writer.aborted
+    assert not inspect_artifact(root, second.ref).complete
 
 
 def test_projection_writer_requires_contiguous_complete_coverage_and_can_abort() -> (
@@ -399,6 +493,46 @@ def test_projection_writer_reuses_only_a_valid_complete_artifact() -> None:
     assert replacement.ref != ref
 
 
+@pytest.mark.parametrize(
+    "tamper",
+    ["distance_shape", "index_dtype", "distance_value", "diagnostics"],
+)
+def test_projection_plan_rejects_tampered_cached_payload(tamper: str) -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+    first = _plan(root, cell_selection, feature_selection, reference.external_ref)
+    ref = _write(root, first)
+    group = artifact_group(root, ref)
+    if tamper == "distance_shape":
+        _replace_array(
+            group,
+            "distances",
+            np.ones((4, 1), dtype=np.float64),
+        )
+    elif tamper == "index_dtype":
+        _replace_array(
+            group,
+            "indices",
+            np.asarray(group["indices"][:], dtype=np.int64),
+        )
+    elif tamper == "distance_value":
+        group["distances"][0, 0] = np.nan
+    else:
+        diagnostics = dict(group.attrs["diagnostics"])
+        diagnostics["featureCoverage"] = 0.0
+        group.attrs["diagnostics"] = diagnostics
+
+    replacement = _plan(
+        root,
+        cell_selection,
+        feature_selection,
+        reference.external_ref,
+    )
+
+    assert not replacement.reused
+    assert replacement.ref != ref
+
+
 def test_projection_plan_rejects_out_of_range_cached_neighbors() -> None:
     root, cell_selection, feature_selection = _query_inputs()
     reference, _ = _mapping_reference()
@@ -428,6 +562,37 @@ def test_projection_finish_rejects_diagnostics_inconsistent_with_rows() -> None:
     with pytest.raises(ValueError, match="number of uninformative"):
         writer.finish(_diagnostics(zero_norm_cell_count=1))
 
+    assert not inspect_artifact(root, plan.ref).complete
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("featureCoverage", 0.0, "featureCoverage"),
+        ("queryBatchCount", 5, "cannot exceed"),
+        ("zeroNormCellCount", 5, "cannot exceed"),
+        ("queryScaledDispersion", -1.0, "queryScaledDispersion"),
+        ("unexpected", 1, "exactly"),
+    ],
+)
+def test_projection_finish_rejects_invalid_diagnostics_and_aborts(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+    plan = _plan(root, cell_selection, feature_selection, reference.external_ref)
+    indices, distances, uninformative = _blocks()
+    writer = ProjectionWriter(root, plan, chunk_rows=4)
+    writer.write_block(0, indices, distances, uninformative)
+    diagnostics = _diagnostics()
+    diagnostics[field] = value
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        writer.finish(diagnostics)
+
+    assert writer.aborted
     assert not inspect_artifact(root, plan.ref).complete
 
 
@@ -523,6 +688,77 @@ def test_projection_loader_rejects_malformed_or_extra_payload(
         load_projection(root, ref)
 
 
+@pytest.mark.parametrize(
+    ("tamper", "message"),
+    [
+        ("index_dtype", "unsigned integer"),
+        ("distance_dtype", "floating matrix"),
+        ("distance_shape", "floating matrix"),
+        ("uninformative_dtype", "boolean row vector"),
+        ("uninformative_shape", "boolean row vector"),
+        ("distance_nan", "finite"),
+        ("distance_negative", "non-negative"),
+        ("selection_count", "stored query cell selection"),
+        ("diagnostics_type", "diagnostics must be a mapping"),
+        ("created_at", "created_at_ns"),
+    ],
+)
+def test_projection_loader_rejects_shape_dtype_and_value_tampering(
+    tamper: str,
+    message: str,
+) -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+    ref = _write(
+        root,
+        _plan(root, cell_selection, feature_selection, reference.external_ref),
+    )
+    group = artifact_group(root, ref)
+    if tamper == "index_dtype":
+        _replace_array(
+            group,
+            "indices",
+            np.asarray(group["indices"][:], dtype=np.int64),
+        )
+    elif tamper == "distance_dtype":
+        _replace_array(
+            group,
+            "distances",
+            np.asarray(group["distances"][:], dtype=np.int64),
+        )
+    elif tamper == "distance_shape":
+        _replace_array(
+            group,
+            "distances",
+            np.ones((4, 1), dtype=np.float64),
+        )
+    elif tamper == "uninformative_dtype":
+        _replace_array(
+            group,
+            "uninformative",
+            np.asarray(group["uninformative"][:], dtype=np.uint8),
+        )
+    elif tamper == "uninformative_shape":
+        _replace_array(
+            group,
+            "uninformative",
+            np.asarray(group["uninformative"][:], dtype=bool)[:, np.newaxis],
+        )
+    elif tamper == "distance_nan":
+        group["distances"][0, 0] = np.nan
+    elif tamper == "distance_negative":
+        group["distances"][0, 0] = -1.0
+    elif tamper == "selection_count":
+        artifact_group(root, cell_selection)["values"][0] = False
+    elif tamper == "diagnostics_type":
+        group.attrs["diagnostics"] = "invalid"
+    else:
+        group.attrs["created_at_ns"] = 0
+
+    with pytest.raises(ValueError, match=message):
+        load_projection(root, ref, reference=reference)
+
+
 def test_projection_written_without_the_dispersion_diagnostic_is_rejected() -> None:
     root, cell_selection, feature_selection = _query_inputs()
     reference, _ = _mapping_reference()
@@ -563,6 +799,78 @@ def test_projection_loader_validates_and_matches_provided_reference() -> None:
 
     reference.datastore.zw["RNA"].attrs["dataset_fingerprint"] = "changed"
     with pytest.raises(ValueError, match="run_mapping"):
+        load_projection(root, ref, reference=reference)
+
+
+def test_projection_loader_rejects_invalid_call_and_artifact_handles() -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+    ref = _write(
+        root,
+        _plan(root, cell_selection, feature_selection, reference.external_ref),
+    )
+
+    with pytest.raises(TypeError, match="load_arrays must be a boolean"):
+        load_projection(root, ref, load_arrays=1)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="reference must be a MappingReference"):
+        load_projection(root, ref, reference=object())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="assay-scoped projection"):
+        load_projection(root, cell_selection)
+    with pytest.raises(ValueError, match="missing or incomplete"):
+        load_projection(root, _artifact_ref("projection", "d"))
+
+
+@pytest.mark.parametrize(
+    ("tamper", "message"),
+    [
+        ("parameters", "parameters do not match"),
+        ("policy", "missing_feature_policy is unsupported"),
+        ("inputs", "inputs do not match"),
+        ("fingerprint", "selected_expression_fingerprint"),
+        ("external", "mapping_reference input is malformed"),
+        ("external_kind", "identify a mapping_reference"),
+        ("selection_scope", "wrong kind or scope"),
+    ],
+)
+def test_projection_loader_rejects_malformed_provenance(
+    tamper: str,
+    message: str,
+) -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+    ref = _write(
+        root,
+        _plan(root, cell_selection, feature_selection, reference.external_ref),
+    )
+    group = artifact_group(root, ref)
+    provenance = dict(group.attrs["provenance"])
+    parameters = dict(provenance["parameters"])
+    inputs = dict(provenance["inputs"])
+    if tamper == "parameters":
+        parameters["extra"] = True
+    elif tamper == "policy":
+        parameters["missing_feature_policy"] = "guess"
+    elif tamper == "inputs":
+        inputs.pop("query_batch_fingerprint")
+    elif tamper == "fingerprint":
+        inputs["selected_expression_fingerprint"] = ""
+    elif tamper == "external":
+        inputs["mapping_reference"] = "invalid"
+    elif tamper == "external_kind":
+        external = reference.external_ref.to_dict()
+        external["ref"] = _artifact_ref("projection", "f").to_dict()
+        inputs["mapping_reference"] = external
+    else:
+        inputs["cell_selection"] = _artifact_ref(
+            "reduction",
+            "f",
+            assay=None,
+        ).to_dict()
+    provenance["parameters"] = parameters
+    provenance["inputs"] = inputs
+    group.attrs["provenance"] = provenance
+
+    with pytest.raises(ValueError, match=message):
         load_projection(root, ref, reference=reference)
 
 
@@ -721,6 +1029,64 @@ def test_plan_projection_rejects_empty_string_arguments() -> None:
         )
 
 
+def test_plan_projection_rejects_selection_reference_and_count_mismatches() -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+
+    with pytest.raises(ValueError, match="selected row count"):
+        _plan(
+            root,
+            cell_selection,
+            feature_selection,
+            reference.external_ref,
+            n_cells=3,
+        )
+    with pytest.raises(ValueError, match="missing_feature_policy"):
+        _plan(
+            root,
+            cell_selection,
+            feature_selection,
+            reference.external_ref,
+            missing_feature_policy="guess",
+        )
+    with pytest.raises(
+        ValueError, match="cell_selection.*wrong artifact kind or scope"
+    ):
+        _plan(
+            root,
+            feature_selection,
+            feature_selection,
+            reference.external_ref,
+        )
+    with pytest.raises(
+        ValueError, match="feature_selection.*wrong artifact kind or scope"
+    ):
+        _plan(
+            root,
+            cell_selection,
+            cell_selection,
+            reference.external_ref,
+        )
+    with pytest.raises(TypeError, match="ExternalArtifactRef"):
+        _plan(
+            root,
+            cell_selection,
+            feature_selection,
+            reference.ref,  # type: ignore[arg-type]
+        )
+    wrong_external = ExternalArtifactRef(
+        dataset_fingerprint="reference-dataset",
+        ref=_artifact_ref("projection", "f"),
+    )
+    with pytest.raises(ValueError, match="mapping_reference artifact"):
+        _plan(
+            root,
+            cell_selection,
+            feature_selection,
+            wrong_external,
+        )
+
+
 def test_resolve_projection_rejects_empty_mapping_name() -> None:
     root, cell_selection, feature_selection = _query_inputs()
     reference, _ = _mapping_reference()
@@ -738,5 +1104,42 @@ def test_resolve_projection_rejects_empty_mapping_name() -> None:
             root,
             query_assay="RNA",
             mapping_name="",
+            mapping_reference=reference.external_ref,
+        )
+
+
+def test_resolve_projection_rejects_missing_and_malformed_candidates() -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+    with pytest.raises(ValueError, match="No complete projection"):
+        resolve_projection(
+            root,
+            query_assay="RNA",
+            mapping_name="missing",
+            mapping_reference=reference.external_ref,
+        )
+
+    ref = _write(
+        root,
+        _plan(
+            root,
+            cell_selection,
+            feature_selection,
+            reference.external_ref,
+            mapping_name="malformed",
+        ),
+    )
+    group = artifact_group(root, ref)
+    provenance = dict(group.attrs["provenance"])
+    parameters = dict(provenance["parameters"])
+    parameters["extra"] = True
+    provenance["parameters"] = parameters
+    group.attrs["provenance"] = provenance
+
+    with pytest.raises(ValueError, match="malformed map_query parameters"):
+        resolve_projection(
+            root,
+            query_assay="RNA",
+            mapping_name="malformed",
             mapping_reference=reference.external_ref,
         )

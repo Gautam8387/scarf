@@ -11,7 +11,10 @@ from scarf.mapping.artifact import (
     load_artifact_mapping_reference,
     write_artifact_mapping_reference,
 )
-from scarf.mapping.models import ScaledPCAProjectionModel
+from scarf.mapping.models import (
+    ScaledPCAProjectionModel,
+    SymphonyCorrectionModel,
+)
 from scarf.storage.artifact_writer import finish_artifact, plan_artifact, start_artifact
 from scarf.storage.artifacts import ArtifactRef, artifact_group
 
@@ -28,6 +31,12 @@ def _ref(
         kind=kind,
         artifact_id=token * 64,
     )
+
+
+def _plain_reference(datastore):
+    state = datastore.get_assay_state("RNA")
+    assert state is not None and state.neighbors is not None
+    return datastore.build_mapping_reference(state.neighbors)
 
 
 def test_load_rejects_non_mapping_reference_refs() -> None:
@@ -158,9 +167,7 @@ def test_write_and_load_reject_missing_payload_arrays_after_corruption(
     analyzed_datastore_ephemeral,
 ) -> None:
     datastore = analyzed_datastore_ephemeral
-    state = datastore.get_assay_state("RNA")
-    assert state is not None and state.neighbors is not None
-    reference = datastore.build_mapping_reference(state.neighbors)
+    reference = _plain_reference(datastore)
     group = artifact_group(datastore.zw, reference.ref)
     del group["loadings"]
 
@@ -174,7 +181,7 @@ def test_load_rejects_versioned_metadata_and_bad_distance_summary(
     datastore = analyzed_datastore_ephemeral
     state = datastore.get_assay_state("RNA")
     assert state is not None and state.neighbors is not None
-    reference = datastore.build_mapping_reference(state.neighbors)
+    reference = _plain_reference(datastore)
     group = artifact_group(datastore.zw, reference.ref)
 
     metadata = dict(group.attrs["reference_metadata"])
@@ -192,6 +199,122 @@ def test_load_rejects_versioned_metadata_and_bad_distance_summary(
     quantiles[:] = np.linspace(1.0, 0.0, quantiles.shape[0])
     with pytest.raises(ValueError, match="distance summary"):
         load_artifact_mapping_reference(datastore, reference.ref)
+
+
+def test_load_rejects_malformed_scoped_and_missing_input_refs(
+    analyzed_datastore_ephemeral,
+) -> None:
+    datastore = analyzed_datastore_ephemeral
+    reference = _plain_reference(datastore)
+    group = artifact_group(datastore.zw, reference.ref)
+    original = dict(group.attrs["provenance"])
+    original_inputs = dict(original["inputs"])
+    malformed_reduction = dict(original_inputs["reduction"])
+    malformed_reduction["artifact_id"] = "invalid"
+    corruptions = (
+        ("not-a-ref", "input 'reduction' is missing"),
+        (malformed_reduction, "input 'reduction' is malformed"),
+        (
+            _ref(kind="reduction", assay=None, token="d").to_dict(),
+            "wrong artifact kind or scope",
+        ),
+        (
+            _ref(kind="reduction", token="e").to_dict(),
+            "input 'reduction' is missing or incomplete",
+        ),
+    )
+
+    for value, message in corruptions:
+        provenance = dict(original)
+        inputs = dict(original_inputs)
+        inputs["reduction"] = value
+        provenance["inputs"] = inputs
+        group.attrs["provenance"] = provenance
+        with pytest.raises(ValueError, match=message):
+            load_artifact_mapping_reference(datastore, reference.ref)
+
+    group.attrs["provenance"] = original
+
+
+def test_load_rejects_coordinate_chain_and_live_fingerprint_mismatches(
+    analyzed_datastore_ephemeral,
+) -> None:
+    datastore = analyzed_datastore_ephemeral
+    reference = _plain_reference(datastore)
+    ann_group = artifact_group(datastore.zw, reference.ann_index)
+    original_ann_provenance = dict(ann_group.attrs["provenance"])
+    ann_provenance = dict(original_ann_provenance)
+    ann_inputs = dict(ann_provenance["inputs"])
+    ann_inputs["coordinates"] = reference.feature_selection.to_dict()
+    ann_provenance["inputs"] = ann_inputs
+    ann_group.attrs["provenance"] = ann_provenance
+
+    with pytest.raises(ValueError, match="ANN index uses different coordinates"):
+        load_artifact_mapping_reference(datastore, reference.ref)
+
+    ann_group.attrs["provenance"] = original_ann_provenance
+    original_fingerprint = datastore.RNA.attrs["dataset_fingerprint"]
+    datastore.RNA.attrs["dataset_fingerprint"] = "changed"
+    with pytest.raises(ValueError, match="dataset fingerprint"):
+        load_artifact_mapping_reference(datastore, reference.ref)
+    datastore.RNA.attrs["dataset_fingerprint"] = original_fingerprint
+
+
+def test_load_rejects_metadata_model_and_payload_tampering(
+    analyzed_datastore_ephemeral,
+) -> None:
+    datastore = analyzed_datastore_ephemeral
+    reference = _plain_reference(datastore)
+    group = artifact_group(datastore.zw, reference.ref)
+    original_metadata = dict(group.attrs["reference_metadata"])
+
+    metadata = dict(original_metadata)
+    metadata["assay"] = "other"
+    group.attrs["reference_metadata"] = metadata
+    with pytest.raises(ValueError, match="metadata does not match"):
+        load_artifact_mapping_reference(datastore, reference.ref)
+
+    metadata = dict(original_metadata)
+    metadata["normalization_parameters"] = []
+    group.attrs["reference_metadata"] = metadata
+    with pytest.raises(ValueError, match="normalization parameters are missing"):
+        load_artifact_mapping_reference(datastore, reference.ref)
+
+    metadata = dict(original_metadata)
+    metadata["selected_cell_count"] = reference.selected_cell_count + 1
+    group.attrs["reference_metadata"] = metadata
+    with pytest.raises(ValueError, match="cell count does not match"):
+        load_artifact_mapping_reference(datastore, reference.ref)
+
+    group.attrs["reference_metadata"] = original_metadata
+    scales = group["feature_scales"]
+    original_scale = float(scales[0])
+    scales[0] = 0.0
+    with pytest.raises(ValueError, match="PCA model is invalid"):
+        load_artifact_mapping_reference(datastore, reference.ref)
+    scales[0] = original_scale
+
+    feature_ids = group["feature_ids"]
+    original_feature_id = feature_ids[0]
+    feature_ids[0] = "__tampered_feature__"
+    with pytest.raises(ValueError, match="feature IDs do not match"):
+        load_artifact_mapping_reference(datastore, reference.ref)
+    feature_ids[0] = original_feature_id
+
+    group.create_group("extra")
+    with pytest.raises(ValueError, match="groups outside"):
+        load_artifact_mapping_reference(datastore, reference.ref)
+    del group["extra"]
+
+    group.create_array("extra", data=np.ones(1), chunks=(1,))
+    with pytest.raises(ValueError, match="arrays outside"):
+        load_artifact_mapping_reference(datastore, reference.ref)
+    del group["extra"]
+
+    del group.attrs["reference_metadata"]
+    with pytest.raises(ValueError, match="metadata is missing"):
+        load_artifact_mapping_reference(datastore, reference.ref)
+    group.attrs["reference_metadata"] = original_metadata
 
 
 def test_write_artifact_mapping_reference_persists_required_pca_arrays() -> None:
@@ -240,3 +363,84 @@ def test_write_artifact_mapping_reference_persists_required_pca_arrays() -> None
         "reference_distance_values",
     }
     assert group.attrs["reference_metadata"]["method"] == "pca"
+
+
+def test_write_artifact_mapping_reference_persists_symphony_state() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    planned = plan_artifact(
+        root,
+        scope="assay",
+        assay="RNA",
+        kind="mapping_reference",
+        operation="build_mapping_reference",
+        parameters={"method": "symphony"},
+        inputs={},
+        execution_options={},
+    )
+    group = start_artifact(root, planned)
+    write_artifact_mapping_reference(
+        group,
+        ScaledPCAProjectionModel(
+            feature_means=np.zeros(2),
+            feature_scales=np.ones(2),
+            loadings=np.eye(2),
+        ),
+        SymphonyCorrectionModel(
+            centroids=np.eye(2),
+            raw_centroids=np.eye(2),
+            corrected_centroids=np.eye(2) * 2,
+            cluster_mass=np.array([1.0, 2.0]),
+            sigma=np.array([0.5, 1.0]),
+        ),
+        np.array(["g0", "g1"], dtype=object),
+        {"method": "symphony"},
+        np.array([0.0, 1.0]),
+        np.array([0.1, 0.2]),
+    )
+    finish_artifact(group, planned)
+
+    assert set(group.array_keys()) == {
+        "feature_ids",
+        "feature_means",
+        "feature_scales",
+        "loadings",
+        "reference_distance_quantiles",
+        "reference_distance_values",
+        "centroids",
+        "raw_centroids",
+        "corrected_centroids",
+        "cluster_mass",
+        "sigma",
+    }
+
+
+def test_write_artifact_mapping_reference_rejects_high_rank_arrays() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    planned = plan_artifact(
+        root,
+        scope="assay",
+        assay="RNA",
+        kind="mapping_reference",
+        operation="build_mapping_reference",
+        parameters={"method": "pca"},
+        inputs={},
+        execution_options={},
+    )
+    group = start_artifact(root, planned)
+
+    with pytest.raises(ValueError, match="one or two axes"):
+        write_artifact_mapping_reference(
+            group,
+            ScaledPCAProjectionModel(
+                feature_means=np.zeros(2),
+                feature_scales=np.ones(2),
+                loadings=np.eye(2),
+            ),
+            None,
+            np.array(["g0", "g1"], dtype=object),
+            {"method": "pca"},
+            np.ones((1, 1, 1)),
+            np.ones(1),
+        )
+
+    assert not group.attrs["complete"]

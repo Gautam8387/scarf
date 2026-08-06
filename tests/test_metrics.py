@@ -360,6 +360,58 @@ def test_knn_without_affinities_preserves_distances():
     )
 
 
+@pytest.mark.parametrize(
+    ("indices", "distances"),
+    [
+        (np.array([0, 1]), np.ones((2, 1))),
+        (np.zeros((2, 1), dtype=np.int64), np.array([1.0, 2.0])),
+    ],
+)
+def test_knn_to_csr_matrix_requires_two_dimensional_inputs(indices, distances):
+    with pytest.raises(ValueError, match="two-dimensional"):
+        knn_to_csr_matrix(indices, distances)
+
+
+def test_knn_to_csr_matrix_requires_matching_shapes_and_integer_indices():
+    with pytest.raises(ValueError, match="matching shapes"):
+        knn_to_csr_matrix(
+            np.array([[1], [0]]),
+            np.ones((2, 2)),
+        )
+    with pytest.raises(TypeError, match="indices must contain integers"):
+        knn_to_csr_matrix(
+            np.array([[1.0], [0.0]]),
+            np.ones((2, 1)),
+        )
+
+
+@pytest.mark.parametrize("invalid_distance", [-1.0, np.nan, np.inf])
+def test_knn_to_csr_matrix_rejects_invalid_distances(invalid_distance):
+    distances = np.ones((2, 1))
+    distances[0, 0] = invalid_distance
+
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        knn_to_csr_matrix(np.array([[1], [0]]), distances)
+
+
+@pytest.mark.parametrize("shape", [(0, 1), (1, 0)])
+def test_knn_to_csr_matrix_rejects_empty_axes(shape):
+    with pytest.raises(ValueError, match="contain cells and neighbors"):
+        knn_to_csr_matrix(
+            np.empty(shape, dtype=np.int64),
+            np.empty(shape, dtype=np.float64),
+        )
+
+
+@pytest.mark.parametrize("invalid_index", [-1, 2])
+def test_knn_to_csr_matrix_rejects_out_of_range_indices(invalid_index):
+    with pytest.raises(IndexError, match="outside the graph"):
+        knn_to_csr_matrix(
+            np.array([[invalid_index], [0]]),
+            np.ones((2, 1)),
+        )
+
+
 def test_knn_affinities_decrease_with_distance():
     indices = np.array([[1, 2], [0, 2], [3, 0], [2, 1]])
     distances = np.array([[0.1, 10.0], [0.1, 3.0], [0.2, 4.0], [0.2, 5.0]])
@@ -389,6 +441,27 @@ def test_cluster_similarity_is_symmetric_with_unit_diagonal():
     assert similarities[0, 1] > 0
 
 
+def test_weighted_cluster_similarity_validates_graph_and_labels():
+    with pytest.raises(ValueError, match="square"):
+        calculate_weighted_cluster_similarity(
+            csr_matrix((2, 3), dtype=np.float64),
+            np.array([0, 1]),
+        )
+
+    for invalid_weight in (-1.0, np.nan, np.inf):
+        graph = csr_matrix(np.array([[0.0, invalid_weight], [1.0, 0.0]]))
+        with pytest.raises(ValueError, match="finite and non-negative"):
+            calculate_weighted_cluster_similarity(graph, np.array([0, 1]))
+
+    graph = csr_matrix(np.eye(2))
+    with pytest.raises(ValueError, match="one value per graph node"):
+        calculate_weighted_cluster_similarity(graph, np.array([0]))
+    with pytest.raises(TypeError, match="labels must contain integers"):
+        calculate_weighted_cluster_similarity(graph, np.array(["a", "b"]))
+    with pytest.raises(ValueError, match="contiguous integers starting at 0"):
+        calculate_weighted_cluster_similarity(graph, np.array([0, 2]))
+
+
 def test_streamed_knn_similarity_matches_csr_similarity():
     indices = np.array([[1, 2], [0, 2], [3, 0], [2, 1]])
     distances = np.array([[0.1, 10.0], [0.1, 3.0], [0.2, 4.0], [0.2, 5.0]])
@@ -406,6 +479,86 @@ def test_streamed_knn_similarity_matches_csr_similarity():
     assert np.allclose(streamed, materialized)
 
 
+def test_streamed_knn_similarity_validates_structure():
+    labels = np.array([0, 1])
+
+    with pytest.raises(ValueError, match="two-dimensional"):
+        calculate_knn_cluster_similarity(
+            np.array([1, 0]),
+            np.ones((2, 1)),
+            labels,
+        )
+    with pytest.raises(ValueError, match="matching shapes"):
+        calculate_knn_cluster_similarity(
+            np.array([[1], [0]]),
+            np.ones((2, 2)),
+            labels,
+        )
+    with pytest.raises(ValueError, match="contain neighbors"):
+        calculate_knn_cluster_similarity(
+            np.empty((2, 0), dtype=np.int64),
+            np.empty((2, 0), dtype=np.float64),
+            labels,
+        )
+    with pytest.raises(ValueError, match="greater than zero"):
+        calculate_knn_cluster_similarity(
+            np.array([[1], [0]]),
+            np.ones((2, 1)),
+            labels,
+            batch_rows=0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("indices", "distances", "error", "message"),
+    [
+        (
+            np.array([[1.0], [0.0]]),
+            np.ones((2, 1)),
+            TypeError,
+            "indices must contain integers",
+        ),
+        (
+            np.array([[-1], [0]]),
+            np.ones((2, 1)),
+            IndexError,
+            "outside the graph",
+        ),
+        (
+            np.array([[2], [0]]),
+            np.ones((2, 1)),
+            IndexError,
+            "outside the graph",
+        ),
+        (
+            np.array([[1], [0]]),
+            np.array([[-1.0], [1.0]]),
+            ValueError,
+            "finite and non-negative",
+        ),
+        (
+            np.array([[1], [0]]),
+            np.array([[np.nan], [1.0]]),
+            ValueError,
+            "finite and non-negative",
+        ),
+    ],
+)
+def test_streamed_knn_similarity_validates_blocks(
+    indices,
+    distances,
+    error,
+    message,
+):
+    with pytest.raises(error, match=message):
+        calculate_knn_cluster_similarity(
+            indices,
+            distances,
+            np.array([0, 1]),
+            batch_rows=1,
+        )
+
+
 def test_top_k_distances_accept_all_candidates():
     distances = calculate_top_k_neighbor_distances(
         np.array([[0.0]]),
@@ -414,6 +567,61 @@ def test_top_k_distances_accept_all_candidates():
     )
 
     assert np.allclose(np.sort(distances[0]), [1.0, 2.0])
+
+
+@pytest.mark.parametrize(
+    ("matrix_a", "matrix_b"),
+    [
+        (np.array([0.0, 1.0]), np.ones((2, 2))),
+        (np.ones((2, 2)), np.array([0.0, 1.0])),
+    ],
+)
+def test_top_k_distances_require_two_dimensional_inputs(matrix_a, matrix_b):
+    with pytest.raises(ValueError, match="two-dimensional"):
+        calculate_top_k_neighbor_distances(matrix_a, matrix_b, k=1)
+
+
+def test_top_k_distances_require_matching_feature_counts():
+    with pytest.raises(ValueError, match="same number of features"):
+        calculate_top_k_neighbor_distances(
+            np.ones((2, 1)),
+            np.ones((2, 2)),
+            k=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("matrix_a", "matrix_b"),
+    [
+        (np.empty((0, 2)), np.ones((1, 2))),
+        (np.ones((1, 2)), np.empty((0, 2))),
+    ],
+)
+def test_top_k_distances_reject_empty_point_sets(matrix_a, matrix_b):
+    with pytest.raises(ValueError, match="at least one point"):
+        calculate_top_k_neighbor_distances(matrix_a, matrix_b, k=1)
+
+
+@pytest.mark.parametrize(
+    ("matrix_a", "matrix_b"),
+    [
+        (np.array([[np.nan, 0.0]]), np.ones((1, 2))),
+        (np.ones((1, 2)), np.array([[np.inf, 0.0]])),
+    ],
+)
+def test_top_k_distances_reject_nonfinite_values(matrix_a, matrix_b):
+    with pytest.raises(ValueError, match="finite values"):
+        calculate_top_k_neighbor_distances(matrix_a, matrix_b, k=1)
+
+
+@pytest.mark.parametrize("k", [0, -1])
+def test_top_k_distances_require_positive_k(k):
+    with pytest.raises(ValueError, match="greater than zero"):
+        calculate_top_k_neighbor_distances(
+            np.zeros((1, 1)),
+            np.zeros((1, 1)),
+            k=k,
+        )
 
 
 def test_top_k_cosine_distances_handle_opposite_and_zero_vectors():
