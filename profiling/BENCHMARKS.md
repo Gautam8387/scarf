@@ -89,8 +89,9 @@ Wall-time `±` values are sample standard deviations, not confidence intervals.
 
 ### Replicate totals
 
-Individual completed totals for matching configurations. The 10M second
-replicate is still running.
+Individual completed totals for matching configurations. The 10M row has one
+completed replicate; two later attempts ended before the full workflow
+completed and are excluded.
 
 | Input cells | Replicate | Wall time (s) | Peak cgroup (GiB) | Peak RSS (GiB) |
 | ---: | --- | ---: | ---: | ---: |
@@ -140,10 +141,11 @@ slowdown across every pipeline stage.
 
 ## Interpretation
 
-The 10M row is still one completed run (`n = 1`) while its second replicate
-runs. The 10k through 5M rows have two replicates and report mean ± sample SD
-plus the observed range. That is enough to show drift at `n = 2`. A Student-t
-95% CI will wait until there are at least three matching replicates.
+The 10M row has one completed run (`n = 1`); two later attempts ended before the
+full workflow completed and are excluded. The 10k through 5M rows have two
+replicates and report mean ± sample SD plus the observed range. That is enough
+to show drift at `n = 2`. A Student-t 95% CI will wait until there are at least
+three matching replicates.
 
 These runs replace the previous July 2026 1M and 10M reference rows. The older
 10M measurement used 16 CPU and 128 GiB; the current 10M measurement uses 16 CPU
