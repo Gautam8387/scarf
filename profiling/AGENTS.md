@@ -5,8 +5,8 @@ These instructions apply to local profiling diagnostics and the Modal end-to-end
 
 ## Before cloud work
 
-- Read `profiling/BENCHMARKS.md` for the current reference measurements and their interpretation
-  limits.
+- Read `docs/source/concepts/benchmarks.md` for the current reference measurements and their
+  interpretation limits.
 - Run local profiling tests before using cloud resources:
 
 ```bash
