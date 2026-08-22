@@ -1,5 +1,6 @@
 import functools
 import json
+import sys
 import warnings
 from pathlib import Path
 
@@ -57,12 +58,81 @@ def _grouped_knn_indices(groups: list[list[int]]) -> np.ndarray:
     return graph.indices.reshape(graph.shape[0], degree)
 
 
-def test_leiden_membership_preserves_disconnected_partitions():
+@pytest.mark.parametrize("backend", ["igraph", "leidenalg"])
+def test_leiden_membership_preserves_disconnected_partitions(backend):
     graph = _grouped_knn_graph([[0, 1, 2, 3], [4, 5, 6, 7]])
 
-    actual = leiden_membership(graph, resolution=1.0, random_seed=4444)
+    actual = leiden_membership(
+        graph,
+        resolution=1.0,
+        random_seed=4444,
+        backend=backend,
+    )
 
     assert adjusted_rand_score([1, 1, 1, 1, 2, 2, 2, 2], actual) == pytest.approx(1.0)
+
+
+def test_native_leiden_membership_is_seeded_and_repeatable():
+    graph = _simple_knn_graph(100)
+
+    first = leiden_membership(graph, resolution=1.0, random_seed=4444)
+    second = leiden_membership(graph, resolution=1.0, random_seed=4444)
+
+    np.testing.assert_array_equal(second, first)
+
+
+def test_leiden_membership_rejects_unknown_backend():
+    graph = _simple_knn_graph(10)
+
+    with pytest.raises(ValueError, match="backend"):
+        leiden_membership(
+            graph,
+            resolution=1.0,
+            random_seed=4444,
+            backend="unknown",  # type: ignore[arg-type]
+        )
+
+
+def test_igraph_leiden_ignores_explicit_zero_weight_edges():
+    solid = _grouped_knn_graph([[0, 1, 2, 3], [4, 5, 6, 7]]).tocoo()
+    padded = coo_matrix(
+        (
+            np.concatenate([solid.data, np.zeros(4)]),
+            (
+                np.concatenate([solid.row, np.array([0, 1, 2, 3])]),
+                np.concatenate([solid.col, np.array([4, 5, 6, 7])]),
+            ),
+        ),
+        shape=solid.shape,
+    )
+
+    assert np.count_nonzero(padded.data) != padded.nnz
+
+    actual = leiden_membership(padded, resolution=1.0, random_seed=4444)
+    expected = leiden_membership(solid, resolution=1.0, random_seed=4444)
+
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_igraph_membership_requires_igraph(monkeypatch):
+    monkeypatch.setitem(sys.modules, "igraph", None)
+    graph = _simple_knn_graph(10)
+
+    with pytest.raises(ImportError, match="igraph"):
+        leiden_membership(graph, resolution=1.0, random_seed=4444)
+
+
+def test_leidenalg_membership_requires_leidenalg(monkeypatch):
+    monkeypatch.setitem(sys.modules, "leidenalg", None)
+    graph = _simple_knn_graph(10)
+
+    with pytest.raises(ImportError, match="leidenalg"):
+        leiden_membership(
+            graph,
+            resolution=1.0,
+            random_seed=4444,
+            backend="leidenalg",
+        )
 
 
 def test_diffusion_operator_matches_powered_row_normalization():

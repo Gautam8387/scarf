@@ -22,7 +22,7 @@ def test_example_config_loads():
     assert set(CORE_STAGE_ORDER) <= set(config.stageResources)
     assert config.effectiveStages == CORE_STAGE_ORDER
     assert "writeCountsT" in CORE_STAGE_ORDER
-    assert "runClustering" in CORE_STAGE_ORDER
+    assert CORE_STAGE_ORDER[-2:] == ("runLeiden", "findMarkers")
     assert config.datasetUri(10_000).endswith("/10000.h5ad")
     assert config.resultUri(10_000, "createStore").endswith(
         "/results/10000/createStore.json"
@@ -32,6 +32,9 @@ def test_example_config_loads():
     leiden = config.resourcesFor("runLeiden")
     assert leiden.modalMemoryLimitMb == 32_768
     assert leiden.modalCpuLimit == 2.0
+    assert config.workflow.topN == 1000
+    assert config.workflow.dims == 21
+    assert config.workflow.k == 11
 
 
 def test_run_tag_isolates_store_and_result_uris():
@@ -69,6 +72,9 @@ def test_marker_group_key_matches_leiden_column():
     workflow = WorkflowParameters()
     assert workflow.resolvedMarkerGroupKey == "RNA_leiden_cluster"
     assert workflow.resolvedHvgKey == "I__hvgs"
+    assert workflow.topN == 1000
+    assert workflow.dims == 21
+    assert workflow.k == 11
 
 
 def test_existing_error_result_is_terminal(monkeypatch) -> None:
