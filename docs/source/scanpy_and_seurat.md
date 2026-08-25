@@ -44,6 +44,10 @@ A `DataStore` can contain several assays, such as `RNA` and `ADT`.
 Most methods use the default assay unless you select another one.
 Local paths and `s3://` or `gs://` locations use the same analysis API.
 
+Feature selection is artifact-first: `features = ds.mark_hvgs(...)` returns an immutable reference, and `ds.run_normalization(features=features)` consumes it.
+Direct feature analyses such as marker search likewise require `features=`; use `ds.resolve_features("RNA", "all_features")` for the complete universe.
+Graph-derived methods use `graph=` or the current connectivity map from `AssayState`, not a separate feature selector.
+
 ## Scanpy workflow map
 
 Scanpy commonly composes the stages as separate `sc.pp`, `sc.tl`, and `sc.pl` calls.
@@ -51,7 +55,7 @@ Scarf provides the same level of control through individual methods, but `ds.pip
 
 The rows below map intent, not identical statistical implementations.
 Scarf selects HVGs before normalizing on that feature set, which differs from the common Scanpy order of normalize, log-transform, then select HVGs.
-When calling stages manually, pass `feat_key="hvgs"` to normalization and build embedding initialization before UMAP; {doc}`tutorials/graph_construction` shows the full chain.
+When calling stages manually, pass the `features` artifact from `mark_hvgs` into `run_normalization` and build embedding initialization before UMAP; {doc}`tutorials/graph_construction` shows the full chain.
 
 | Goal | Scanpy | Scarf |
 |---|---|---|
