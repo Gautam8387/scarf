@@ -20,9 +20,11 @@ from .types import (
     StageStatus,
     TuningBiologyHandoff,
 )
+from ..utils.logging import logger
 
 try:
-    from pydantic_ai import ModelRetry, RunContext
+    from pydantic_ai import ModelRetry, RunContext, Tool
+    from pydantic_ai.tools import ToolDefinition
 except ImportError as exc:
     from .config._deps import AGENT_INSTALL_HINT
 
@@ -55,15 +57,23 @@ class BiologicalContext(AgentDataModel):
     """Caller-supplied facts that constrain biological interpretation."""
 
     organism: str = ""
+    studyContext: str = ""
     tissue: str = ""
     cellTypeReferences: list[str] = Field(default_factory=list)
     experimentalDetails: list[str] = Field(default_factory=list)
     treatmentQuestion: str = ""
 
     @classmethod
+    def get_blank(cls) -> "BiologicalContext":
+        return cls()
+
+    @classmethod
     def get_example(cls) -> "BiologicalContext":
         return cls(
             organism="Homo sapiens",
+            studyContext=(
+                "Human lung samples were profiled after drug or vehicle treatment."
+            ),
             tissue="lung",
             cellTypeReferences=["alveolar macrophage", "T cell"],
             experimentalDetails=["drug and vehicle groups"],
@@ -308,6 +318,8 @@ class BiologicalInterpretationReport(AgentDataModel):
     followUps: list[FollowUpRecommendation] = Field(default_factory=list)
     clusterArtifact: ArtifactReferenceModel | None = None
     markerArtifact: ArtifactReferenceModel | None = None
+    graphAssay: str | None = None
+    markerAssay: str | None = None
     evidenceIds: list[str] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
     stopReason: str = ""
@@ -326,6 +338,8 @@ class BiologicalInterpretationReport(AgentDataModel):
             followUps=[follow_up],
             clusterArtifact=ClusterCompositionEvidence.get_example().clusterArtifact,
             markerArtifact=ClusterMarkerEvidence.get_example().markerArtifact,
+            graphAssay="RNA",
+            markerAssay="RNA",
             evidenceIds=sorted(
                 {
                     *interpretation.evidenceIds,
@@ -348,6 +362,8 @@ class BiologicalInterpretationDependencies(AgentDataModel):
     cluster: Any = Field(default=None, exclude=True)
     cellKey: str = "I"
     fromAssay: str | None = None
+    graphAssay: str | None = None
+    markerAssayType: str | None = None
     sampleColumn: str | None = None
     conditionColumn: str | None = None
     marker: Any = Field(default=None, exclude=True)
@@ -360,6 +376,7 @@ class BiologicalInterpretationDependencies(AgentDataModel):
     evidenceIds: set[str] = Field(default_factory=set, exclude=True)
     clusterValues: dict[str, Any] = Field(default_factory=dict, exclude=True)
     markerEvidenceIds: dict[str, str] = Field(default_factory=dict, exclude=True)
+    toolCalls: list[str] = Field(default_factory=list, exclude=True)
     conditionEvidence: dict[str, ConditionClusterSummary] = Field(
         default_factory=dict,
         exclude=True,
@@ -375,9 +392,29 @@ class BiologicalInterpretationDependencies(AgentDataModel):
             clusterColumn="RNA_cluster",
             cluster=object(),
             fromAssay="RNA",
+            graphAssay="RNA",
+            markerAssayType="RNA",
             sampleColumn="sample",
             conditionColumn="treatment",
         )
+
+
+def _prepare_biological_interpretation_tool(
+    ctx: RunContext[BiologicalInterpretationDependencies],
+    tool_definition: ToolDefinition,
+) -> ToolDefinition | None:
+    """Expose composition and marker batches once and in the required order."""
+    completed_calls = set(ctx.deps.toolCalls)
+    if tool_definition.name == "inspect_cluster_composition":
+        return None if tool_definition.name in completed_calls else tool_definition
+    if tool_definition.name == "inspect_cluster_markers_batch":
+        if (
+            "inspect_cluster_composition" not in completed_calls
+            or tool_definition.name in completed_calls
+        ):
+            return None
+        return tool_definition
+    return tool_definition
 
 
 _SYSTEM_PROMPT = dedent(
@@ -396,7 +433,12 @@ _SYSTEM_PROMPT = dedent(
         for that cluster into its evidenceIds. Do not interpret a cluster whose
         marker evidenceId is empty. Cluster abundance summaries are descriptive,
         not tests of significance or causal effects. Treatment observations must
-        compare two returned sample-level condition summaries for the same cluster.
+        compare two returned independent-unit condition summaries for the same
+        cluster. Independent units may occur in more than one condition in paired
+        or repeated-measure designs. Return treatmentObservations empty unless the
+        exact experimental handoff confirms independent-unit aggregation, a
+        between-unit coefficient, an estimable coefficient, and at least two
+        independent units in each cited condition.
         Marker p-values describe cluster-versus-rest marker specificity, not
         condition effects. Keep treatment content out of cluster identity
         interpretations. Recommend a named follow-up operation when replication, a
@@ -431,6 +473,10 @@ async def inspect_cluster_composition(
 ) -> ClusterCompositionEvidence:
     """Inspect bounded cluster and condition composition without identifiers."""
     deps = ctx.deps
+    logger.info(
+        f"Inspecting cluster composition for column {deps.clusterColumn!r}; "
+        f"cell_key={deps.cellKey!r}, max_clusters={deps.maxClusters}"
+    )
     _check_column(deps.store, deps.clusterColumn, "cluster column")
     _check_column(deps.store, deps.cellKey, "cell key")
     if deps.sampleColumn is not None:
@@ -447,11 +493,13 @@ async def inspect_cluster_composition(
             "cluster must identify a cluster_labels or cluster_cut artifact"
         )
     if (
-        deps.fromAssay is not None
+        deps.graphAssay is not None
         and cluster_artifact.scope == "assay"
-        and cluster_artifact.assay != deps.fromAssay
+        and cluster_artifact.assay != deps.graphAssay
     ):
         raise ValueError("cluster artifact belongs to a different assay")
+    if cluster_artifact.scope == "datastore" and cluster_artifact.assay is not None:
+        raise ValueError("datastore-scoped cluster artifacts must not name an assay")
     if hasattr(deps.store, "inspect_artifact"):
         status = deps.store.inspect_artifact(deps.cluster)
         if not getattr(status, "exists", True):
@@ -541,7 +589,8 @@ async def inspect_cluster_composition(
             {summary.evidenceId: summary for summary in condition_summaries}
         )
 
-    return ClusterCompositionEvidence(
+    deps.toolCalls.append("inspect_cluster_composition")
+    evidence = ClusterCompositionEvidence(
         clusterColumn=deps.clusterColumn,
         clusterArtifact=cluster_artifact,
         cellKey=deps.cellKey,
@@ -553,6 +602,13 @@ async def inspect_cluster_composition(
         evidenceIds=sorted(deps.evidenceIds),
         warnings=warnings,
     )
+    logger.info(
+        f"Completed cluster composition inspection: cells={evidence.totalCells}, "
+        f"clusters={len(evidence.clusterCounts)}, "
+        f"condition_summaries={len(evidence.conditionSummaries)}, "
+        f"warnings={len(evidence.warnings)}"
+    )
+    return evidence
 
 
 def _sample_condition_summaries(
@@ -563,9 +619,9 @@ def _sample_condition_summaries(
     retained_clusters: list[str],
     evidence_prefix: str,
 ) -> list[ConditionClusterSummary]:
+    """Aggregate each condition-unit pair without exposing unit identifiers."""
     sample_counts: dict[tuple[str, str], Counter[str]] = defaultdict(Counter)
     sample_totals: Counter[tuple[str, str]] = Counter()
-    sample_conditions: dict[str, set[str]] = defaultdict(set)
     for sample, condition, cluster in zip(
         sample_values,
         condition_values,
@@ -574,20 +630,9 @@ def _sample_condition_summaries(
     ):
         condition_label = _string_value(condition)
         sample_label = _string_value(sample)
-        sample_conditions[sample_label].add(condition_label)
         key = (condition_label, sample_label)
         sample_totals[key] += 1
         sample_counts[key][_string_value(cluster)] += 1
-    conflicting_samples = sorted(
-        sample
-        for sample, conditions in sample_conditions.items()
-        if len(conditions) > 1
-    )
-    if conflicting_samples:
-        raise ValueError(
-            "each sample must map to exactly one condition; "
-            f"{len(conflicting_samples)} samples map to multiple conditions"
-        )
 
     fractions: dict[tuple[str, str], list[float]] = defaultdict(list)
     cell_counts: Counter[tuple[str, str]] = Counter()
@@ -654,12 +699,17 @@ async def inspect_cluster_markers(
 ) -> ClusterMarkerEvidence:
     """Load markers for one observed cluster, optionally creating one artifact."""
     deps = ctx.deps
+    logger.debug(f"Inspecting markers for cluster {cluster_id!r}")
     if not deps.clusterValues:
         raise ModelRetry("Call inspect_cluster_composition before inspecting markers.")
     if cluster_id not in deps.clusterValues:
         raise ModelRetry(f"cluster_id must be one of {sorted(deps.clusterValues)}")
     if deps.marker is None:
         if not deps.allowMarkerSearch:
+            logger.warning(
+                f"Markers for cluster {cluster_id!r} are unavailable because no "
+                "marker artifact was supplied or authorized"
+            )
             return ClusterMarkerEvidence(
                 clusterId=cluster_id,
                 evidenceId="",
@@ -668,11 +718,19 @@ async def inspect_cluster_markers(
                 ],
             )
         if deps.markerFeatures is None:
+            logger.warning(
+                f"Markers for cluster {cluster_id!r} are unavailable because no "
+                "feature selection was supplied"
+            )
             return ClusterMarkerEvidence(
                 clusterId=cluster_id,
                 evidenceId="",
                 warnings=["Marker search requires an exact feature selection."],
             )
+        logger.info(
+            f"Creating one marker artifact for assay {deps.fromAssay!r} and "
+            f"cluster column {deps.clusterColumn!r}"
+        )
         deps.marker = deps.store.run_marker_search(
             from_assay=deps.fromAssay,
             group_key=deps.clusterColumn,
@@ -739,13 +797,18 @@ async def inspect_cluster_markers(
     if markers:
         deps.evidenceIds.add(evidence_id)
         deps.markerEvidenceIds[cluster_id] = evidence_id
-    return ClusterMarkerEvidence(
+    evidence = ClusterMarkerEvidence(
         clusterId=cluster_id,
         markers=markers,
         markerArtifact=marker_artifact,
         evidenceId=evidence_id if markers else "",
         warnings=[] if markers else ["No markers passed the requested thresholds."],
     )
+    logger.debug(
+        f"Completed marker inspection for cluster {cluster_id!r}: "
+        f"markers={len(markers)}"
+    )
+    return evidence
 
 
 async def inspect_cluster_markers_batch(
@@ -764,6 +827,7 @@ async def inspect_cluster_markers_batch(
     if len(set(cluster_ids)) != len(cluster_ids):
         raise ModelRetry("cluster_ids must not contain duplicates")
 
+    logger.info(f"Inspecting markers for {len(cluster_ids)} cluster(s) in one batch")
     clusters = [
         await inspect_cluster_markers(ctx, cluster_id=cluster_id)
         for cluster_id in cluster_ids
@@ -774,11 +838,18 @@ async def inspect_cluster_markers_batch(
         for cluster in clusters
         for warning in cluster.warnings
     ]
-    return ClusterMarkerBatchEvidence(
+    ctx.deps.toolCalls.append("inspect_cluster_markers_batch")
+    evidence = ClusterMarkerBatchEvidence(
         clusters=clusters,
         evidenceIds=evidence_ids,
         warnings=warnings,
     )
+    logger.info(
+        f"Completed marker batch inspection: clusters={len(clusters)}, "
+        f"clusters_with_markers={sum(bool(cluster.markers) for cluster in clusters)}, "
+        f"evidence_records={len(evidence_ids)}"
+    )
+    return evidence
 
 
 def _marker_feature(row: dict[str, Any]) -> MarkerFeature:
@@ -798,48 +869,10 @@ def _marker_feature(row: dict[str, Any]) -> MarkerFeature:
     )
 
 
-def validate_biological_interpretation_report(
+def _canonicalize_cluster_interpretations(
     report: BiologicalInterpretationReport,
     deps: BiologicalInterpretationDependencies,
-) -> BiologicalInterpretationReport:
-    """Reject invented evidence, clusters, or completed marker-free reviews."""
-    if not deps.clusterValues:
-        raise ModelRetry("Call inspect_cluster_composition before returning a report.")
-    expected_cluster_artifact = artifact_reference(deps.cluster)
-    if (
-        report.clusterArtifact is not None
-        and report.clusterArtifact != expected_cluster_artifact
-    ):
-        raise ModelRetry("Report clusterArtifact does not match the inspected artifact")
-    if deps.marker is not None:
-        expected_marker_artifact = artifact_reference(deps.marker)
-        if (
-            report.markerArtifact is not None
-            and report.markerArtifact != expected_marker_artifact
-        ):
-            raise ModelRetry(
-                "Report markerArtifact does not match the inspected artifact"
-            )
-
-    cited = set(report.evidenceIds)
-    for interpretation in report.clusterInterpretations:
-        cited.update(interpretation.evidenceIds)
-    for observation in report.treatmentObservations:
-        cited.update(observation.evidenceIds)
-    for follow_up in report.followUps:
-        cited.update(follow_up.evidenceIds)
-    if report.needsInput is not None:
-        cited.update(report.needsInput.evidenceIds)
-    unknown = cited.difference(deps.evidenceIds)
-    if unknown:
-        raise ModelRetry(f"Unknown evidenceIds: {sorted(unknown)}")
-    interpreted_clusters = {item.clusterId for item in report.clusterInterpretations}
-    observed_clusters = {item.clusterId for item in report.treatmentObservations}
-    unknown_clusters = (interpreted_clusters | observed_clusters).difference(
-        deps.clusterValues
-    )
-    if unknown_clusters:
-        raise ModelRetry(f"Unknown cluster ids: {sorted(unknown_clusters)}")
+) -> tuple[list[ClusterInterpretation], list[str]]:
     canonical_interpretations: list[ClusterInterpretation] = []
     omitted_interpretation_clusters: list[str] = []
     for interpretation in report.clusterInterpretations:
@@ -854,15 +887,51 @@ def validate_biological_interpretation_report(
                 f"evidence: {non_marker_evidence}"
             )
         canonical_interpretations.append(
-            interpretation.model_copy(update={"evidenceIds": [marker_id]})
+            interpretation.model_copy(
+                update={
+                    "evidenceIds": [marker_id],
+                    **(
+                        {
+                            "identityIsHypothesis": True,
+                            "confidence": "low",
+                        }
+                        if deps.markerAssayType == "ATAC"
+                        else {}
+                    ),
+                }
+            )
         )
+    return canonical_interpretations, omitted_interpretation_clusters
 
+
+def _canonicalize_treatment_observations(
+    report: BiologicalInterpretationReport,
+    deps: BiologicalInterpretationDependencies,
+) -> list[TreatmentObservation]:
     if report.treatmentObservations and deps.conditionColumn is None:
         raise ModelRetry("Treatment observations require a condition column.")
     if report.treatmentObservations and deps.sampleColumn is None:
         raise ModelRetry(
-            "Treatment observations require sample-level composition summaries."
+            "Treatment observations require independent-unit composition summaries."
         )
+    if report.treatmentObservations:
+        handoff = deps.designHandoff
+        if (
+            handoff is None
+            or not handoff.conditionColumn
+            or handoff.conditionColumn != deps.conditionColumn
+            or not handoff.independentUnit
+            or handoff.independentUnit != deps.sampleColumn
+            or handoff.coefficientScope != "betweenUnit"
+            or handoff.estimability.get("status") != "ok"
+            or handoff.estimability.get("coefficientEstimable") is not True
+        ):
+            raise ModelRetry(
+                "Treatment observations require an explicit condition, aggregation "
+                "at the independent unit, a between-unit coefficient, and an "
+                "estimable experimental contrast."
+            )
+
     canonical_observations: list[TreatmentObservation] = []
     for observation in report.treatmentObservations:
         if not observation.isDescriptiveOnly:
@@ -927,30 +996,86 @@ def validate_biological_interpretation_report(
         if observation.direction != expected_direction:
             raise ModelRetry(
                 "Treatment observation direction does not match the cited mean "
-                "sample-level fractions."
+                "independent-unit fractions."
             )
         if expected_direction == "equal":
             canonical_text = (
-                f"Cluster {observation.clusterId} has equal mean sample-level "
+                f"Cluster {observation.clusterId} has equal mean independent-unit "
                 f"fractions in {comparison.condition} and {reference.condition} "
                 f"({comparison.meanFraction:.6g}); this is descriptive only."
             )
         else:
             canonical_text = (
                 f"Cluster {observation.clusterId} has a {expected_direction} mean "
-                f"sample-level fraction in {comparison.condition} "
+                f"independent-unit fraction in {comparison.condition} "
                 f"({comparison.meanFraction:.6g}) than in {reference.condition} "
                 f"({reference.meanFraction:.6g}); this is descriptive only."
             )
         canonical_observations.append(
             observation.model_copy(update={"observation": canonical_text})
         )
+    return canonical_observations
+
+
+def validate_biological_interpretation_report(
+    report: BiologicalInterpretationReport,
+    deps: BiologicalInterpretationDependencies,
+) -> BiologicalInterpretationReport:
+    """Reject invented evidence, clusters, or completed marker-free reviews."""
+    if not deps.clusterValues:
+        raise ModelRetry("Call inspect_cluster_composition before returning a report.")
+    expected_cluster_artifact = artifact_reference(deps.cluster)
+    if (
+        report.clusterArtifact is not None
+        and report.clusterArtifact != expected_cluster_artifact
+    ):
+        raise ModelRetry("Report clusterArtifact does not match the inspected artifact")
+    if deps.marker is not None:
+        expected_marker_artifact = artifact_reference(deps.marker)
+        if (
+            report.markerArtifact is not None
+            and report.markerArtifact != expected_marker_artifact
+        ):
+            raise ModelRetry(
+                "Report markerArtifact does not match the inspected artifact"
+            )
+
+    cited = set(report.evidenceIds)
+    for interpretation in report.clusterInterpretations:
+        cited.update(interpretation.evidenceIds)
+    for observation in report.treatmentObservations:
+        cited.update(observation.evidenceIds)
+    for follow_up in report.followUps:
+        cited.update(follow_up.evidenceIds)
+    if report.needsInput is not None:
+        cited.update(report.needsInput.evidenceIds)
+    unknown = cited.difference(deps.evidenceIds)
+    if unknown:
+        raise ModelRetry(f"Unknown evidenceIds: {sorted(unknown)}")
+    interpreted_clusters = {item.clusterId for item in report.clusterInterpretations}
+    observed_clusters = {item.clusterId for item in report.treatmentObservations}
+    unknown_clusters = (interpreted_clusters | observed_clusters).difference(
+        deps.clusterValues
+    )
+    if unknown_clusters:
+        raise ModelRetry(f"Unknown cluster ids: {sorted(unknown_clusters)}")
+    canonical_interpretations, omitted_interpretation_clusters = (
+        _canonicalize_cluster_interpretations(report, deps)
+    )
+    canonical_observations = _canonicalize_treatment_observations(report, deps)
     if report.status == "done" and not canonical_interpretations:
         raise ModelRetry(
             "A done report must contain at least one cluster interpretation with "
             "non-empty marker evidence."
         )
     limitations = list(report.limitations)
+    if deps.markerAssayType == "ATAC":
+        atac_limitation = (
+            "ATAC peak markers are descriptive, so all cell identities remain "
+            "low-confidence hypotheses."
+        )
+        if atac_limitation not in limitations:
+            limitations.append(atac_limitation)
     if omitted_interpretation_clusters:
         omitted_clusters = ", ".join(sorted(set(omitted_interpretation_clusters)))
         marker_limitation = (
@@ -961,24 +1086,12 @@ def validate_biological_interpretation_report(
             limitations.append(marker_limitation)
     if canonical_observations:
         descriptive_limitation = (
-            "Condition-level cluster fractions are descriptive summaries, not "
+            "Independent-unit cluster fractions are descriptive summaries, not "
             "tests of significance or causal treatment effects."
         )
         if descriptive_limitation not in limitations:
             limitations.append(descriptive_limitation)
-        handoff = deps.designHandoff
-        if handoff is not None and (
-            handoff.coefficientScope != "betweenUnit"
-            or handoff.estimability.get("status") != "ok"
-            or handoff.estimability.get("coefficientEstimable") is not True
-        ):
-            design_limitation = (
-                "Experimental design evidence does not establish an estimable "
-                "between-unit condition contrast."
-            )
-            if design_limitation not in limitations:
-                limitations.append(design_limitation)
-    return report.model_copy(
+    validated = report.model_copy(
         update={
             "clusterInterpretations": canonical_interpretations,
             "treatmentObservations": canonical_observations,
@@ -997,7 +1110,149 @@ def validate_biological_interpretation_report(
             "markerArtifact": (
                 artifact_reference(deps.marker) if deps.marker is not None else None
             ),
+            "graphAssay": deps.graphAssay,
+            "markerAssay": deps.fromAssay,
         }
+    )
+    logger.debug(
+        f"Validated biological interpretation report: status={validated.status}, "
+        f"cluster_interpretations={len(validated.clusterInterpretations)}, "
+        f"treatment_observations={len(validated.treatmentObservations)}, "
+        f"omitted_interpretations={len(omitted_interpretation_clusters)}"
+    )
+    return validated
+
+
+def _prepare_biological_interpretation_dependencies(
+    store: Any,
+    *,
+    cluster_column: str | None,
+    cluster: Any,
+    cell_key: str,
+    from_assay: str | None,
+    graph_assay: str | None,
+    marker_assay_type: str | None,
+    sample_column: str | None,
+    condition_column: str | None,
+    tuning_handoff: TuningBiologyHandoff | None,
+    experimental_handoff: ExperimentalBiologyHandoff | None,
+    marker: Any,
+    marker_features: Any,
+    allow_marker_search: bool,
+    max_clusters: int,
+    max_markers: int,
+    marker_min_score: float,
+    marker_min_fraction: float,
+) -> BiologicalInterpretationDependencies:
+    if tuning_handoff is not None:
+        if tuning_handoff.clusterArtifact is None:
+            raise ValueError("tuning_handoff lacks a cluster artifact")
+        if (
+            cluster_column is not None
+            and cluster_column != tuning_handoff.clusterColumn
+        ):
+            raise ValueError("cluster_column conflicts with tuning_handoff")
+        if cluster is not None and (
+            artifact_reference(cluster) != tuning_handoff.clusterArtifact
+        ):
+            raise ValueError("cluster conflicts with tuning_handoff")
+        tuning_marker_assay = tuning_handoff.markerAssay or tuning_handoff.fromAssay
+        tuning_graph_assay = tuning_handoff.graphAssay
+        if from_assay is not None and from_assay != tuning_marker_assay:
+            raise ValueError("from_assay conflicts with tuning_handoff")
+        if graph_assay is not None and graph_assay != tuning_graph_assay:
+            raise ValueError("graph_assay conflicts with tuning_handoff")
+        if cell_key != "I" and cell_key != tuning_handoff.cellKey:
+            raise ValueError("cell_key conflicts with tuning_handoff")
+        cluster_column = tuning_handoff.clusterColumn
+        cluster = tuning_handoff.clusterArtifact
+        from_assay = tuning_marker_assay
+        graph_assay = tuning_graph_assay
+        cell_key = tuning_handoff.cellKey
+    if experimental_handoff is not None:
+        if tuning_handoff is not None and cell_key != experimental_handoff.cellKey:
+            raise ValueError("Experimental and tuning handoffs use different cell keys")
+        if (
+            tuning_handoff is None
+            and cell_key != "I"
+            and cell_key != experimental_handoff.cellKey
+        ):
+            raise ValueError("cell_key conflicts with experimental_handoff")
+        if (
+            condition_column is not None
+            and condition_column != experimental_handoff.conditionColumn
+        ):
+            raise ValueError("condition_column conflicts with experimental_handoff")
+        aggregation_unit = (
+            experimental_handoff.independentUnit or experimental_handoff.observationUnit
+        )
+        if sample_column is not None and sample_column != aggregation_unit:
+            raise ValueError("sample_column conflicts with experimental_handoff")
+        condition_column = experimental_handoff.conditionColumn
+        sample_column = aggregation_unit
+        cell_key = experimental_handoff.cellKey
+    if not cluster_column:
+        raise ValueError("cluster_column must be non-empty")
+    if cluster is None:
+        raise ValueError("cluster must identify an exact cluster artifact")
+    if not 1 <= max_clusters <= CONFIG._MAX_CLUSTERS:
+        raise ValueError(f"max_clusters must be between 1 and {CONFIG._MAX_CLUSTERS}")
+    if not 1 <= max_markers <= CONFIG._MAX_MARKERS:
+        raise ValueError(f"max_markers must be between 1 and {CONFIG._MAX_MARKERS}")
+    if not 0 < marker_min_score <= 1:
+        raise ValueError("marker_min_score must be greater than 0 and at most 1")
+    if not 0 <= marker_min_fraction <= 1:
+        raise ValueError("marker_min_fraction must be between 0 and 1")
+    if allow_marker_search and marker is None and marker_features is None:
+        raise ValueError("marker_features is required when marker search is authorized")
+
+    cluster = core_artifact_reference(cluster)
+    marker = core_artifact_reference(marker)
+    cluster_artifact = artifact_reference(cluster)
+    if cluster_artifact.kind not in {"cluster_labels", "cluster_cut"}:
+        raise ValueError(
+            "cluster must identify a cluster_labels or cluster_cut artifact"
+        )
+    if cluster_artifact.scope == "datastore" and cluster_artifact.assay is not None:
+        raise ValueError("datastore-scoped cluster artifacts must not name an assay")
+    if (
+        tuning_handoff is not None
+        and cluster_artifact.scope == "datastore"
+        and not tuning_handoff.markerAssay
+    ):
+        raise ValueError(
+            "Integrated tuning handoffs must explicitly identify markerAssay"
+        )
+    resolved_graph_assay = graph_assay or cluster_artifact.assay
+    if (
+        resolved_graph_assay is not None
+        and cluster_artifact.scope == "assay"
+        and cluster_artifact.assay != resolved_graph_assay
+    ):
+        raise ValueError("cluster belongs to a different assay")
+    resolved_assay = from_assay or cluster_artifact.assay
+    if cluster_artifact.scope == "datastore" and not resolved_assay:
+        raise ValueError(
+            "from_assay is required to resolve markers for integrated clusters"
+        )
+    return BiologicalInterpretationDependencies(
+        store=store,
+        clusterColumn=cluster_column,
+        cluster=cluster,
+        cellKey=cell_key,
+        fromAssay=resolved_assay,
+        graphAssay=resolved_graph_assay,
+        markerAssayType=marker_assay_type,
+        sampleColumn=sample_column,
+        conditionColumn=condition_column,
+        designHandoff=experimental_handoff,
+        marker=marker,
+        markerFeatures=marker_features,
+        allowMarkerSearch=allow_marker_search,
+        maxClusters=max_clusters,
+        maxMarkers=max_markers,
+        markerMinScore=marker_min_score,
+        markerMinFraction=marker_min_fraction,
     )
 
 
@@ -1012,8 +1267,8 @@ class BiologicalInterpretationAgent:
     ) -> None:
         self.model = model
         self.config = (config or AgentRunConfig()).with_limits(
-            request_limit=5,
-            tool_call_limit=2,
+            request_limit=8,
+            tool_call_limit=5,
             output_token_limit=32768,
             timeout_seconds=600.0,
         )
@@ -1027,6 +1282,8 @@ class BiologicalInterpretationAgent:
         biological_context: BiologicalContext | None = None,
         cell_key: str = "I",
         from_assay: str | None = None,
+        graph_assay: str | None = None,
+        marker_assay_type: str | None = None,
         sample_column: str | None = None,
         condition_column: str | None = None,
         tuning_handoff: TuningBiologyHandoff | None = None,
@@ -1040,107 +1297,44 @@ class BiologicalInterpretationAgent:
         marker_min_fraction: float = 0.2,
     ) -> BiologicalInterpretationReport:
         """Interpret cluster results while exposing only bounded tools to the model."""
-        if tuning_handoff is not None:
-            if tuning_handoff.clusterArtifact is None:
-                raise ValueError("tuning_handoff lacks a cluster artifact")
-            if (
-                cluster_column is not None
-                and cluster_column != tuning_handoff.clusterColumn
-            ):
-                raise ValueError("cluster_column conflicts with tuning_handoff")
-            if cluster is not None and (
-                artifact_reference(cluster) != tuning_handoff.clusterArtifact
-            ):
-                raise ValueError("cluster conflicts with tuning_handoff")
-            if from_assay is not None and from_assay != tuning_handoff.fromAssay:
-                raise ValueError("from_assay conflicts with tuning_handoff")
-            if cell_key != "I" and cell_key != tuning_handoff.cellKey:
-                raise ValueError("cell_key conflicts with tuning_handoff")
-            cluster_column = tuning_handoff.clusterColumn
-            cluster = tuning_handoff.clusterArtifact
-            from_assay = tuning_handoff.fromAssay
-            cell_key = tuning_handoff.cellKey
-        if experimental_handoff is not None:
-            if tuning_handoff is not None and cell_key != experimental_handoff.cellKey:
-                raise ValueError(
-                    "Experimental and tuning handoffs use different cell keys"
-                )
-            if (
-                tuning_handoff is None
-                and cell_key != "I"
-                and cell_key != experimental_handoff.cellKey
-            ):
-                raise ValueError("cell_key conflicts with experimental_handoff")
-            if (
-                condition_column is not None
-                and condition_column != experimental_handoff.conditionColumn
-            ):
-                raise ValueError("condition_column conflicts with experimental_handoff")
-            if (
-                sample_column is not None
-                and sample_column != experimental_handoff.observationUnit
-            ):
-                raise ValueError("sample_column conflicts with experimental_handoff")
-            condition_column = experimental_handoff.conditionColumn
-            sample_column = experimental_handoff.observationUnit
-            cell_key = experimental_handoff.cellKey
-        if not cluster_column:
-            raise ValueError("cluster_column must be non-empty")
-        if cluster is None:
-            raise ValueError("cluster must identify an exact cluster artifact")
-        if not 1 <= max_clusters <= CONFIG._MAX_CLUSTERS:
-            raise ValueError(
-                f"max_clusters must be between 1 and {CONFIG._MAX_CLUSTERS}"
-            )
-        if not 1 <= max_markers <= CONFIG._MAX_MARKERS:
-            raise ValueError(f"max_markers must be between 1 and {CONFIG._MAX_MARKERS}")
-        if not 0 < marker_min_score <= 1:
-            raise ValueError("marker_min_score must be greater than 0 and at most 1")
-        if not 0 <= marker_min_fraction <= 1:
-            raise ValueError("marker_min_fraction must be between 0 and 1")
-        if allow_marker_search and marker is None and marker_features is None:
-            raise ValueError(
-                "marker_features is required when marker search is authorized"
-            )
-        cluster = core_artifact_reference(cluster)
-        marker = core_artifact_reference(marker)
-        cluster_artifact = artifact_reference(cluster)
-        if cluster_artifact.kind not in {"cluster_labels", "cluster_cut"}:
-            raise ValueError(
-                "cluster must identify a cluster_labels or cluster_cut artifact"
-            )
-        if (
-            from_assay is not None
-            and cluster_artifact.scope == "assay"
-            and cluster_artifact.assay != from_assay
-        ):
-            raise ValueError("cluster belongs to a different assay")
-        resolved_assay = from_assay or cluster_artifact.assay
-        context = biological_context or BiologicalContext()
-        deps = BiologicalInterpretationDependencies(
-            store=store,
-            clusterColumn=cluster_column,
+        deps = _prepare_biological_interpretation_dependencies(
+            store,
+            cluster_column=cluster_column,
             cluster=cluster,
-            cellKey=cell_key,
-            fromAssay=resolved_assay,
-            sampleColumn=sample_column,
-            conditionColumn=condition_column,
-            designHandoff=experimental_handoff,
+            cell_key=cell_key,
+            from_assay=from_assay,
+            graph_assay=graph_assay,
+            marker_assay_type=marker_assay_type,
+            sample_column=sample_column,
+            condition_column=condition_column,
+            tuning_handoff=tuning_handoff,
+            experimental_handoff=experimental_handoff,
             marker=marker,
-            markerFeatures=marker_features,
-            allowMarkerSearch=allow_marker_search,
-            maxClusters=max_clusters,
-            maxMarkers=max_markers,
-            markerMinScore=marker_min_score,
-            markerMinFraction=marker_min_fraction,
+            marker_features=marker_features,
+            allow_marker_search=allow_marker_search,
+            max_clusters=max_clusters,
+            max_markers=max_markers,
+            marker_min_score=marker_min_score,
+            marker_min_fraction=marker_min_fraction,
         )
-        marker_state = "provided" if marker is not None else "not provided"
+        logger.info(
+            f"Starting biological interpretation: "
+            f"cluster_column={deps.clusterColumn!r}, "
+            f"graph_assay={deps.graphAssay!r}, marker_assay={deps.fromAssay!r}, "
+            f"marker_artifact_supplied={deps.marker is not None}, "
+            f"marker_search_authorized={deps.allowMarkerSearch}"
+        )
+        context = biological_context or BiologicalContext()
+        cluster_artifact = artifact_reference(deps.cluster)
+        marker_state = "provided" if deps.marker is not None else "not provided"
         user_prompt = (
             dedent(
                 """
                 Review the cluster results named {cluster_column} for cell selection
-                {cell_key}. The exact cluster artifact is {cluster_artifact}. The exact
-                marker artifact is {marker_state}; creating a marker artifact is
+                {cell_key}. The graph owner is {graph_assay}; markers are resolved
+                from {marker_assay}. The exact cluster artifact is
+                {cluster_artifact}. The exact marker artifact is {marker_state};
+                creating a marker artifact is
                 authorized={allow_marker_search}. Review no more
                 than {max_clusters} clusters and return no more than {max_markers}
                 markers per tool call.
@@ -1154,13 +1348,16 @@ class BiologicalInterpretationAgent:
                 Call inspect_cluster_composition once. Then send every cluster you
                 intend to interpret in one inspect_cluster_markers_batch call. If
                 markers cannot be inspected, return needsInput and state the exact
-                missing input.
+                missing input. Each tool is removed after it succeeds, so request
+                every required cluster in that one marker batch.
                 """
             )
             .strip()
             .format(
-                cluster_column=cluster_column,
-                cell_key=cell_key,
+                cluster_column=deps.clusterColumn,
+                cell_key=deps.cellKey,
+                graph_assay=deps.graphAssay or "datastore integration",
+                marker_assay=deps.fromAssay,
                 cluster_artifact=cluster_artifact.model_dump_json(),
                 marker_state=marker_state,
                 allow_marker_search=allow_marker_search,
@@ -1174,12 +1371,29 @@ class BiologicalInterpretationAgent:
                 ),
             )
         )
+        logger.info(
+            f"Requesting biological interpretation for at most "
+            f"{deps.maxClusters} clusters"
+        )
         execution = run_agent_sync(
             model=self.model,
             output_type=BiologicalInterpretationReport,
             system_prompt=_SYSTEM_PROMPT,
             user_prompt=user_prompt,
-            tools=(inspect_cluster_composition, inspect_cluster_markers_batch),
+            tools=(
+                Tool(
+                    inspect_cluster_composition,
+                    prepare=_prepare_biological_interpretation_tool,
+                    sequential=self.config.sequentialTools,
+                    timeout=self.config.timeoutSeconds,
+                ),
+                Tool(
+                    inspect_cluster_markers_batch,
+                    prepare=_prepare_biological_interpretation_tool,
+                    sequential=self.config.sequentialTools,
+                    timeout=self.config.timeoutSeconds,
+                ),
+            ),
             deps_type=BiologicalInterpretationDependencies,
             deps=deps,
             config=self.config,
@@ -1191,4 +1405,10 @@ class BiologicalInterpretationAgent:
         )
         report = validate_biological_interpretation_report(execution.output, deps)
         report.runInfo = execution.runInfo
+        logger.info(
+            f"Completed biological interpretation: status={report.status}, "
+            f"interpreted_clusters={len(report.clusterInterpretations)}, "
+            f"treatment_observations={len(report.treatmentObservations)}, "
+            f"follow_ups={len(report.followUps)}, tool_calls={len(deps.toolCalls)}"
+        )
         return report
