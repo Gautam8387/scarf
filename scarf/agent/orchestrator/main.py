@@ -706,6 +706,11 @@ class AgentOrchestrator(
         )
         if ingest_outcome is None:
             raise RuntimeError("The persisted ingest stage is missing")
+        cell_selection = ingest_outcome.artifacts.get("cellSelection")
+        if cell_selection is None or cell_selection.kind != "cell_selection":
+            raise RuntimeError(
+                "The persisted ingest stage lacks an exact cell selection"
+            )
         parents = [journal._parent_link(ingest_outcome)]
 
         enrichment_outcome, enrichment = self.data_enrichment_stage(
@@ -713,6 +718,7 @@ class AgentOrchestrator(
             workflow,
             request_record,
             parents,
+            cell_selection,
             answers,
             resume_record=resume_record,
         )
@@ -731,6 +737,7 @@ class AgentOrchestrator(
             request_record,
             parents,
             enrichment,
+            cell_selection,
             resume_record=resume_record,
         )
         if hto_outcome.status != "done":
@@ -740,6 +747,16 @@ class AgentOrchestrator(
                 request_record,
                 hto_outcome,
             )
+        quality_metric_artifacts = self._named_stage_artifacts(
+            hto_outcome,
+            "qualityMetricArtifacts",
+            "quality_metric",
+        )
+        hto_identity_artifacts = self._named_stage_artifacts(
+            hto_outcome,
+            "htoIdentityArtifacts",
+            "hto_identity",
+        )
         parents = [journal._parent_link(hto_outcome)]
 
         context_outcome, experimental = self.experimental_context_stage(
@@ -747,8 +764,10 @@ class AgentOrchestrator(
             workflow,
             request_record,
             parents,
+            cell_selection,
             enrichment_outcome.reportReferences[0],
-            cast(list[str], hto_outcome.outputs.get("htoIdentityColumns", [])),
+            quality_metric_artifacts,
+            hto_identity_artifacts,
             answers,
             resume_record=resume_record,
         )

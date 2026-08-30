@@ -41,7 +41,7 @@ from scarf.agent.persistence import (
     load_agent_workflow,
     save_agent_report,
 )
-from scarf.agent.types import AgentRunInfo
+from scarf.agent.types import AgentRunInfo, ArtifactReferenceModel
 from scarf.datastore.datastore import DataStore
 from tests.agent_orchestrator_store import create_store
 
@@ -952,12 +952,16 @@ def test_data_enrichment_recovers_report_after_outcome_write_crash(
         save_outcome(*args, **kwargs)
 
     monkeypatch.setattr(journal_module, "_save_outcome", crash_after_report)
+    cell_selection = ArtifactReferenceModel.from_artifact_ref(
+        store.snapshot_cell_selection("I")
+    )
     with pytest.raises(KeyboardInterrupt, match="simulated process crash"):
         orchestrator.data_enrichment_stage(
             store,
             workflow,
             request_record,
             [],
+            cell_selection,
             {},
         )
     monkeypatch.setattr(journal_module, "_save_outcome", save_outcome)
@@ -967,6 +971,7 @@ def test_data_enrichment_recovers_report_after_outcome_write_crash(
         workflow,
         request_record,
         [],
+        cell_selection,
         {},
     )
 

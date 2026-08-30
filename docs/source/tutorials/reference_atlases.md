@@ -25,16 +25,12 @@ It is not a complete reimplementation of every option in the Symphony R package.
 ## 1. Open the reference and query
 
 ```{code-cell} ipython3
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
 import numpy as np
 import pandas as pd
 
 import scarf
-from scarf.tools.repack_zarr import repack_store
 
-scarf.configure_output(level="WARNING", progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
 repository = scarf.cytebase.connect("scarf_docs")
 ctrl_path = repository.download_dataset(
@@ -47,38 +43,21 @@ stim_path = repository.download_dataset(
     destination="scarf_datasets",
     zarr=True,
 )
-analysis_directory = TemporaryDirectory()
-ctrl_counts_path = Path(analysis_directory.name) / "control_counts.zarr"
-stim_counts_path = Path(analysis_directory.name) / "stimulated_counts.zarr"
-ctrl_analysis_path = Path(analysis_directory.name) / "reference.zarr"
-stim_analysis_path = Path(analysis_directory.name) / "query.zarr"
-repack_store(
+ds_ctrl = scarf.DataStore(
     f"{ctrl_path}/data.zarr",
-    str(ctrl_counts_path),
-    nthreads=2,
-)
-repack_store(
-    f"{stim_path}/data.zarr",
-    str(stim_counts_path),
-    nthreads=2,
-)
-ds_ctrl = scarf.mount_datastore(
-    str(ctrl_counts_path),
-    at=str(ctrl_analysis_path),
     default_assay="RNA",
     nthreads=4,
 )
-ds_stim = scarf.mount_datastore(
-    str(stim_counts_path),
-    at=str(stim_analysis_path),
+ds_stim = scarf.DataStore(
+    f"{stim_path}/data.zarr",
     default_assay="RNA",
     nthreads=4,
 )
 ```
 
-Both published stores remain unchanged.
-Each is structurally repacked into its own temporary source with the current RNA count layout.
-Mounting those sources copies literal cell metadata into two separate page-local targets, while the current reference and mapping artifacts are written only there.
+Both catalog stores were rebuilt from their declared sources with the current RNA count layout.
+Documentation execution downloads separate page-local copies, so the new reference and mapping
+artifacts remain isolated from the published archives.
 
 `reference_batch` must represent technical structure such as donor, preparation, or sequencing batch.
 The single control label below only exercises the API.
@@ -97,38 +76,23 @@ ds_ctrl.cells.insert(
 Build the Harmony-backed neighbour chain with one pipeline call, then package it as the mapping reference.
 
 ```{code-cell} ipython3
-artifacts = ds_ctrl.pipeline.run(
+run = ds_ctrl.pipeline.run(
+    label="harmony_reference",
     filtering=False,
-    cell_cycle_scoring=False,
-    highly_variable_features={
-        "min_cells": 10,
-        "top_n": 2000,
-        "min_mean": -3,
-        "max_mean": 2,
-        "max_var": 6,
-    },
-    pca={"dims": 25},
-    harmony={"batch_columns": ["reference_batch"]},
-    neighbors={"k": 17},
-    umap=False,
-    leiden={},
+    cell_cycle=False,
+    hvg_count=2000,
+    pca_dims=25,
+    harmony_batch_columns=["reference_batch"],
+    neighbors_k=17,
+    leiden=False,
     paris=False,
-    doublet_scoring=False,
+    doublets=False,
     markers=False,
+    snapshot_columns=["cluster_labels"],
 )
-reference = ds_ctrl.build_mapping_reference(artifacts["neighbors"])
-pd.Series(
-    {
-        "method": reference.method,
-        "assay": reference.assay_name,
-        "feature_selection": reference.feature_selection,
-        "selected_cells": reference.selected_cell_count,
-        "n_features": reference.model.n_features,
-        "n_dims": reference.model.n_dims,
-        "has_symphony_state": reference.symphony_state is not None,
-    },
-    name="mapping_reference",
-)
+reference_layout = run["umap"]
+reference_ref = ds_ctrl.build_mapping_reference(run["neighbors"])
+reference_ref
 ```
 
 `method="symphony"` means the neighbour chain used Harmony-corrected coordinates and the reference carries soft-assignment state for query correction.
@@ -136,23 +100,30 @@ The feature count and PCA dimensions stay fixed for every later query.
 
 ```{code-cell} ipython3
 ds_ctrl.plots.embedding(
-    layout_key="RNA_UMAP",
+    run=run,
+    layout="umap",
     color_by="cluster_labels",
 )
 ```
 
-This plot uses the pre-published `RNA_UMAP` already on the datastore.
-`umap=False` above skipped recomputing UMAP for the Harmony neighbour chain, so the layout is a viewing aid rather than part of the packaged mapping reference.
-`MappingReference` stores the exact immutable `feature_selection` reference, PCA basis, corrected coordinates, and neighbour index; it does not store an embedding.
+This plot uses the Harmony run's immutable UMAP and its snapshot of `cluster_labels`.
+`reference_layout` is reused for mapping-score plots below. `MappingReference` stores
+the exact immutable `feature_selection` reference, PCA basis, corrected coordinates, and neighbour
+index; it does not store an embedding.
 Mapping places query weight onto reference cells without moving those cells.
 
-In a later session, reopen the reference store and load the named mapping reference.
+In a later session, reopen the reference store and load the exact mapping-reference artifact.
 The prepared reference datastore may be opened read-only.
 Mapping still requires a separate writable query datastore.
 Use `mount_datastore` when the query counts come from a read-only source or from the same source used to prepare the reference.
 
 ```{code-cell} ipython3
-reference = ds_ctrl.get_mapping_reference()
+reference_store = scarf.DataStore(
+    f"{ctrl_path}/data.zarr",
+    zarr_mode="r",
+    nthreads=4,
+)
+reference = reference_store.get_mapping_reference(reference_ref)
 pd.Series(
     {
         "method": reference.method,
@@ -180,14 +151,15 @@ query_batches = pd.DataFrame(
         )
     }
 )
-mapping = ds_stim.run_mapping(
+query_cell_selection = ds_stim.snapshot_cell_selection("I")
+mapping_ref = ds_stim.run_mapping(
     reference,
-    "stim_atlas",
+    query_cell_selection,
     query_assay="RNA",
     save_k=5,
     query_batches=query_batches,
 )
-mapping.mapping_name, mapping.n_cells, mapping.correction_method
+mapping_ref
 ```
 
 The mapping result is stored in `ds_stim`.
@@ -196,9 +168,8 @@ The reference model and reference coordinates remain unchanged.
 
 ```{code-cell} ipython3
 mapped = ds_stim.get_mapping_result(
-    "stim_atlas",
+    mapping_ref,
     reference=reference,
-    query_assay="RNA",
     load_arrays=True,
 )
 mapped.diagnostics
@@ -212,8 +183,9 @@ Use a separate writable query datastore for controls.
 
 ```{code-cell} ipython3
 transferred = ds_stim.get_target_classes(
-    mapped,
+    mapping_ref,
     reference_class_group="cluster_labels",
+    reference=reference,
     threshold_fraction=0.6,
 )
 ds_stim.cells.insert(
@@ -229,11 +201,15 @@ accepted.value_counts().rename(
 
 Cells below `threshold_fraction` abstain as `NA` instead of taking a weak majority label.
 Compare the accepted and abstained counts with the `NA` column in the confusion matrix below.
+The mapping reference freezes its model and selected cell axis, while `reference_class_group`
+reads the named column from the reference store at use time. Keep a reusable atlas read-only, or
+version externally revised labels under a new column name.
 
 ```{code-cell} ipython3
 query_labels = np.asarray(ds_stim.cells.fetch("cluster_labels")).astype(str)
 ds_stim.plots.mapping_confusion(
-    mapped,
+    mapping_ref,
+    reference=reference,
     reference_class_group="cluster_labels",
     known_labels=query_labels,
     normalize="true",
@@ -254,15 +230,15 @@ focus_groups = np.array(
     [label if label in focus_labels else "other" for label in query_labels],
     dtype=object,
 )
-assert mapped.reference is not None
 ref_classes = np.asarray(
-    mapped.reference.fetch_cell_column("cluster_labels"),
+    reference.fetch_cell_column("cluster_labels"),
     dtype=object,
 )
 score_mass: dict[str, pd.Series] = {}
 for group, values in ds_stim.get_mapping_score(
-    mapped,
+    mapping_ref,
     target_groups=focus_groups,
+    reference=reference,
     log_transform=False,
 ):
     if group == "other":
@@ -282,8 +258,9 @@ score_mass_table.loc[
 
 ```{code-cell} ipython3
 ds_stim.plots.mapping_score(
-    mapped,
-    layout_key="RNA_UMAP",
+    mapping_ref,
+    reference=reference,
+    layout=reference_layout,
     target_groups=focus_groups,
     size_by_score=True,
     log_transform=False,

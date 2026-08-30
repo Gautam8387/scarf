@@ -24,7 +24,9 @@ from scarf.agent.data_enrichment import (
 from scarf.agent.experimental_context import (
     BatchCorrectionPlan,
     CellQcPlan,
+    CellQcProfileEvidence,
     ExperimentalContextResult,
+    NamedArtifactSource,
 )
 from scarf.agent.orchestrator import (
     AgentOrchestrator,
@@ -42,6 +44,7 @@ from scarf.agent.persistence import (
     AgentReportReference,
     create_agent_workflow,
     list_agent_reports,
+    load_agent_record,
     load_agent_workflow,
     save_agent_report,
 )
@@ -69,6 +72,14 @@ from tests.agent_orchestrator_store import create_store
 
 
 _PLAN_CHECKSUM = "a" * 64
+
+
+def _cell_selection_model() -> ArtifactReferenceModel:
+    return ArtifactReferenceModel(
+        scope="datastore",
+        kind="cell_selection",
+        artifactId="c" * 64,
+    )
 
 
 class _FeatureTable:
@@ -213,6 +224,11 @@ def _native_assay_report(assay: str, token: int) -> ParameterTuningReport:
     evaluation = ParameterCandidateEvaluation.get_example().model_copy(
         update={
             "artifacts": {
+                "neighbors": ArtifactRecord(
+                    assay=assay,
+                    kind="neighbors",
+                    artifactId=f"{token + 2:064x}",
+                ),
                 "connectivityMap": ArtifactRecord(
                     assay=assay,
                     kind="connectivity_map",
@@ -224,6 +240,7 @@ def _native_assay_report(assay: str, token: int) -> ParameterTuningReport:
                     artifactId=f"{token + 1:064x}",
                 ),
             },
+            "cellSelection": _cell_selection_model(),
             "clusterColumn": f"{assay}_agent_clusters",
             "evidenceIds": ["candidate:baseline:clusters"],
         }
@@ -231,6 +248,7 @@ def _native_assay_report(assay: str, token: int) -> ParameterTuningReport:
     return ParameterTuningReport(
         status="done",
         fromAssay=assay,
+        cellSelection=_cell_selection_model(),
         evaluations=[evaluation],
         recommendedCandidateId=evaluation.candidateId,
         selectedArtifacts=dict(evaluation.artifacts),
@@ -248,7 +266,7 @@ def _native_batch_report(*assays: str) -> ParameterTuningReport:
     return ParameterTuningReport(
         status="done",
         fromAssay=assays[0],
-        cellKey="I",
+        cellSelection=_cell_selection_model(),
         evaluations=list(primary.evaluations),
         recommendedCandidateId=primary.recommendedCandidateId,
         selectedArtifacts=dict(primary.selectedArtifacts),
@@ -274,6 +292,7 @@ def _eligible_integration() -> IntegrationCandidateEvaluation:
         assays=["RNA", "ADT"],
         status="done",
         eligible=True,
+        cellSelection=_cell_selection_model(),
         resolution=1.0,
         graphArtifact=ArtifactRecord(
             scope="datastore",
@@ -302,6 +321,9 @@ def test_unsafe_experimental_context_pauses_and_explicit_skip_reuses_evidence(
     path = create_store(tmp_path / "unsafe-context.zarr")
     store = DataStore(str(path), default_assay="RNA", min_features_per_cell=0)
     workflow = create_agent_workflow(store, workflow_run_id="unsafe-context")
+    cell_selection = ArtifactReferenceModel.from_artifact_ref(
+        store.snapshot_cell_selection("I")
+    )
     enrichment = DataEnrichmentReport.get_example().model_copy(
         update={
             "runInfo": AgentRunInfo(
@@ -338,6 +360,9 @@ def test_unsafe_experimental_context_pauses_and_explicit_skip_reuses_evidence(
     )
     unsafe_report = example.model_copy(
         update={
+            "cellSelection": cell_selection,
+            "qualityMetricArtifacts": [],
+            "htoIdentityArtifacts": [],
             "decision": example.decision.model_copy(
                 update={"batchCorrection": unsafe_plan}
             ),
@@ -377,7 +402,9 @@ def test_unsafe_experimental_context_pauses_and_explicit_skip_reuses_evidence(
         workflow,
         request_record,
         [],
+        cell_selection,
         enrichment_reference,
+        [],
         [],
         {},
     )
@@ -413,7 +440,9 @@ def test_unsafe_experimental_context_pauses_and_explicit_skip_reuses_evidence(
         workflow,
         request_record,
         [],
+        cell_selection,
         enrichment_reference,
+        [],
         [],
         {"experimentalDirections": "skipHarmony"},
     )
@@ -452,11 +481,11 @@ def test_preprocessing_plan_routes_supported_modalities_and_skips_others() -> No
     plan = _build_plan(assays)
     routes = {value.assay: value for value in plan.assays}
 
-    assert (plan.primaryAssay, plan.markerAssay, plan.cellKey) == (
+    assert (plan.primaryAssay, plan.markerAssay) == (
         "transcriptome",
         "transcriptome",
-        "I",
     )
+    assert plan.cellSelection == _cell_selection_model()
     assert (
         routes["transcriptome"].role,
         routes["transcriptome"].featureMethod,
@@ -483,7 +512,7 @@ def test_preprocessing_plan_routes_supported_modalities_and_skips_others() -> No
     assert any("Unsupported assay 'custom'" in value for value in plan.limitations)
 
 
-def test_converted_input_always_resets_selection_and_persists_typed_qc() -> None:
+def test_converted_input_preserves_exact_selection_and_typed_qc() -> None:
     inputs = list(
         _planning_inputs(
             {
@@ -496,18 +525,13 @@ def test_converted_input_always_resets_selection_and_persists_typed_qc() -> None
         )
     )
     request_record = inputs[1]
-    request = request_record.request.model_copy(
-        update={
-            "sourcePath": "dataset.h5ad",
-            "resetCellSelection": False,
-        }
-    )
+    request = request_record.request.model_copy(update={"sourcePath": "dataset.h5ad"})
     inputs[1] = request_record.model_copy(update={"request": request})
     inputs[4] = inputs[4].model_copy(update={"outputs": {"format": "h5ad"}})
 
     plan = AgentOrchestrator(object()).build_preprocessing_plan(*inputs)
 
-    assert plan.resetCellSelection is True
+    assert plan.cellSelection == inputs[3].cellSelection
     assert isinstance(plan.cellQc, CellQcPlan)
 
 
@@ -575,6 +599,9 @@ def test_percent_features_follow_deterministic_inspection_not_policy_lists(
         ribo_pattern="",
         zarr_mode="r+",
     )
+    cell_selection = ArtifactReferenceModel.from_artifact_ref(
+        store.snapshot_cell_selection("I")
+    )
     assert "RNA_percentMito" not in store.cells.columns
     workflow = create_agent_workflow(store, workflow_run_id="inspected-families")
     request_record = OrchestrationRequestRecord(
@@ -608,25 +635,94 @@ def test_percent_features_follow_deterministic_inspection_not_policy_lists(
         ],
     )
 
-    outcome = AgentOrchestrator(object())._hto_stage(
+    orchestrator = AgentOrchestrator(object())
+    outcome = orchestrator._hto_stage(
         store,
         workflow,
         request_record,
         [],
         enrichment,
+        cell_selection,
     )
 
     assert outcome.status == "done"
-    assert "RNA_percentMito" in store.cells.columns
+    assert "RNA_percentMito" not in store.cells.columns
     assert "compute_percent_mito:RNA" in outcome.actions
-    assert outcome.outputs["operations"] == [
-        {
-            "operation": "add_percent_feature",
-            "assay": "RNA",
-            "pattern": r"^(MT-|mt-)",
-            "column": "RNA_percentMito",
+    metric_source = NamedArtifactSource.model_validate(
+        outcome.outputs["qualityMetricArtifacts"][0]
+    )
+    assert metric_source.name == "RNA_percentMito"
+    assert metric_source.artifact.kind == "quality_metric"
+    assert outcome.artifacts[metric_source.name] == metric_source.artifact
+    assert orchestrator._named_stage_artifacts(
+        outcome,
+        "qualityMetricArtifacts",
+        "quality_metric",
+    ) == [metric_source]
+    operation = outcome.outputs["operations"][0]
+    assert operation["operation"] == "run_feature_percentage"
+    assert operation["cellSelection"] == cell_selection.model_dump(mode="json")
+    assert operation["features"]["kind"] == "feature_selection"
+    assert operation["artifact"] == metric_source.artifact.model_dump(mode="json")
+
+    profile = CellQcProfileEvidence(
+        profileId="cellQc:RNA:RNA:globalGaussian:0.01:0.99",
+        action="globalGaussian",
+        driverAssay="RNA",
+        driverAssayType="RNA",
+        attributes=["RNA_nCounts"],
+        artifactMetrics=[metric_source],
+        parameters={"minP": 0.01, "maxP": 0.99},
+        activeCells=4,
+        retainedCells=2,
+        retainedFraction=0.5,
+        evidenceId="qcProfile:artifact-backed-global",
+    )
+    plan = CellQcPlan(
+        action=profile.action,
+        profileId=profile.profileId,
+        driverAssay=profile.driverAssay,
+        driverAssayType=profile.driverAssayType,
+        attributes=profile.attributes,
+        artifactMetrics=profile.artifactMetrics,
+        evidenceIds=[profile.evidenceId],
+    )
+    experimental = ExperimentalContextResult.get_blank().model_copy(
+        update={
+            "cellSelection": cell_selection,
+            "cellQc": plan,
+            "qcProfiles": [profile],
+            "qualityMetricArtifacts": [metric_source],
         }
+    )
+    qc_actions: list[str] = []
+    qc_operations: list[dict[str, Any]] = []
+    filtered = AgentOrchestrator(object()).apply_cell_qc(
+        store,
+        experimental,
+        ArtifactRef(
+            scope="datastore",
+            kind="cell_selection",
+            artifact_id=cell_selection.artifactId,
+        ),
+        qc_actions,
+        qc_operations,
+    )
+
+    filtered_status = store.inspect_artifact(filtered)
+    assert filtered.kind == "cell_selection"
+    assert filtered_status.inputs["artifact_metrics"] == {
+        metric_source.name: ArtifactRef(
+            scope=metric_source.artifact.scope,
+            assay=metric_source.artifact.assay,
+            kind=metric_source.artifact.kind,
+            artifact_id=metric_source.artifact.artifactId,
+        ).to_dict()
+    }
+    assert qc_operations[0]["artifactMetrics"] == [
+        metric_source.model_dump(mode="json")
     ]
+    assert "RNA_percentMito" not in store.cells.columns
 
 
 def test_hto_demultiplexing_is_checkpointed_once_and_never_graph_bearing(
@@ -642,6 +738,9 @@ def test_hto_demultiplexing_is_checkpointed_once_and_never_graph_bearing(
         ribo_pattern="",
         zarr_mode="r+",
     )
+    cell_selection = ArtifactReferenceModel.from_artifact_ref(
+        store.snapshot_cell_selection("I")
+    )
     workflow = create_agent_workflow(store, workflow_run_id="hto-once")
     request_record = OrchestrationRequestRecord(
         workflowRunId=workflow.workflowRunId,
@@ -655,18 +754,37 @@ def test_hto_demultiplexing_is_checkpointed_once_and_never_graph_bearing(
     )
     calls = 0
 
-    def mark_identities(*_args: Any, **kwargs: Any) -> str:
-        nonlocal calls
-        calls += 1
-        column = f"HTO_{kwargs['label']}"
-        store.cells.insert(
-            column,
-            np.asarray(["negative", "singlet", "doublet", "singlet"]),
-            overwrite=True,
-        )
-        return column
+    identity_ref = ArtifactRef(
+        scope="assay",
+        assay="HTO",
+        kind="hto_identity",
+        artifact_id="d" * 64,
+    )
 
-    monkeypatch.setattr(store, "mark_hto_identities", mark_identities)
+    def run_hto(
+        selection: ArtifactRef,
+        **_kwargs: Any,
+    ) -> ArtifactRef:
+        nonlocal calls
+        assert selection == ArtifactRef(
+            scope="datastore",
+            kind="cell_selection",
+            artifact_id=cell_selection.artifactId,
+        )
+        calls += 1
+        return identity_ref
+
+    load_artifact = store.load_artifact
+    monkeypatch.setattr(store, "run_hto_demultiplexing", run_hto)
+    monkeypatch.setattr(
+        store,
+        "load_artifact",
+        lambda reference: (
+            {"values": np.asarray(["negative", "singlet", "doublet", "singlet"])}
+            if reference == identity_ref
+            else load_artifact(reference)
+        ),
+    )
     enrichment = DataEnrichmentReport(
         status="done",
         policies=[
@@ -691,6 +809,7 @@ def test_hto_demultiplexing_is_checkpointed_once_and_never_graph_bearing(
         request_record,
         [],
         enrichment,
+        cell_selection,
     )
     second = orchestrator._hto_stage(
         store,
@@ -698,12 +817,225 @@ def test_hto_demultiplexing_is_checkpointed_once_and_never_graph_bearing(
         request_record,
         [],
         enrichment,
+        cell_selection,
     )
 
     assert first == second
     assert calls == 1
-    assert first.outputs["operations"][0]["operation"] == "mark_hto_identities"
+    assert first.outputs["operations"][0]["operation"] == "run_hto_demultiplexing"
+    assert first.artifacts["HTO_htoIdentity"].artifactId == identity_ref.artifact_id
+    assert "htoIdentityColumns" not in first.outputs
+    identity_source = NamedArtifactSource.model_validate(
+        first.outputs["htoIdentityArtifacts"][0]
+    )
+    assert identity_source.name == "HTO_htoIdentity"
+    assert identity_source.artifact == first.artifacts[identity_source.name]
+    assert orchestrator._named_stage_artifacts(
+        first,
+        "htoIdentityArtifacts",
+        "hto_identity",
+    ) == [identity_source]
+    missing_source = first.model_copy(
+        update={
+            "outputs": {
+                **first.outputs,
+                "htoIdentityArtifacts": [],
+            }
+        }
+    )
+    with pytest.raises(ValueError, match="must name every persisted"):
+        orchestrator._named_stage_artifacts(
+            missing_source,
+            "htoIdentityArtifacts",
+            "hto_identity",
+        )
     assert all("graph" not in action for action in first.actions)
+
+    enrichment_reference = save_agent_report(
+        store,
+        workflow.workflowRunId,
+        enrichment,
+        invocation=AgentInvocation(
+            agentName="data_enrichment",
+            inputs={"assays": ["HTO"]},
+        ),
+    )
+    captured_sources: list[NamedArtifactSource] = []
+    context_example = ExperimentalContextResult.get_example()
+    context_report = context_example.model_copy(
+        update={
+            "cellSelection": cell_selection,
+            "cellQc": CellQcPlan(),
+            "qcProfiles": [],
+            "qualityMetricArtifacts": [],
+            "htoIdentityColumns": [],
+            "htoIdentityArtifacts": [identity_source],
+            "decision": context_example.decision.model_copy(
+                update={"cellQc": CellQcPlan()}
+            ),
+        }
+    )
+
+    class CapturingContextAgent:
+        calls = 0
+
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            self.config = AgentRunConfig()
+
+        def run(
+            self,
+            *_args: Any,
+            quality_metric_artifacts: list[NamedArtifactSource],
+            hto_identity_artifacts: list[NamedArtifactSource],
+            **_kwargs: Any,
+        ) -> ExperimentalContextResult:
+            type(self).calls += 1
+            assert quality_metric_artifacts == []
+            captured_sources.extend(hto_identity_artifacts)
+            return context_report
+
+    monkeypatch.setattr(
+        context_module,
+        "ExperimentalContextAgent",
+        CapturingContextAgent,
+    )
+    context_outcome, _ = orchestrator.experimental_context_stage(
+        store,
+        workflow,
+        request_record,
+        [journal_module._parent_link(first)],
+        cell_selection,
+        enrichment_reference,
+        [],
+        [identity_source],
+        {},
+    )
+
+    assert context_outcome.status == "done"
+    assert captured_sources == [identity_source]
+    assert context_outcome.artifacts[identity_source.name] == identity_source.artifact
+    context_record = load_agent_record(
+        store,
+        context_outcome.reportReferences[0],
+    )
+    assert (
+        context_record.invocation.artifacts[identity_source.name]
+        == identity_source.artifact
+    )
+    reused_context, reused_report = orchestrator.experimental_context_stage(
+        store,
+        workflow,
+        request_record,
+        [journal_module._parent_link(first)],
+        cell_selection,
+        enrichment_reference,
+        [],
+        [identity_source],
+        {},
+    )
+    assert reused_context == context_outcome
+    assert reused_report == context_report
+    assert CapturingContextAgent.calls == 1
+
+
+def test_selected_sample_mad_qc_passes_exact_artifact_sources() -> None:
+    cell_selection = ArtifactReferenceModel(
+        scope="datastore",
+        kind="cell_selection",
+        artifactId="c" * 64,
+    )
+    metric = NamedArtifactSource(
+        name="RNA_percentMito",
+        artifact=ArtifactReferenceModel(
+            scope="assay",
+            assay="RNA",
+            kind="quality_metric",
+            artifactId="d" * 64,
+        ),
+    )
+    sample = NamedArtifactSource(
+        name="HTO_htoIdentity",
+        artifact=ArtifactReferenceModel(
+            scope="assay",
+            assay="HTO",
+            kind="hto_identity",
+            artifactId="e" * 64,
+        ),
+    )
+    profile = CellQcProfileEvidence(
+        profileId="cellQc:RNA:RNA:sampleMad:artifact:HTO_htoIdentity",
+        action="sampleMad",
+        driverAssay="RNA",
+        driverAssayType="RNA",
+        sampleArtifact=sample,
+        attributes=["RNA_nCounts"],
+        artifactMetrics=[metric],
+        parameters={"nMads": 4.0, "minCellsPerSample": 12},
+        activeCells=100,
+        retainedCells=95,
+        retainedFraction=0.95,
+        evidenceId="qcProfile:artifact-sample",
+    )
+    plan = CellQcPlan(
+        action=profile.action,
+        profileId=profile.profileId,
+        driverAssay=profile.driverAssay,
+        driverAssayType=profile.driverAssayType,
+        sampleArtifact=profile.sampleArtifact,
+        attributes=profile.attributes,
+        artifactMetrics=profile.artifactMetrics,
+        evidenceIds=[profile.evidenceId],
+    )
+    experimental = ExperimentalContextResult.get_blank().model_copy(
+        update={
+            "cellSelection": cell_selection,
+            "cellQc": plan,
+            "qcProfiles": [profile],
+            "qualityMetricArtifacts": [metric],
+            "htoIdentityArtifacts": [sample],
+        }
+    )
+    output_selection = ArtifactRef(
+        scope="datastore",
+        kind="cell_selection",
+        artifact_id="f" * 64,
+    )
+    captured: dict[str, Any] = {}
+
+    class Store:
+        def auto_filter_cells(self, **kwargs: Any) -> ArtifactRef:
+            captured.update(kwargs)
+            return output_selection
+
+    actions: list[str] = []
+    operations: list[dict[str, Any]] = []
+    result = AgentOrchestrator(object()).apply_cell_qc(
+        Store(),
+        experimental,
+        ArtifactRef(
+            scope="datastore",
+            kind="cell_selection",
+            artifact_id=cell_selection.artifactId,
+        ),
+        actions,
+        operations,
+    )
+
+    assert result == output_selection
+    assert captured["attrs"] == ["RNA_nCounts"]
+    assert captured["artifact_metrics"][0].name == metric.name
+    assert captured["artifact_metrics"][0].artifact.artifact_id == (
+        metric.artifact.artifactId
+    )
+    assert captured["sample_column"] is None
+    assert captured["sample_artifact"].name == sample.name
+    assert captured["sample_artifact"].artifact.artifact_id == (
+        sample.artifact.artifactId
+    )
+    assert captured["n_mads"] == 4.0
+    assert captured["min_cells_per_sample"] == 12
+    assert operations[0]["sampleArtifact"] == sample.model_dump(mode="json")
+    assert operations[0]["artifactMetrics"] == [metric.model_dump(mode="json")]
 
 
 @pytest.mark.parametrize(
@@ -992,7 +1324,8 @@ def test_final_selection_pause_exposes_exact_options_and_resumes_without_screen(
         experimental,
         invocation=AgentInvocation(
             agentName="experimental_context",
-            inputs={"cellKey": "I"},
+            inputs={"cellSelection": _cell_selection_model().model_dump(mode="json")},
+            artifacts={"cellSelection": _cell_selection_model()},
         ),
     )
     request_record = OrchestrationRequestRecord(
@@ -1026,6 +1359,7 @@ def test_final_selection_pause_exposes_exact_options_and_resumes_without_screen(
         PreprocessedAssayHandoff(
             assay="ADT",
             assayType="ADT",
+            cellSelection=_cell_selection_model(),
             reductionMethod="identity",
             normalized=ArtifactReferenceModel(
                 assay="ADT",
@@ -1271,11 +1605,10 @@ def test_single_integration_resolution_is_centered_and_workflow_unique() -> None
 
         def integrate_assays(
             self,
-            assays: list[str],
-            label: str,
+            sources: list[ArtifactRef],
             **kwargs: Any,
         ) -> ArtifactRef:
-            self.integration_calls.append({"assays": assays, "label": label, **kwargs})
+            self.integration_calls.append({"sources": sources, **kwargs})
             token = len(self.integration_calls)
             return ArtifactRef(
                 scope="datastore",
@@ -1283,8 +1616,12 @@ def test_single_integration_resolution_is_centered_and_workflow_unique() -> None
                 artifact_id=f"{100 + token:064x}",
             )
 
-        def run_leiden_clustering(self, **kwargs: Any) -> ArtifactRef:
-            self.cluster_calls.append(kwargs)
+        def run_leiden_clustering(
+            self,
+            graph: ArtifactRef,
+            **kwargs: Any,
+        ) -> ArtifactRef:
+            self.cluster_calls.append({"graph": graph, **kwargs})
             token = len(self.cluster_calls)
             return ArtifactRef(
                 scope="datastore",
@@ -1303,7 +1640,10 @@ def test_single_integration_resolution_is_centered_and_workflow_unique() -> None
         "integration-center",
         plan,
         report,
-        ExperimentalTuningHandoff(batchAction="skip"),
+        ExperimentalTuningHandoff(
+            cellSelection=_cell_selection_model(),
+            batchAction="skip",
+        ),
         AutomatedWorkflowConfig(
             integrationResolutionCandidates=1,
             minClusterCells=1,
@@ -1316,6 +1656,10 @@ def test_single_integration_resolution_is_centered_and_workflow_unique() -> None
     assert len(store.integration_calls) == 2
     assert all(call["invalidate_cache"] is True for call in store.integration_calls)
     assert {call["method"] for call in store.integration_calls} == {"snn", "wnn"}
+    for call in store.integration_calls:
+        expected_kind = "connectivity_map" if call["method"] == "snn" else "neighbors"
+        assert {source.kind for source in call["sources"]} == {expected_kind}
+        assert "label" not in call
     assert len(store.cluster_calls) == 2
     assert {call["resolution"] for call in store.cluster_calls} == {1.25}
 
@@ -1329,8 +1673,7 @@ def test_integration_requires_trusted_label_connectivity() -> None:
 
         def integrate_assays(
             self,
-            _assays: list[str],
-            _label: str,
+            _sources: list[ArtifactRef],
             **_kwargs: Any,
         ) -> ArtifactRef:
             return ArtifactRef(
@@ -1339,7 +1682,11 @@ def test_integration_requires_trusted_label_connectivity() -> None:
                 artifact_id="7" * 64,
             )
 
-        def run_leiden_clustering(self, **_kwargs: Any) -> ArtifactRef:
+        def run_leiden_clustering(
+            self,
+            _graph: ArtifactRef,
+            **_kwargs: Any,
+        ) -> ArtifactRef:
             return ArtifactRef(
                 scope="datastore",
                 kind="cluster_labels",
@@ -1359,6 +1706,7 @@ def test_integration_requires_trusted_label_connectivity() -> None:
         ),
         _native_batch_report("RNA", "ADT"),
         ExperimentalTuningHandoff(
+            cellSelection=_cell_selection_model(),
             batchAction="skip",
             preservationColumns=["trusted_cell_type"],
         ),
@@ -1422,19 +1770,18 @@ def test_integration_checkpoints_prevent_retry_execution(
         return {"values": np.asarray([0, 0, 1, 1])}
 
     def integrate_assays(
-        assays: list[str],
-        label: str,
+        sources: list[ArtifactRef],
         **kwargs: Any,
     ) -> ArtifactRef:
-        integration_calls.append({"assays": assays, "label": label, **kwargs})
+        integration_calls.append({"sources": sources, **kwargs})
         return ArtifactRef(
             scope="datastore",
             kind="integrated_graph",
             artifact_id=f"{100 + len(integration_calls):064x}",
         )
 
-    def cluster(**kwargs: Any) -> ArtifactRef:
-        cluster_calls.append(kwargs)
+    def cluster(graph: ArtifactRef, **kwargs: Any) -> ArtifactRef:
+        cluster_calls.append({"graph": graph, **kwargs})
         return ArtifactRef(
             scope="datastore",
             kind="cluster_labels",
@@ -1462,7 +1809,10 @@ def test_integration_checkpoints_prevent_retry_execution(
         workflow.workflowRunId,
         plan,
         report,
-        ExperimentalTuningHandoff(batchAction="skip"),
+        ExperimentalTuningHandoff(
+            cellSelection=_cell_selection_model(),
+            batchAction="skip",
+        ),
         config,
         started=started,
         actions=first_actions,
@@ -1476,7 +1826,10 @@ def test_integration_checkpoints_prevent_retry_execution(
         workflow.workflowRunId,
         plan,
         report,
-        ExperimentalTuningHandoff(batchAction="skip"),
+        ExperimentalTuningHandoff(
+            cellSelection=_cell_selection_model(),
+            batchAction="skip",
+        ),
         config,
         started=retried,
         actions=retry_actions,
@@ -1500,3 +1853,489 @@ def test_integration_checkpoints_prevent_retry_execution(
     )
     assert len(checkpoint_reports) == 2
     assert all("_integration_" in value.agentRunId for value in checkpoint_reports)
+
+
+def test_preprocess_atac_and_adt_feature_routes() -> None:
+    class Features:
+        def __init__(self, ids: list[str], names: list[str]) -> None:
+            self.N = len(ids)
+            self.values = {"ids": np.asarray(ids), "names": np.asarray(names)}
+
+        def fetch_all(self, column: str) -> np.ndarray:
+            return self.values[column]
+
+    class Store:
+        def __init__(self) -> None:
+            self.assays = {
+                "ATAC": SimpleNamespace(
+                    feats=Features(
+                        ["chr1:1-10", "chr1:20-30", "chr2:1-10", "chr2:20-30"],
+                        ["peak1", "peak2", "peak3", "peak4"],
+                    )
+                ),
+                "ADT": SimpleNamespace(
+                    feats=Features(
+                        ["adt1", "adt2", "adt3", "adt4"],
+                        ["CD3", "control", "CD19", "CD45"],
+                    )
+                ),
+            }
+            self.masks: list[np.ndarray] = []
+
+        def get_assay(self, assay: str) -> Any:
+            return self.assays[assay]
+
+        @staticmethod
+        def select_prevalent_peaks(*_args: Any, **_kwargs: Any) -> ArtifactRef:
+            return ArtifactRef(
+                scope="assay",
+                assay="ATAC",
+                kind="feature_selection",
+                artifact_id="1" * 64,
+            )
+
+        def set_feature_selection(
+            self, *, from_assay: str, mask: np.ndarray, **_kwargs: Any
+        ) -> ArtifactRef:
+            self.masks.append(mask.copy())
+            return ArtifactRef(
+                scope="assay",
+                assay=from_assay,
+                kind="feature_selection",
+                artifact_id=("2" if from_assay == "ADT" else "3") * 64,
+            )
+
+        @staticmethod
+        def run_normalization(
+            _selection: ArtifactRef, *, features: ArtifactRef, **_kwargs: Any
+        ) -> ArtifactRef:
+            return ArtifactRef(
+                scope="assay",
+                assay=features.assay,
+                kind="normalized",
+                artifact_id=("4" if features.assay == "ATAC" else "5") * 64,
+            )
+
+        def load_artifact(self, ref: ArtifactRef) -> dict[str, np.ndarray]:
+            selected = 3 if ref.assay == "ATAC" else int(self.masks[-1].sum())
+            return {"values": np.asarray([True] * selected + [False] * (4 - selected))}
+
+    store = Store()
+    selection = ArtifactRef(
+        scope="datastore",
+        kind="cell_selection",
+        artifact_id="c" * 64,
+    )
+    selection_model = ArtifactReferenceModel.from_artifact_ref(selection)
+    orchestrator = AgentOrchestrator(object())
+    actions: list[str] = []
+    operations: list[dict[str, Any]] = []
+    artifacts: dict[str, ArtifactReferenceModel] = {}
+    atac = AssayPreprocessingPlan(
+        assay="ATAC",
+        assayType="ATAC",
+        role="graph",
+        graphEligible=True,
+        markerEligible=True,
+        featureMethod="prevalentPeaks",
+        reductionMethod="lsi",
+        featureParameters={"topN": 10, "minCells": 1},
+        normalizationParameters={"logTransform": False, "renormalizeSubset": False},
+    )
+    atac_handoff = orchestrator.preprocess_assay(
+        store,
+        atac,
+        cell_selection=selection,
+        cell_selection_model=selection_model,
+        active_cells=12,
+        actions=actions,
+        operations=operations,
+        artifacts=artifacts,
+    )
+    assert atac_handoff.nFeatures == 3
+    assert operations[0]["topN"] == 3
+
+    adt = AssayPreprocessingPlan(
+        assay="ADT",
+        assayType="ADT",
+        role="graph",
+        graphEligible=True,
+        markerEligible=True,
+        featureMethod="panel",
+        reductionMethod="identity",
+        exactExcludedFeatures=["control", "adt4"],
+        normalizationParameters={"logTransform": True, "renormalizeSubset": True},
+    )
+    adt_handoff = orchestrator.preprocess_assay(
+        store,
+        adt,
+        cell_selection=selection,
+        cell_selection_model=selection_model,
+        active_cells=12,
+        actions=actions,
+        operations=operations,
+        artifacts=artifacts,
+    )
+    assert adt_handoff.nFeatures == 2
+    np.testing.assert_array_equal(store.masks[-1], [True, False, True, False])
+
+    with pytest.raises(ValueError, match="fewer than two non-control"):
+        orchestrator.preprocess_assay(
+            store,
+            adt.model_copy(update={"exactExcludedFeatures": ["adt2", "adt3", "adt4"]}),
+            cell_selection=selection,
+            cell_selection_model=selection_model,
+            active_cells=12,
+            actions=[],
+            operations=[],
+            artifacts={},
+        )
+    with pytest.raises(ValueError, match="Unsupported feature route"):
+        orchestrator.preprocess_assay(
+            store,
+            adt.model_copy(update={"featureMethod": "none"}),
+            cell_selection=selection,
+            cell_selection_model=selection_model,
+            active_cells=12,
+            actions=[],
+            operations=[],
+            artifacts={},
+        )
+
+
+def test_exact_feature_exclusion_covers_all_supported_families() -> None:
+    class Features:
+        N = 4
+
+        @staticmethod
+        def fetch_all(column: str) -> np.ndarray:
+            values = {
+                "ids": np.asarray(["MT-CO1", "RPS3", "HIST1H1", "gene4"]),
+                "names": np.asarray(["mito", "ribo", "histone", "GENE4"]),
+            }
+            return values[column]
+
+    class Store:
+        def __init__(self) -> None:
+            self.mask: np.ndarray | None = None
+
+        @staticmethod
+        def get_assay(_assay: str) -> Any:
+            return SimpleNamespace(feats=Features())
+
+        @staticmethod
+        def load_artifact(_source: ArtifactRef) -> dict[str, np.ndarray]:
+            return {"values": np.ones(4, dtype=bool)}
+
+        def set_feature_selection(
+            self, *, from_assay: str, mask: np.ndarray, **_kwargs: Any
+        ) -> ArtifactRef:
+            self.mask = mask.copy()
+            return ArtifactRef(
+                scope="assay",
+                assay=from_assay,
+                kind="feature_selection",
+                artifact_id="6" * 64,
+            )
+
+    plan = AssayPreprocessingPlan(
+        assay="RNA",
+        assayType="RNA",
+        role="graph",
+        graphEligible=True,
+        markerEligible=True,
+        featureMethod="hvg",
+        reductionMethod="pca",
+        featureParameters={
+            "excludeFamilies": ["mitochondrial", "ribosomal", "histone"]
+        },
+    )
+    orchestrator = AgentOrchestrator(object())
+    blacklist = orchestrator.rna_blacklist(plan)
+    assert all(token in blacklist for token in ("MT-", "RPS", "HIST"))
+    source = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="feature_selection",
+        artifact_id="7" * 64,
+    )
+    store = Store()
+    result = orchestrator.exclude_exact_features(store, plan, source)
+    assert result.kind == "feature_selection"
+    assert store.mask is not None
+    np.testing.assert_array_equal(store.mask, [False, False, False, True])
+    with pytest.raises(ValueError, match="removed every feature"):
+        orchestrator.exclude_exact_features(
+            store,
+            plan.model_copy(update={"exactExcludedFeatures": ["gene4"]}),
+            source,
+        )
+
+
+def test_cell_qc_artifact_and_execution_validation_edges() -> None:
+    metric = NamedArtifactSource(
+        name="metric",
+        artifact=ArtifactReferenceModel(
+            scope="assay",
+            assay="RNA",
+            kind="quality_metric",
+            artifactId="8" * 64,
+        ),
+    )
+    sample = NamedArtifactSource(
+        name="sample",
+        artifact=ArtifactReferenceModel(
+            scope="assay",
+            assay="HTO",
+            kind="hto_identity",
+            artifactId="9" * 64,
+        ),
+    )
+    global_plan = CellQcPlan(
+        action="globalGaussian",
+        profileId="global",
+        driverAssay="RNA",
+        driverAssayType="RNA",
+        artifactMetrics=[metric],
+        evidenceIds=["qcProfile:global"],
+    )
+    orchestrator = AgentOrchestrator(object())
+    with pytest.raises(ValueError, match="metric names must be unique"):
+        orchestrator._cell_qc_stage_artifacts(
+            global_plan.model_copy(update={"artifactMetrics": [metric, metric]})
+        )
+    with pytest.raises(ValueError, match="collides with a metric"):
+        orchestrator._cell_qc_stage_artifacts(
+            global_plan.model_copy(
+                update={
+                    "sampleArtifact": sample.model_copy(update={"name": metric.name})
+                }
+            )
+        )
+    artifacts = orchestrator._cell_qc_stage_artifacts(
+        global_plan.model_copy(update={"sampleArtifact": sample})
+    )
+    assert set(artifacts) == {"cellQcMetric:metric", "cellQcSample:sample"}
+
+    selection = ArtifactRef(
+        scope="datastore",
+        kind="cell_selection",
+        artifact_id="a" * 64,
+    )
+    skip_profile = CellQcProfileEvidence(
+        profileId="skip",
+        action="skip",
+        activeCells=4,
+        retainedCells=4,
+        retainedFraction=1.0,
+        evidenceId="qcProfile:skip",
+    )
+    skip_plan = CellQcPlan(
+        action="skip",
+        profileId="skip",
+        evidenceIds=[skip_profile.evidenceId],
+    )
+
+    def report(
+        plan: CellQcPlan,
+        profile: CellQcProfileEvidence,
+        *,
+        quality: list[NamedArtifactSource] | None = None,
+        identities: list[NamedArtifactSource] | None = None,
+    ) -> ExperimentalContextResult:
+        return ExperimentalContextResult.get_blank().model_copy(
+            update={
+                "cellQc": plan,
+                "qcProfiles": [profile],
+                "qualityMetricArtifacts": list(quality or []),
+                "htoIdentityArtifacts": list(identities or []),
+            }
+        )
+
+    with pytest.raises(ValueError, match="unknown QC profile"):
+        orchestrator.apply_cell_qc(
+            object(),
+            report(skip_plan, skip_profile).model_copy(update={"qcProfiles": []}),
+            selection,
+            [],
+            [],
+        )
+    with pytest.raises(ValueError, match="does not match"):
+        orchestrator.apply_cell_qc(
+            object(),
+            report(skip_plan.model_copy(update={"driverAssay": "RNA"}), skip_profile),
+            selection,
+            [],
+            [],
+        )
+
+    global_profile = CellQcProfileEvidence(
+        profileId="global",
+        action="globalGaussian",
+        driverAssay="RNA",
+        driverAssayType="RNA",
+        artifactMetrics=[metric],
+        activeCells=4,
+        retainedCells=3,
+        retainedFraction=0.75,
+        evidenceId="qcProfile:global",
+    )
+    with pytest.raises(ValueError, match="absent from Experimental Context"):
+        orchestrator.apply_cell_qc(
+            object(),
+            report(global_plan, global_profile),
+            selection,
+            [],
+            [],
+        )
+
+    sample_profile = CellQcProfileEvidence(
+        profileId="sample",
+        action="sampleMad",
+        driverAssay="RNA",
+        driverAssayType="RNA",
+        sampleArtifact=sample,
+        attributes=["RNA_nCounts"],
+        activeCells=4,
+        retainedCells=3,
+        retainedFraction=0.75,
+        evidenceId="qcProfile:sample",
+    )
+    sample_plan = CellQcPlan(
+        action="sampleMad",
+        profileId="sample",
+        driverAssay="RNA",
+        driverAssayType="RNA",
+        sampleArtifact=sample,
+        attributes=["RNA_nCounts"],
+        evidenceIds=[sample_profile.evidenceId],
+    )
+    with pytest.raises(ValueError, match="sample artifact is absent"):
+        orchestrator.apply_cell_qc(
+            object(),
+            report(sample_plan, sample_profile),
+            selection,
+            [],
+            [],
+        )
+
+    actions: list[str] = []
+    operations: list[dict[str, Any]] = []
+    assert (
+        orchestrator.apply_cell_qc(
+            object(),
+            report(skip_plan, skip_profile),
+            selection,
+            actions,
+            operations,
+        )
+        == selection
+    )
+    assert actions == ["skip_cell_qc"]
+
+    invalid_global_plan = global_plan.model_copy(update={"sampleColumn": "sample"})
+    invalid_global_profile = global_profile.model_copy(
+        update={"sampleColumn": "sample"}
+    )
+    with pytest.raises(ValueError, match="cannot include a sample"):
+        orchestrator.apply_cell_qc(
+            object(),
+            report(invalid_global_plan, invalid_global_profile, quality=[metric]),
+            selection,
+            [],
+            [],
+        )
+    invalid_sample_plan = sample_plan.model_copy(update={"sampleArtifact": None})
+    invalid_sample_profile = sample_profile.model_copy(update={"sampleArtifact": None})
+    with pytest.raises(ValueError, match="requires exactly one"):
+        orchestrator.apply_cell_qc(
+            object(),
+            report(invalid_sample_plan, invalid_sample_profile),
+            selection,
+            [],
+            [],
+        )
+    unsupported_plan = skip_plan.model_copy(update={"action": "unsupported"})
+    unsupported_profile = skip_profile.model_copy(update={"action": "unsupported"})
+    with pytest.raises(ValueError, match="Unsupported cell QC action"):
+        orchestrator.apply_cell_qc(
+            object(),
+            report(unsupported_plan, unsupported_profile),
+            selection,
+            [],
+            [],
+        )
+
+
+def test_preprocessing_plan_rejects_invalid_assay_routing() -> None:
+    orchestrator = AgentOrchestrator(object())
+    unsupported = _planning_inputs(
+        {"custom": ("CRISPR", ["guide"], ["guide"])},
+    )
+    with pytest.raises(ValueError, match="No supported graph-bearing"):
+        orchestrator.build_preprocessing_plan(*unsupported)
+
+    too_many = list(
+        _planning_inputs(
+            {
+                "RNA": ("RNA", ["g1", "g2", "g3"], ["G1", "G2", "G3"]),
+                "ADT": ("ADT", ["a1", "a2", "a3"], ["A1", "A2", "A3"]),
+            },
+            config=AutomatedWorkflowConfig(maxGraphAssays=1),
+        )
+    )
+    with pytest.raises(ValueError, match="Too many graph-bearing"):
+        orchestrator.build_preprocessing_plan(*too_many)
+
+    duplicate = list(
+        _planning_inputs(
+            {
+                "RNA1": ("RNA", ["g1", "g2", "g3"], ["G1", "G2", "G3"]),
+                "RNA2": ("RNA", ["g4", "g5", "g6"], ["G4", "G5", "G6"]),
+            }
+        )
+    )
+    request_record = duplicate[1]
+    duplicate[1] = request_record.model_copy(
+        update={
+            "request": request_record.request.model_copy(update={"analysisAssays": []})
+        }
+    )
+    with pytest.raises(ValueError, match="same-kind biological assays"):
+        orchestrator.build_preprocessing_plan(*duplicate)
+
+    base = list(
+        _planning_inputs({"RNA": ("RNA", ["g1", "g2", "g3"], ["G1", "G2", "G3"])})
+    )
+    request_record = base[1]
+    for updates, message in (
+        ({"primaryAssay": "missing"}, "primaryAssay"),
+        ({"markerAssay": "missing"}, "markerAssay"),
+        ({"pairedAssays": ["RNA", "missing"]}, "non-graph assays"),
+    ):
+        values = list(base)
+        values[1] = request_record.model_copy(
+            update={"request": request_record.request.model_copy(update=updates)}
+        )
+        with pytest.raises(ValueError, match=message):
+            orchestrator.build_preprocessing_plan(*values)
+
+    paired = list(
+        _planning_inputs(
+            {
+                "RNA": ("RNA", ["g1", "g2", "g3"], ["G1", "G2", "G3"]),
+                "ADT": ("ADT", ["a1", "a2", "a3"], ["A1", "A2", "A3"]),
+            },
+            primary_assay="RNA",
+        )
+    )
+    request_record = paired[1]
+    paired[1] = request_record.model_copy(
+        update={
+            "request": request_record.request.model_copy(
+                update={"pairedAssays": ["ADT"]}
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="must include the primary"):
+        orchestrator.build_preprocessing_plan(*paired)

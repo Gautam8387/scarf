@@ -11,6 +11,7 @@ import json
 import re
 import time
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -20,6 +21,8 @@ from zarr.core.buffer import default_buffer_prototype
 from zarr.core.sync import sync
 
 from ..datastore.datastore import DataStore
+from ..storage.artifacts import inspect_artifact
+from ..storage.refs import ArtifactRef
 from ..storage.schema import validate_workspace_name
 from ..utils.logging import logger
 from . import record_io
@@ -162,12 +165,24 @@ class AgentInvocation(AgentDataModel):
 
     @classmethod
     def get_example(cls) -> "AgentInvocation":
+        cell_selection = ArtifactReferenceModel(
+            scope="datastore",
+            kind="cell_selection",
+            artifactId="c" * 64,
+        )
         return cls(
             agentName="parameter_tuning",
             parentReports=[AgentReportLink.get_example()],
-            inputs={"fromAssay": "RNA", "cellKey": "I"},
+            inputs={
+                "fromAssay": "RNA",
+                "cellSelection": cell_selection.model_dump(mode="json"),
+            },
+            artifacts={"cellSelection": cell_selection},
             runConfig=AgentRunConfig.get_example(),
-            experimentalTuningHandoff=ExperimentalTuningHandoff(batchAction="skip"),
+            experimentalTuningHandoff=ExperimentalTuningHandoff(
+                cellSelection=cell_selection,
+                batchAction="skip",
+            ),
         )
 
 
@@ -926,6 +941,68 @@ def _has_handoff_parent(
     return supplied is not None
 
 
+def _selection_descends_from(
+    group: zarr.Group,
+    supplied: ArtifactReferenceModel | None,
+    expected: ArtifactReferenceModel | None,
+) -> bool:
+    if supplied is None or expected is None:
+        return supplied == expected
+    current = ArtifactRef(
+        scope=supplied.scope,
+        assay=supplied.assay,
+        kind=supplied.kind,
+        artifact_id=supplied.artifactId,
+    )
+    ancestor = ArtifactRef(
+        scope=expected.scope,
+        assay=expected.assay,
+        kind=expected.kind,
+        artifact_id=expected.artifactId,
+    )
+    if current.kind != "cell_selection" or ancestor.kind != "cell_selection":
+        return False
+    visited: set[ArtifactRef] = set()
+    while current not in visited:
+        if current == ancestor:
+            return True
+        visited.add(current)
+        status = inspect_artifact(group, current)
+        if not status.exists or not status.complete:
+            return False
+        raw_parent = (status.inputs or {}).get("prior_cell_selection")
+        if not isinstance(raw_parent, Mapping):
+            return False
+        try:
+            current = ArtifactRef.from_dict(dict(raw_parent))
+        except (KeyError, TypeError, ValueError):
+            return False
+    return False
+
+
+def _validate_projected_experimental_handoff(
+    group: zarr.Group,
+    invocation: AgentInvocation,
+    *,
+    label: str,
+    supplied: ExperimentalTuningHandoff | ExperimentalBiologyHandoff,
+    expected: ExperimentalTuningHandoff | ExperimentalBiologyHandoff,
+) -> None:
+    supplied_selection = supplied.cellSelection
+    if invocation.artifacts.get("cellSelection") != supplied_selection:
+        raise ValueError(f"{label} cellSelection must be an invocation artifact")
+    if not _selection_descends_from(
+        group,
+        supplied_selection,
+        expected.cellSelection,
+    ):
+        raise ValueError(
+            f"{label} cellSelection does not descend from the cited parent report"
+        )
+    if supplied != expected.model_copy(update={"cellSelection": supplied_selection}):
+        raise ValueError(f"{label} does not match the cited parent report")
+
+
 def _validate_invocation(
     group: zarr.Group,
     prefix: str,
@@ -955,10 +1032,14 @@ def _validate_invocation(
             expected = ExperimentalContextResult.model_validate(
                 experimental_parents[0].report
             ).to_parameter_tuning_handoff()
-            if invocation.experimentalTuningHandoff != expected:
-                raise ValueError(
-                    "experimentalTuningHandoff does not match the cited parent report"
-                )
+            assert invocation.experimentalTuningHandoff is not None
+            _validate_projected_experimental_handoff(
+                group,
+                invocation,
+                label="experimentalTuningHandoff",
+                supplied=invocation.experimentalTuningHandoff,
+                expected=expected,
+            )
     elif invocation.experimentalTuningHandoff is not None:
         raise ValueError("experimentalTuningHandoff is only valid for parameter_tuning")
 
@@ -981,10 +1062,13 @@ def _validate_invocation(
             ).to_biological_handoff(
                 invocation.experimentalBiologyHandoff.conditionColumn
             )
-            if invocation.experimentalBiologyHandoff != expected_experimental:
-                raise ValueError(
-                    "experimentalBiologyHandoff does not match the cited parent report"
-                )
+            _validate_projected_experimental_handoff(
+                group,
+                invocation,
+                label="experimentalBiologyHandoff",
+                supplied=invocation.experimentalBiologyHandoff,
+                expected=expected_experimental,
+            )
         tuning_parents = parents["parameter_tuning"]
         if _has_handoff_parent(
             label="tuningBiologyHandoff",

@@ -9,7 +9,9 @@ import numpy as np
 
 from ...datastore.datastore import DataStore
 from ...datastore.summary import AssaySummary
+from ...metadata.selection import NamedCellArtifact
 from ...storage.refs import ArtifactRef
+from ...storage.selections import read_stored_selection_mask
 from ...utils.logging import logger
 from .. import record_io
 from ..data_enrichment import (
@@ -17,7 +19,7 @@ from ..data_enrichment import (
     DataEnrichmentReport,
     FeatureSelectionPolicy,
 )
-from ..experimental_context import ExperimentalContextResult
+from ..experimental_context import CellQcPlan, ExperimentalContextResult
 from ..persistence import AgentWorkflowRun
 from ..types import ArtifactReferenceModel
 from . import journal
@@ -32,11 +34,31 @@ from .models import (
     WorkflowQuestion,
     WorkflowStageAttempt,
     WorkflowStageLink,
+    artifact_model_to_ref,
 )
 
 
 class PreprocessingStagesMixin:
     """Stages that plan and execute modality-specific preprocessing."""
+
+    @staticmethod
+    def _cell_qc_stage_artifacts(
+        plan: CellQcPlan,
+    ) -> dict[str, ArtifactReferenceModel]:
+        artifacts = {
+            f"cellQcMetric:{source.name}": source.artifact
+            for source in plan.artifactMetrics
+        }
+        if len(artifacts) != len(plan.artifactMetrics):
+            raise ValueError("Cell-QC artifact metric names must be unique")
+        if plan.sampleArtifact is not None:
+            if plan.sampleArtifact.name in {
+                source.name for source in plan.artifactMetrics
+            }:
+                raise ValueError("Cell-QC sample artifact name collides with a metric")
+            key = f"cellQcSample:{plan.sampleArtifact.name}"
+            artifacts[key] = plan.sampleArtifact.artifact
+        return artifacts
 
     def preprocessing_plan_stage(
         self,
@@ -67,6 +89,9 @@ class PreprocessingStagesMixin:
             return existing, AutomatedPreprocessingPlan.model_validate(
                 existing.outputs["preprocessingPlan"]
             )
+        if experimental.cellSelection is None:
+            raise ValueError("Experimental Context lacks an exact cell selection")
+        cell_qc_artifacts = self._cell_qc_stage_artifacts(experimental.cellQc)
         started = journal._start_attempt(
             store.zw,
             prefix,
@@ -77,6 +102,7 @@ class PreprocessingStagesMixin:
             inputs={
                 "approvalAnswer": answers.get("approvePlanChecksum"),
                 "allowAssumptions": request_record.request.allowAssumptions,
+                "cellSelection": experimental.cellSelection.model_dump(mode="json"),
             },
             resume_record=resume_record,
         )
@@ -98,7 +124,17 @@ class PreprocessingStagesMixin:
                 f"routes=[{route_summary}])"
             )
         except Exception as exc:
-            outcome = journal.finish_exception(store, prefix, workflow, started, exc)
+            outcome = journal.finish_exception(
+                store,
+                prefix,
+                workflow,
+                started,
+                exc,
+                artifacts={
+                    "cellSelection": experimental.cellSelection,
+                    **cell_qc_artifacts,
+                },
+            )
             return outcome, AutomatedPreprocessingPlan.get_blank()
         supplied_approval = answers.get("approvePlanChecksum")
         preapproved = bool(
@@ -119,6 +155,10 @@ class PreprocessingStagesMixin:
             outcome = journal._complete_attempt(
                 started,
                 status="needsInput",
+                artifacts={
+                    "cellSelection": experimental.cellSelection,
+                    **cell_qc_artifacts,
+                },
                 outputs={"preprocessingPlan": plan.model_dump(mode="json")},
                 needs_input=WorkflowNeedsInput(
                     questions=[
@@ -140,6 +180,10 @@ class PreprocessingStagesMixin:
             outcome = journal._complete_attempt(
                 started,
                 status="done",
+                artifacts={
+                    "cellSelection": experimental.cellSelection,
+                    **cell_qc_artifacts,
+                },
                 outputs={"preprocessingPlan": plan.model_dump(mode="json")},
                 actions=["approve_preprocessing_plan"],
             )
@@ -251,7 +295,6 @@ class PreprocessingStagesMixin:
                 ),
                 primary,
             )
-        ingest_format = ingest_outcome.outputs.get("format")
         if request.pairedAssays:
             paired = list(request.pairedAssays)
             unknown_paired = sorted(set(paired) - set(graph_assays))
@@ -273,14 +316,13 @@ class PreprocessingStagesMixin:
                 limitations.append(
                     "Multimodal integration skipped because pairing provenance was not supplied"
                 )
-        reset_selection = ingest_format != "zarr" or bool(request.resetCellSelection)
         final_plan = AutomatedPreprocessingPlan(
             primaryAssay=primary,
             markerAssay=marker_assay,
+            cellSelection=experimental.cellSelection,
             cellQc=experimental.cellQc,
             assays=assay_plans,
             pairedAssays=paired,
-            resetCellSelection=reset_selection,
             limitations=list(dict.fromkeys(limitations)),
         )
         checksum = hashlib.sha256(
@@ -497,6 +539,17 @@ class PreprocessingStagesMixin:
                 PreprocessedAssayHandoff.model_validate(value)
                 for value in existing.outputs["assays"]
             ]
+        if plan.cellSelection is None:
+            raise ValueError("Preprocessing plan lacks an exact cell selection")
+        if experimental.cellSelection != plan.cellSelection:
+            raise ValueError(
+                "Preprocessing plan and Experimental Context selections differ"
+            )
+        if experimental.cellQc != plan.cellQc:
+            raise ValueError(
+                "Preprocessing plan and Experimental Context cell-QC plans differ"
+            )
+        input_cell_selection = artifact_model_to_ref(plan.cellSelection)
         started = journal._start_attempt(
             store.zw,
             prefix,
@@ -504,15 +557,54 @@ class PreprocessingStagesMixin:
             "preprocessing",
             request_record,
             parents,
-            inputs={"preprocessingPlan": plan.model_dump(mode="json")},
+            inputs={
+                "preprocessingPlan": plan.model_dump(mode="json"),
+                "cellSelection": plan.cellSelection.model_dump(mode="json"),
+            },
             resume_record=resume_record,
         )
         actions: list[str] = []
         operations: list[dict[str, Any]] = []
-        artifacts: dict[str, ArtifactReferenceModel] = {}
+        artifacts: dict[str, ArtifactReferenceModel] = {
+            "inputCellSelection": plan.cellSelection,
+            **self._cell_qc_stage_artifacts(plan.cellQc),
+        }
         try:
-            self.apply_cell_qc(store, experimental, actions, operations)
-            active_cells = int(np.asarray(store.cells.fetch_all("I"), dtype=bool).sum())
+            cell_selection = self.apply_cell_qc(
+                store,
+                experimental,
+                input_cell_selection,
+                actions,
+                operations,
+            )
+            cell_selection_model = ArtifactReferenceModel.from_artifact_ref(
+                cell_selection
+            )
+            artifacts["cellSelection"] = cell_selection_model
+            active_cells = int(
+                read_stored_selection_mask(
+                    store.zw,
+                    cell_selection,
+                    kind="cell_selection",
+                    scope="datastore",
+                    assay=None,
+                    table_path="cellData",
+                ).sum()
+            )
+            selected_profile = next(
+                (
+                    profile
+                    for profile in experimental.qcProfiles
+                    if profile.profileId == experimental.cellQc.profileId
+                ),
+                None,
+            )
+            if selected_profile is None:
+                raise ValueError("Selected cell-QC profile is unavailable")
+            if active_cells != selected_profile.retainedCells:
+                raise ValueError(
+                    "Executed cell-QC retention differs from the selected profile"
+                )
             logger.info(
                 f"Workflow {workflow.workflowRunId}: preprocessing retained "
                 f"{active_cells} active cell(s)"
@@ -520,7 +612,6 @@ class PreprocessingStagesMixin:
             if active_cells < 3:
                 raise ValueError("Preprocessing requires at least three active cells")
             handoffs: list[PreprocessedAssayHandoff] = []
-            token = workflow.workflowRunId[:12]
             for assay_plan in plan.assays:
                 if not assay_plan.graphEligible:
                     continue
@@ -533,8 +624,9 @@ class PreprocessingStagesMixin:
                     self.preprocess_assay(
                         store,
                         assay_plan,
+                        cell_selection=cell_selection,
+                        cell_selection_model=cell_selection_model,
                         active_cells=active_cells,
-                        token=token,
                         actions=actions,
                         operations=operations,
                         artifacts=artifacts,
@@ -550,6 +642,7 @@ class PreprocessingStagesMixin:
                 },
                 outputs={
                     "assays": [value.model_dump(mode="json") for value in handoffs],
+                    "cellSelection": cell_selection_model.model_dump(mode="json"),
                     "operations": operations,
                 },
                 actions=actions,
@@ -578,69 +671,62 @@ class PreprocessingStagesMixin:
         store: DataStore,
         assay_plan: AssayPreprocessingPlan,
         *,
+        cell_selection: ArtifactRef,
+        cell_selection_model: ArtifactReferenceModel,
         active_cells: int,
-        token: str,
         actions: list[str],
         operations: list[dict[str, Any]],
         artifacts: dict[str, ArtifactReferenceModel],
     ) -> PreprocessedAssayHandoff:
         assay = store.get_assay(assay_plan.assay)
-        label_base = f"agent_{token}_{journal._safe_label(assay_plan.assay).lower()}"
         min_cells = int(assay_plan.featureParameters.get("minCells", 1))
         marker_features: ArtifactRef
         if assay_plan.featureMethod == "hvg":
             blacklist = self.rna_blacklist(assay_plan)
-            graph_label = f"{label_base}_graph_features"
             actual_top_n = min(
                 int(assay_plan.featureParameters["topN"]),
                 max(1, assay.feats.N - 1),
             )
-            hvg_features = store.mark_hvgs(
+            hvg_features = store.select_hvgs(
+                cell_selection,
                 from_assay=assay_plan.assay,
-                cell_key="I",
                 min_cells=min_cells,
                 top_n=actual_top_n,
                 blacklist=blacklist,
                 show_plot=False,
-                label=graph_label,
+                invalidate_cache=False,
             )
-            filtered_graph_label = f"{label_base}_filtered_graph_features"
             graph_features = self.exclude_exact_features(
                 store,
                 assay_plan,
                 hvg_features,
-                label=filtered_graph_label,
             )
-            detected_label = f"{label_base}_detected_features"
             detected = store.select_detected_features(
+                cell_selection,
                 from_assay=assay_plan.assay,
-                cell_key="I",
                 min_cells=min_cells,
-                label=detected_label,
+                invalidate_cache=False,
             )
-            marker_label = f"{label_base}_marker_features"
             marker_features = self.exclude_exact_features(
                 store,
                 assay_plan,
                 detected,
-                label=marker_label,
             )
             actions.extend(
                 [
-                    f"mark_hvgs:{assay_plan.assay}",
+                    f"select_hvgs:{assay_plan.assay}",
                     f"select_marker_features:{assay_plan.assay}",
                 ]
             )
             operations.append(
                 {
-                    "operation": "mark_hvgs",
+                    "operation": "select_hvgs",
                     "assay": assay_plan.assay,
-                    "cellKey": "I",
+                    "cellSelection": cell_selection_model.model_dump(mode="json"),
                     "minCells": min_cells,
                     "topN": actual_top_n,
                     "blacklist": blacklist,
                     "showPlot": False,
-                    "label": graph_label,
                     "invalidateCache": False,
                     "artifact": ArtifactReferenceModel.from_artifact_ref(
                         hvg_features
@@ -659,7 +745,6 @@ class PreprocessingStagesMixin:
                         "excludeFamilies": list(
                             assay_plan.featureParameters.get("excludeFamilies", [])
                         ),
-                        "label": filtered_graph_label,
                         "artifact": ArtifactReferenceModel.from_artifact_ref(
                             graph_features
                         ).model_dump(mode="json"),
@@ -667,9 +752,8 @@ class PreprocessingStagesMixin:
                     {
                         "operation": "select_detected_features",
                         "assay": assay_plan.assay,
-                        "cellKey": "I",
+                        "cellSelection": cell_selection_model.model_dump(mode="json"),
                         "minCells": min_cells,
-                        "label": detected_label,
                         "artifact": ArtifactReferenceModel.from_artifact_ref(
                             detected
                         ).model_dump(mode="json"),
@@ -684,7 +768,6 @@ class PreprocessingStagesMixin:
                         "excludeFamilies": list(
                             assay_plan.featureParameters.get("excludeFamilies", [])
                         ),
-                        "label": marker_label,
                         "artifact": ArtifactReferenceModel.from_artifact_ref(
                             marker_features
                         ).model_dump(mode="json"),
@@ -702,26 +785,24 @@ class PreprocessingStagesMixin:
                 }
             )
         elif assay_plan.featureMethod == "prevalentPeaks":
-            peak_label = f"{label_base}_prevalent_peaks"
             actual_top_n = min(
                 int(assay_plan.featureParameters["topN"]),
                 assay.feats.N - 1,
             )
-            graph_features = store.mark_prevalent_peaks(
+            graph_features = store.select_prevalent_peaks(
+                cell_selection,
                 from_assay=assay_plan.assay,
-                cell_key="I",
                 top_n=actual_top_n,
-                label=peak_label,
+                invalidate_cache=False,
             )
             marker_features = graph_features
-            actions.append(f"mark_prevalent_peaks:{assay_plan.assay}")
+            actions.append(f"select_prevalent_peaks:{assay_plan.assay}")
             operations.append(
                 {
-                    "operation": "mark_prevalent_peaks",
+                    "operation": "select_prevalent_peaks",
                     "assay": assay_plan.assay,
-                    "cellKey": "I",
+                    "cellSelection": cell_selection_model.model_dump(mode="json"),
                     "topN": actual_top_n,
-                    "label": peak_label,
                     "invalidateCache": False,
                     "artifact": ArtifactReferenceModel.from_artifact_ref(
                         graph_features
@@ -740,11 +821,10 @@ class PreprocessingStagesMixin:
                 raise ValueError(
                     f"ADT assay {assay_plan.assay!r} has fewer than two non-control features"
                 )
-            panel_label = f"{label_base}_panel"
             graph_features = store.set_feature_selection(
                 from_assay=assay_plan.assay,
                 mask=mask,
-                label=panel_label,
+                invalidate_cache=False,
             )
             marker_features = graph_features
             actions.append(f"select_adt_panel:{assay_plan.assay}")
@@ -754,7 +834,6 @@ class PreprocessingStagesMixin:
                     "assay": assay_plan.assay,
                     "selectedFeatures": int(mask.sum()),
                     "exactExcludedFeatures": sorted(excluded),
-                    "label": panel_label,
                     "artifact": ArtifactReferenceModel.from_artifact_ref(
                         graph_features
                     ).model_dump(mode="json"),
@@ -763,8 +842,7 @@ class PreprocessingStagesMixin:
         else:
             raise ValueError(f"Unsupported feature route {assay_plan.featureMethod!r}")
         normalized = store.run_normalization(
-            from_assay=assay_plan.assay,
-            cell_key="I",
+            cell_selection,
             features=graph_features,
             log_transform=cast(
                 bool,
@@ -774,7 +852,7 @@ class PreprocessingStagesMixin:
                 bool,
                 assay_plan.normalizationParameters.get("renormalizeSubset"),
             ),
-            update_state=True,
+            invalidate_cache=False,
         )
         graph_feature_group = store.load_artifact(graph_features)
         graph_feature_values = cast(Any, graph_feature_group["values"])
@@ -787,7 +865,7 @@ class PreprocessingStagesMixin:
         handoff = PreprocessedAssayHandoff(
             assay=assay_plan.assay,
             assayType=assay_plan.assayType,
-            cellKey="I",
+            cellSelection=cell_selection_model,
             reductionMethod=assay_plan.reductionMethod,
             graphFeatures=graph_features_model,
             markerFeatures=marker_features_model,
@@ -807,13 +885,12 @@ class PreprocessingStagesMixin:
             {
                 "operation": "run_normalization",
                 "assay": assay_plan.assay,
-                "cellKey": "I",
+                "cellSelection": cell_selection_model.model_dump(mode="json"),
                 "features": graph_features_model.model_dump(mode="json"),
                 "logTransform": assay_plan.normalizationParameters.get("logTransform"),
                 "renormalizeSubset": assay_plan.normalizationParameters.get(
                     "renormalizeSubset"
                 ),
-                "updateState": True,
                 "invalidateCache": False,
                 "artifact": normalized_model.model_dump(mode="json"),
             }
@@ -829,23 +906,15 @@ class PreprocessingStagesMixin:
         self,
         store: DataStore,
         experimental: ExperimentalContextResult,
+        cell_selection: ArtifactRef,
         actions: list[str],
         operations: list[dict[str, Any]],
-    ) -> None:
+    ) -> ArtifactRef:
         plan = experimental.cellQc
+        input_model = ArtifactReferenceModel.from_artifact_ref(cell_selection)
         logger.info(
             f"Applying cell QC action={plan.action!r}, profile={plan.profileId!r}"
         )
-        if plan.action == "skip":
-            actions.append("skip_cell_qc")
-            operations.append(
-                {
-                    "operation": "skip_cell_qc",
-                    "profileId": plan.profileId,
-                    "cellKey": plan.cellKey,
-                }
-            )
-            return
         profile = next(
             (
                 value
@@ -856,57 +925,137 @@ class PreprocessingStagesMixin:
         )
         if profile is None:
             raise ValueError("Experimental Context selected an unknown QC profile")
+        for field_name in (
+            "action",
+            "driverAssay",
+            "driverAssayType",
+            "sampleColumn",
+            "sampleArtifact",
+            "attributes",
+            "artifactMetrics",
+        ):
+            if getattr(plan, field_name) != getattr(profile, field_name):
+                raise ValueError(
+                    "Selected cell-QC plan does not match its exact offered profile"
+                )
+        if any(
+            source not in experimental.qualityMetricArtifacts
+            for source in plan.artifactMetrics
+        ):
+            raise ValueError(
+                "Selected cell-QC metrics are absent from Experimental Context"
+            )
+        if (
+            plan.sampleArtifact is not None
+            and plan.sampleArtifact not in experimental.htoIdentityArtifacts
+        ):
+            raise ValueError(
+                "Selected cell-QC sample artifact is absent from Experimental Context"
+            )
+        if plan.action == "skip":
+            actions.append("skip_cell_qc")
+            operations.append(
+                {
+                    "operation": "skip_cell_qc",
+                    "profileId": plan.profileId,
+                    "cellSelection": input_model.model_dump(mode="json"),
+                    "artifact": input_model.model_dump(mode="json"),
+                }
+            )
+            return cell_selection
+        artifact_metrics = [
+            NamedCellArtifact(
+                name=source.name,
+                artifact=artifact_model_to_ref(source.artifact),
+            )
+            for source in plan.artifactMetrics
+        ]
+        sample_artifact = (
+            None
+            if plan.sampleArtifact is None
+            else NamedCellArtifact(
+                name=plan.sampleArtifact.name,
+                artifact=artifact_model_to_ref(plan.sampleArtifact.artifact),
+            )
+        )
         if plan.action == "globalGaussian":
-            store.auto_filter_cells(
-                attrs=profile.attributes,
+            if plan.sampleColumn is not None or sample_artifact is not None:
+                raise ValueError("globalGaussian QC cannot include a sample source")
+            result = store.auto_filter_cells(
+                attrs=plan.attributes,
+                artifact_metrics=artifact_metrics,
                 min_p=float(profile.parameters.get("minP", 0.01)),
                 max_p=float(profile.parameters.get("maxP", 0.99)),
-                show_qc_plots=False,
+                cell_selection=cell_selection,
+                invalidate_cache=False,
             )
+            result_model = ArtifactReferenceModel.from_artifact_ref(result)
             actions.append(f"cell_qc_global:{profile.profileId}")
             operations.append(
                 {
                     "operation": "auto_filter_cells",
                     "profileId": profile.profileId,
-                    "attrs": list(profile.attributes),
+                    "cellSelection": input_model.model_dump(mode="json"),
+                    "attrs": list(plan.attributes),
+                    "artifactMetrics": [
+                        source.model_dump(mode="json")
+                        for source in plan.artifactMetrics
+                    ],
                     "minP": float(profile.parameters.get("minP", 0.01)),
                     "maxP": float(profile.parameters.get("maxP", 0.99)),
-                    "showQcPlots": False,
                     "sampleColumn": None,
                     "invalidateCache": False,
+                    "artifact": result_model.model_dump(mode="json"),
                 }
             )
-            return
+            return result
         if plan.action == "sampleMad":
-            if not plan.sampleColumn:
-                raise ValueError("sampleMad QC requires a sample column")
-            store.auto_filter_cells(
-                attrs=profile.attributes,
-                show_qc_plots=False,
+            if (plan.sampleColumn is None) == (sample_artifact is None):
+                raise ValueError(
+                    "sampleMad QC requires exactly one metadata or artifact "
+                    "sample source"
+                )
+            result = store.auto_filter_cells(
+                attrs=plan.attributes,
+                artifact_metrics=artifact_metrics,
+                cell_selection=cell_selection,
                 sample_column=plan.sampleColumn,
+                sample_artifact=sample_artifact,
                 n_mads=float(profile.parameters.get("nMads", 3.0)),
                 min_cells_per_sample=int(
                     profile.parameters.get("minCellsPerSample", 20)
                 ),
+                invalidate_cache=False,
             )
+            result_model = ArtifactReferenceModel.from_artifact_ref(result)
             actions.append(f"cell_qc_sample_mad:{profile.profileId}")
             operations.append(
                 {
                     "operation": "auto_filter_cells",
                     "profileId": profile.profileId,
-                    "attrs": list(profile.attributes),
+                    "cellSelection": input_model.model_dump(mode="json"),
+                    "attrs": list(plan.attributes),
+                    "artifactMetrics": [
+                        source.model_dump(mode="json")
+                        for source in plan.artifactMetrics
+                    ],
                     "minP": 0.01,
                     "maxP": 0.99,
-                    "showQcPlots": False,
                     "sampleColumn": plan.sampleColumn,
+                    "sampleArtifact": (
+                        None
+                        if plan.sampleArtifact is None
+                        else plan.sampleArtifact.model_dump(mode="json")
+                    ),
                     "nMads": float(profile.parameters.get("nMads", 3.0)),
                     "minCellsPerSample": int(
                         profile.parameters.get("minCellsPerSample", 20)
                     ),
                     "invalidateCache": False,
+                    "artifact": result_model.model_dump(mode="json"),
                 }
             )
-            return
+            return result
         raise ValueError(f"Unsupported cell QC action {plan.action!r}")
 
     def rna_blacklist(self, plan: AssayPreprocessingPlan) -> str:
@@ -930,8 +1079,6 @@ class PreprocessingStagesMixin:
         store: DataStore,
         plan: AssayPreprocessingPlan,
         source: ArtifactRef,
-        *,
-        label: str,
     ) -> ArtifactRef:
         families = set(
             cast(list[str], plan.featureParameters.get("excludeFamilies", []))
@@ -973,5 +1120,5 @@ class PreprocessingStagesMixin:
         return store.set_feature_selection(
             from_assay=plan.assay,
             mask=mask,
-            label=label,
+            invalidate_cache=False,
         )

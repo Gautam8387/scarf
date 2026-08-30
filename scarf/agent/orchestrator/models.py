@@ -203,11 +203,10 @@ class AutomatedPreprocessingPlan(AgentDataModel):
 
     primaryAssay: str = ""
     markerAssay: str = ""
-    cellKey: str = "I"
+    cellSelection: ArtifactReferenceModel | None = None
     cellQc: CellQcPlan = Field(default_factory=CellQcPlan.get_blank)
     assays: list[AssayPreprocessingPlan] = Field(default_factory=list)
     pairedAssays: list[str] = Field(default_factory=list)
-    resetCellSelection: bool = False
     planChecksum: str = ""
     limitations: list[str] = Field(default_factory=list)
 
@@ -220,6 +219,11 @@ class AutomatedPreprocessingPlan(AgentDataModel):
         return cls(
             primaryAssay="RNA",
             markerAssay="RNA",
+            cellSelection=ArtifactReferenceModel(
+                scope="datastore",
+                kind="cell_selection",
+                artifactId="c" * 64,
+            ),
             assays=[AssayPreprocessingPlan.get_example()],
             planChecksum="0" * 64,
         )
@@ -230,7 +234,7 @@ class PreprocessedAssayHandoff(AgentDataModel):
 
     assay: str = ""
     assayType: str = "Assay"
-    cellKey: str = "I"
+    cellSelection: ArtifactReferenceModel | None = None
     reductionMethod: ReductionMethod = "none"
     graphFeatures: ArtifactReferenceModel | None = None
     markerFeatures: ArtifactReferenceModel | None = None
@@ -247,6 +251,11 @@ class PreprocessedAssayHandoff(AgentDataModel):
         return cls(
             assay="RNA",
             assayType="RNA",
+            cellSelection=ArtifactReferenceModel(
+                scope="datastore",
+                kind="cell_selection",
+                artifactId="c" * 64,
+            ),
             reductionMethod="pca",
             graphFeatures=ArtifactReferenceModel.get_example(),
             markerFeatures=ArtifactReferenceModel.get_example(),
@@ -273,9 +282,7 @@ class NativeAnalysisHandoff(AgentDataModel):
     neighbors: ArtifactReferenceModel | None = None
     graph: ArtifactReferenceModel | None = None
     clusters: ArtifactReferenceModel | None = None
-    clusterColumn: str = ""
     umap: ArtifactReferenceModel | None = None
-    umapColumns: list[str] = Field(default_factory=list)
 
     @classmethod
     def get_blank(cls) -> "NativeAnalysisHandoff":
@@ -292,14 +299,13 @@ class FinalAnalysisHandoff(AgentDataModel):
     workflowRunId: str = ""
     primaryAssay: str = ""
     markerAssay: str = ""
-    cellKey: str = "I"
+    cellSelection: ArtifactReferenceModel | None = None
     nativeAnalyses: list[NativeAnalysisHandoff] = Field(default_factory=list)
     graph: ArtifactReferenceModel | None = None
     graphMethod: Literal["native", "snn", "wnn"] = "native"
     clusters: ArtifactReferenceModel | None = None
-    clusterColumn: str = ""
+    embeddingInitialization: ArtifactReferenceModel | None = None
     umap: ArtifactReferenceModel | None = None
-    umapColumns: list[str] = Field(default_factory=list)
     markerFeatures: ArtifactReferenceModel | None = None
     markers: ArtifactReferenceModel | None = None
     parameterReport: AgentReportReference | None = None
@@ -315,14 +321,23 @@ class FinalAnalysisHandoff(AgentDataModel):
             workflowRunId="workflow-1",
             primaryAssay="RNA",
             markerAssay="RNA",
+            cellSelection=ArtifactReferenceModel(
+                scope="datastore",
+                kind="cell_selection",
+                artifactId="c" * 64,
+            ),
             nativeAnalyses=[NativeAnalysisHandoff.get_example()],
             graph=ArtifactReferenceModel(
                 assay="RNA", kind="connectivity_map", artifactId="2" * 64
             ),
+            embeddingInitialization=ArtifactReferenceModel(
+                assay="RNA",
+                kind="embedding_initialization",
+                artifactId="5" * 64,
+            ),
             clusters=ArtifactReferenceModel(
                 assay="RNA", kind="cluster_labels", artifactId="3" * 64
             ),
-            clusterColumn="RNA_agent_clusters",
         )
 
 
@@ -363,7 +378,6 @@ class AutomatedWorkflowRequest(AgentDataModel):
     markerAssay: str | None = None
     analysisAssays: list[str] = Field(default_factory=list)
     pairedAssays: list[str] = Field(default_factory=list)
-    resetCellSelection: bool | None = None
     ingestDirections: dict[str, Any] = Field(default_factory=dict)
     experimentalDirections: dict[str, Any] = Field(default_factory=dict)
 

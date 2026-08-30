@@ -72,6 +72,13 @@ class FinalizationStagesMixin:
             return existing, FinalAnalysisHandoff.model_validate(
                 existing.outputs["finalAnalysis"]
             )
+        if tuning_report.cellSelection is None:
+            raise ValueError("Parameter Tuning lacks an exact cell selection")
+        cell_selection = tuning_report.cellSelection
+        if any(value.cellSelection != cell_selection for value in preprocessed):
+            raise ValueError(
+                "Finalization inputs do not share the selected tuning cells"
+            )
         started = journal._start_attempt(
             store.zw,
             prefix,
@@ -84,14 +91,18 @@ class FinalizationStagesMixin:
                 "preprocessedAssays": [
                     value.model_dump(mode="json") for value in preprocessed
                 ],
-                "finalClusterColumn": tuning_report.finalClusterColumn,
+                "cellSelection": cell_selection.model_dump(mode="json"),
+                "finalClusters": (
+                    tuning_report.finalClusterArtifact.model_dump(mode="json")
+                    if tuning_report.finalClusterArtifact is not None
+                    else None
+                ),
             },
             resume_record=resume_record,
         )
-        artifacts: dict[str, ArtifactReferenceModel] = {}
+        artifacts: dict[str, ArtifactReferenceModel] = {"cellSelection": cell_selection}
         actions: list[str] = []
         operations: list[dict[str, Any]] = []
-        metadata_columns: list[str] = []
         logger.info(
             f"Workflow {workflow.workflowRunId}: finalizing "
             f"{len(preprocessed)} native analysis route(s) and markers from "
@@ -101,7 +112,6 @@ class FinalizationStagesMixin:
             if (
                 tuning_report.status != "done"
                 or tuning_report.finalClusterArtifact is None
-                or not tuning_report.finalClusterColumn
             ):
                 raise ValueError("Parameter Tuning has no finalized cluster branch")
             preprocessed_by_assay = {value.assay: value for value in preprocessed}
@@ -110,31 +120,29 @@ class FinalizationStagesMixin:
                 self.model,
                 config=request_record.config.agentRunConfig,
             )
-            token = workflow.workflowRunId[:12]
             native_handoffs, native_umaps = self.finalize_native_analyses(
                 store,
                 agent,
                 request_record,
                 tuning_report,
                 preprocessed_by_assay,
-                token,
                 artifacts,
                 actions,
                 operations,
-                metadata_columns,
             )
-            graph_method, final_graph, final_umap, final_umap_columns = (
-                self.finalize_selected_graph(
-                    store,
-                    plan,
-                    tuning_report,
-                    native_handoffs,
-                    native_umaps,
-                    token,
-                    actions,
-                    operations,
-                    metadata_columns,
-                )
+            (
+                graph_method,
+                final_graph,
+                final_initialization,
+                final_umap,
+            ) = self.finalize_selected_graph(
+                store,
+                plan,
+                tuning_report,
+                native_handoffs,
+                native_umaps,
+                actions,
+                operations,
             )
             final_clusters = ArtifactReferenceModel.model_validate(
                 tuning_report.finalClusterArtifact.model_dump()
@@ -144,11 +152,9 @@ class FinalizationStagesMixin:
                 raise ValueError("Marker assay lacks an exact feature panel")
             marker_plan = plan_by_assay[plan.markerAssay]
             marker_ref = store.run_marker_search(
+                artifact_model_to_ref(final_clusters),
                 from_assay=plan.markerAssay,
-                group_key=tuning_report.finalClusterColumn,
-                cell_key="I",
                 features=artifact_model_to_ref(marker_handoff.markerFeatures),
-                skip_save=False,
                 invalidate_cache=False,
                 log_transform=bool(
                     marker_plan.normalizationParameters.get("logTransform", False)
@@ -164,12 +170,12 @@ class FinalizationStagesMixin:
                 {
                     "final_graph": final_graph,
                     "final_clusters": final_clusters,
+                    "final_embedding_initialization": final_initialization,
                     "final_umap": final_umap,
                     "marker_features": marker_handoff.markerFeatures,
                     "markers": marker_model,
                 }
             )
-            metadata_columns.append(tuning_report.finalClusterColumn)
             limitations = list(
                 dict.fromkeys([*plan.limitations, *tuning_report.limitations])
             )
@@ -182,14 +188,13 @@ class FinalizationStagesMixin:
                 workflowRunId=workflow.workflowRunId,
                 primaryAssay=plan.primaryAssay,
                 markerAssay=plan.markerAssay,
-                cellKey="I",
+                cellSelection=cell_selection,
                 nativeAnalyses=native_handoffs,
                 graph=final_graph,
                 graphMethod=graph_method,
                 clusters=final_clusters,
-                clusterColumn=tuning_report.finalClusterColumn,
+                embeddingInitialization=final_initialization,
                 umap=final_umap,
-                umapColumns=final_umap_columns,
                 markerFeatures=marker_handoff.markerFeatures,
                 markers=marker_model,
                 parameterReport=tuning_reference,
@@ -200,10 +205,9 @@ class FinalizationStagesMixin:
                 {
                     "operation": "run_marker_search",
                     "assay": plan.markerAssay,
-                    "groupKey": tuning_report.finalClusterColumn,
-                    "cellKey": "I",
+                    "clusters": final_clusters.model_dump(mode="json"),
+                    "cellSelection": cell_selection.model_dump(mode="json"),
                     "features": marker_handoff.markerFeatures.model_dump(mode="json"),
-                    "skipSave": False,
                     "invalidateCache": False,
                     "logTransform": bool(
                         marker_plan.normalizationParameters.get("logTransform", False)
@@ -222,7 +226,6 @@ class FinalizationStagesMixin:
                 artifacts=artifacts,
                 outputs={
                     "finalAnalysis": final_analysis.model_dump(mode="json"),
-                    "metadataColumns": list(dict.fromkeys(metadata_columns)),
                     "operations": operations,
                 },
                 actions=actions,
@@ -245,7 +248,6 @@ class FinalizationStagesMixin:
                 artifacts=artifacts,
                 actions=actions,
                 outputs={
-                    "metadataColumns": list(dict.fromkeys(metadata_columns)),
                     "operations": operations,
                 },
             )
@@ -258,17 +260,21 @@ class FinalizationStagesMixin:
         request_record: OrchestrationRequestRecord,
         tuning_report: ParameterTuningReport,
         preprocessed_by_assay: Mapping[str, PreprocessedAssayHandoff],
-        token: str,
         artifacts: dict[str, ArtifactReferenceModel],
         actions: list[str],
         operations: list[dict[str, Any]],
-        metadata_columns: list[str],
     ) -> tuple[
         list[NativeAnalysisHandoff],
-        dict[str, tuple[ArtifactReferenceModel, list[str]]],
+        dict[
+            str,
+            tuple[ArtifactReferenceModel, ArtifactReferenceModel],
+        ],
     ]:
         native_handoffs: list[NativeAnalysisHandoff] = []
-        native_umaps: dict[str, tuple[ArtifactReferenceModel, list[str]]] = {}
+        native_umaps: dict[
+            str,
+            tuple[ArtifactReferenceModel, ArtifactReferenceModel],
+        ] = {}
         for assay, assay_report in tuning_report.assayReports.items():
             logger.info(
                 f"Finalizing native analysis for assay {assay!r} with candidate "
@@ -276,8 +282,11 @@ class FinalizationStagesMixin:
             )
             preprocessed_assay = preprocessed_by_assay[assay]
             normalized = preprocessed_assay.normalized
-            if normalized is None:
-                raise ValueError(f"Assay {assay!r} lacks normalization")
+            if normalized is None or preprocessed_assay.cellSelection is None:
+                raise ValueError(
+                    f"Assay {assay!r} lacks normalization or cell selection"
+                )
+            native_selection = preprocessed_assay.cellSelection.model_dump(mode="json")
             promoted = agent.promote(
                 store,
                 report=assay_report,
@@ -291,33 +300,21 @@ class FinalizationStagesMixin:
             )
             initialization_ref = store.build_embedding_initialization(
                 reduction_ref,
-                from_assay=assay,
                 n_centroids=min(1000, preprocessed_assay.nCells),
                 rand_state=4466,
-                update_state=True,
                 invalidate_cache=False,
             )
             graph_record = promoted.artifacts["connectivityMap"]
             graph_ref = artifact_model_to_ref(
                 ArtifactReferenceModel.model_validate(graph_record.model_dump())
             )
-            umap_label = (
-                f"agent_{token}_{journal._safe_label(assay).lower()}_native_umap"
-            )
             umap_ref = store.run_umap(
                 graph_ref,
-                from_assay=assay,
-                cell_key="I",
-                label=umap_label,
+                initialization_ref,
                 parallel=False,
                 random_seed=4444,
                 invalidate_cache=False,
             )
-            umap_columns = [
-                f"{assay}_{umap_label}1",
-                f"{assay}_{umap_label}2",
-            ]
-            metadata_columns.extend([*umap_columns, cast(str, promoted.clusterColumn)])
             promoted_artifacts = {
                 name: ArtifactReferenceModel.model_validate(value.model_dump())
                 for name, value in promoted.artifacts.items()
@@ -326,7 +323,7 @@ class FinalizationStagesMixin:
             initialization_model = ArtifactReferenceModel.from_artifact_ref(
                 initialization_ref
             )
-            native_umaps[assay] = (umap_model, umap_columns)
+            native_umaps[assay] = (initialization_model, umap_model)
             operations.extend(
                 [
                     {
@@ -334,10 +331,10 @@ class FinalizationStagesMixin:
                         "assay": assay,
                         "candidate": promoted.parameters.model_dump(mode="json"),
                         "normalized": normalized.model_dump(mode="json"),
+                        "cellSelection": native_selection,
                         "identityFeatureLimit": (
                             request_record.config.maxIdentityFeatures
                         ),
-                        "updateState": True,
                         "artifacts": {
                             name: value.model_dump(mode="json")
                             for name, value in promoted_artifacts.items()
@@ -349,9 +346,9 @@ class FinalizationStagesMixin:
                         "reduction": ArtifactReferenceModel.model_validate(
                             reduction_record.model_dump()
                         ).model_dump(mode="json"),
+                        "cellSelection": native_selection,
                         "nCentroids": min(1000, preprocessed_assay.nCells),
                         "randomSeed": 4466,
-                        "updateState": True,
                         "invalidateCache": False,
                         "artifact": initialization_model.model_dump(mode="json"),
                     },
@@ -361,8 +358,8 @@ class FinalizationStagesMixin:
                         "graph": promoted_artifacts["connectivityMap"].model_dump(
                             mode="json"
                         ),
-                        "cellKey": "I",
-                        "label": umap_label,
+                        "initialization": initialization_model.model_dump(mode="json"),
+                        "cellSelection": native_selection,
                         "parallel": False,
                         "randomSeed": 4444,
                         "invalidateCache": False,
@@ -386,9 +383,7 @@ class FinalizationStagesMixin:
                     neighbors=promoted_artifacts["neighbors"],
                     graph=promoted_artifacts["connectivityMap"],
                     clusters=promoted_artifacts["clusters"],
-                    clusterColumn=cast(str, promoted.clusterColumn),
                     umap=umap_model,
-                    umapColumns=umap_columns,
                 )
             )
             artifacts.update(
@@ -411,17 +406,21 @@ class FinalizationStagesMixin:
         plan: AutomatedPreprocessingPlan,
         tuning_report: ParameterTuningReport,
         native_handoffs: Sequence[NativeAnalysisHandoff],
-        native_umaps: Mapping[str, tuple[ArtifactReferenceModel, list[str]]],
-        token: str,
+        native_umaps: Mapping[
+            str,
+            tuple[ArtifactReferenceModel, ArtifactReferenceModel],
+        ],
         actions: list[str],
         operations: list[dict[str, Any]],
-        metadata_columns: list[str],
     ) -> tuple[
         Literal["native", "snn", "wnn"],
         ArtifactReferenceModel,
         ArtifactReferenceModel,
-        list[str],
+        ArtifactReferenceModel,
     ]:
+        if tuning_report.cellSelection is None:
+            raise ValueError("Final graph selection lacks an exact cell selection")
+        final_cell_selection = tuning_report.cellSelection.model_dump(mode="json")
         if tuning_report.recommendedIntegrationId is not None:
             selected_integration = next(
                 value
@@ -439,50 +438,48 @@ class FinalizationStagesMixin:
                 f"{selected_integration.integrationId!r}"
             )
             graph_ref = artifact_model_to_ref(final_graph)
-            graph_label = f"agent_{token}_{graph_method}"
-            umap_label = f"agent_{token}_{graph_method}_final_umap"
+            primary_native = next(
+                value for value in native_handoffs if value.assay == plan.primaryAssay
+            )
+            if primary_native.embeddingInitialization is None:
+                raise ValueError(
+                    "Primary native analysis lacks embedding initialization"
+                )
+            final_initialization = primary_native.embeddingInitialization
             umap_ref = store.run_umap(
                 graph_ref,
-                from_assay=plan.primaryAssay,
-                cell_key="I",
-                label=umap_label,
+                artifact_model_to_ref(final_initialization),
                 parallel=False,
                 random_seed=4444,
                 invalidate_cache=False,
             )
             final_umap = ArtifactReferenceModel.from_artifact_ref(umap_ref)
-            final_umap_columns = [
-                f"{graph_label}_{umap_label}1",
-                f"{graph_label}_{umap_label}2",
-            ]
-            metadata_columns.extend(final_umap_columns)
             actions.append(f"run_final_umap:{graph_method}")
             operations.append(
                 {
                     "operation": "run_umap",
                     "graphMethod": graph_method,
                     "graph": final_graph.model_dump(mode="json"),
-                    "fromAssay": plan.primaryAssay,
-                    "cellKey": "I",
-                    "label": umap_label,
+                    "initialization": final_initialization.model_dump(mode="json"),
+                    "cellSelection": final_cell_selection,
                     "parallel": False,
                     "randomSeed": 4444,
                     "invalidateCache": False,
                     "artifact": final_umap.model_dump(mode="json"),
                 }
             )
-            return graph_method, final_graph, final_umap, final_umap_columns
+            return graph_method, final_graph, final_initialization, final_umap
         graph_assay = tuning_report.graphAssay
         if graph_assay is None:
             raise ValueError("Native final selection lacks graphAssay")
         native = next(value for value in native_handoffs if value.assay == graph_assay)
         if native.graph is None:
             raise ValueError("Native final selection lacks graph artifact")
-        final_umap, final_umap_columns = native_umaps[graph_assay]
+        final_initialization, final_umap = native_umaps[graph_assay]
         logger.info(
             f"Reusing native graph and UMAP from assay {graph_assay!r} as final"
         )
-        return "native", native.graph, final_umap, final_umap_columns
+        return "native", native.graph, final_initialization, final_umap
 
     def biological_interpretation_stage(
         self,
@@ -528,6 +525,8 @@ class FinalizationStagesMixin:
             f"Workflow {workflow.workflowRunId}: Biological Interpretation has "
             f"{len(coefficients)} validated coefficient option(s)"
         )
+        if final_analysis.cellSelection is None:
+            raise ValueError("Final analysis lacks an exact cell selection")
         started = journal._start_attempt(
             store.zw,
             prefix,
@@ -544,6 +543,7 @@ class FinalizationStagesMixin:
                     mode="json"
                 ),
                 "finalAnalysis": final_analysis.model_dump(mode="json"),
+                "cellSelection": final_analysis.cellSelection.model_dump(mode="json"),
                 "primaryCoefficient": requested_coefficient,
                 "biologicalInterpretation": answers.get("biologicalInterpretation"),
             },
@@ -557,6 +557,7 @@ class FinalizationStagesMixin:
             outcome = journal._complete_attempt(
                 started,
                 status="needsInput",
+                artifacts={"cellSelection": final_analysis.cellSelection},
                 needs_input=WorkflowNeedsInput(
                     questions=[
                         WorkflowQuestion(
@@ -582,8 +583,12 @@ class FinalizationStagesMixin:
             if coefficients:
                 experimental_handoff = experimental.to_biological_handoff(
                     requested_coefficient
-                )
+                ).model_copy(update={"cellSelection": final_analysis.cellSelection})
             tuning_handoff = tuning_report.to_biological_handoff()
+            if tuning_handoff.cellSelection != final_analysis.cellSelection:
+                raise ValueError(
+                    "Biological handoffs do not share the final cell selection"
+                )
             marker_policy = next(
                 (
                     value
@@ -662,10 +667,8 @@ class FinalizationStagesMixin:
                 )
                 report = agent.run(
                     store,
-                    cluster_column=final_analysis.clusterColumn,
                     cluster=artifact_model_to_ref(final_analysis.clusters),
                     biological_context=biological_context,
-                    cell_key=final_analysis.cellKey,
                     from_assay=final_analysis.markerAssay,
                     graph_assay=tuning_handoff.graphAssay,
                     marker_assay_type=(
@@ -718,9 +721,10 @@ class FinalizationStagesMixin:
                             "biologicalContext": biological_context.model_dump(
                                 mode="json"
                             ),
-                            "clusterColumn": final_analysis.clusterColumn,
-                            "cellKey": final_analysis.cellKey,
-                            "fromAssay": final_analysis.markerAssay,
+                            "cellSelection": (
+                                final_analysis.cellSelection.model_dump(mode="json")
+                            ),
+                            "markerAssay": final_analysis.markerAssay,
                             "graphAssay": tuning_handoff.graphAssay,
                             "markerAssayType": (
                                 marker_policy.assayModality
@@ -734,6 +738,7 @@ class FinalizationStagesMixin:
                             ),
                         },
                         artifacts={
+                            "cellSelection": final_analysis.cellSelection,
                             "clusters": final_analysis.clusters,
                             "markers": final_analysis.markers,
                             "markerFeatures": final_analysis.markerFeatures,
@@ -759,6 +764,7 @@ class FinalizationStagesMixin:
                     status="needsInput",
                     report_references=[reference],
                     artifacts={
+                        "cellSelection": final_analysis.cellSelection,
                         "clusters": final_analysis.clusters,
                         "markers": final_analysis.markers,
                     },
@@ -780,6 +786,11 @@ class FinalizationStagesMixin:
                     started,
                     status="failed",
                     report_references=[reference],
+                    artifacts={
+                        "cellSelection": final_analysis.cellSelection,
+                        "clusters": final_analysis.clusters,
+                        "markers": final_analysis.markers,
+                    },
                     actions=recovery_actions,
                     error="; ".join(report.limitations)
                     or "Biological Interpretation failed",
@@ -790,6 +801,7 @@ class FinalizationStagesMixin:
                     status="done",
                     report_references=[reference],
                     artifacts={
+                        "cellSelection": final_analysis.cellSelection,
                         "clusters": final_analysis.clusters,
                         "markers": final_analysis.markers,
                     },
@@ -811,4 +823,11 @@ class FinalizationStagesMixin:
                 )
             return outcome
         except Exception as exc:
-            return journal.finish_exception(store, prefix, workflow, started, exc)
+            return journal.finish_exception(
+                store,
+                prefix,
+                workflow,
+                started,
+                exc,
+                artifacts={"cellSelection": final_analysis.cellSelection},
+            )

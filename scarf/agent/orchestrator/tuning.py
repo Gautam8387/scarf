@@ -105,7 +105,14 @@ class TuningStagesMixin:
                 and candidate_report.assayReports
             ):
                 resumable_report = candidate_report
-        experimental_handoff = experimental.to_parameter_tuning_handoff()
+        cell_selection = preprocessed[0].cellSelection if preprocessed else None
+        if cell_selection is None or any(
+            value.cellSelection != cell_selection for value in preprocessed
+        ):
+            raise ValueError("Preprocessed assays must share one exact cell selection")
+        experimental_handoff = experimental.to_parameter_tuning_handoff().model_copy(
+            update={"cellSelection": cell_selection}
+        )
         tuning_answer = answers.get("parameter_tuning")
         if isinstance(tuning_answer, Mapping):
             tuning_directions = json.dumps(
@@ -130,6 +137,7 @@ class TuningStagesMixin:
                 "experimentalTuningHandoff": experimental_handoff.model_dump(
                     mode="json"
                 ),
+                "cellSelection": cell_selection.model_dump(mode="json"),
                 "primaryAssay": plan.primaryAssay,
                 "markerAssay": plan.markerAssay,
                 "pairedAssays": plan.pairedAssays,
@@ -306,8 +314,6 @@ class TuningStagesMixin:
                 assay_inputs.append(
                     ParameterTuningAssayInput(
                         normalized=artifact_model_to_ref(handoff.normalized),
-                        fromAssay=handoff.assay,
-                        cellKey=handoff.cellKey,
                         candidates=candidates,
                         batchColumns=(
                             list(experimental_handoff.batchColumns)
@@ -421,7 +427,9 @@ class TuningStagesMixin:
                 actions,
             )
         except Exception as exc:
-            failure_artifacts: dict[str, ArtifactReferenceModel] = {}
+            failure_artifacts: dict[str, ArtifactReferenceModel] = {
+                "cellSelection": cell_selection
+            }
             for assay, assay_report in report.assayReports.items():
                 for evaluation in assay_report.evaluations:
                     for name, artifact in evaluation.artifacts.items():
@@ -541,11 +549,15 @@ class TuningStagesMixin:
         prior_tuning_reference: AgentReportReference | None = None,
         persisted_reference: AgentReportReference | None = None,
     ) -> tuple[WorkflowStageAttempt, ParameterTuningReport]:
-        invocation_artifacts = {
-            f"{value.assay}_normalized": value.normalized
-            for value in preprocessed
-            if value.normalized is not None
-        }
+        if experimental_handoff.cellSelection is None:
+            raise ValueError("Parameter tuning handoff lacks an exact cell selection")
+        if report.cellSelection != experimental_handoff.cellSelection:
+            raise ValueError("Parameter tuning report uses a different cell selection")
+        invocation_artifacts: dict[str, ArtifactReferenceModel] = {}
+        for value in preprocessed:
+            if value.normalized is not None:
+                invocation_artifacts[f"{value.assay}_normalized"] = value.normalized
+        invocation_artifacts["cellSelection"] = experimental_handoff.cellSelection
         for integration_evaluation in integration_evaluations:
             if integration_evaluation.graphArtifact is not None:
                 invocation_artifacts[
@@ -568,6 +580,24 @@ class TuningStagesMixin:
         if report.finalClusterArtifact is not None:
             stage_artifacts["final_clusters"] = ArtifactReferenceModel.model_validate(
                 report.finalClusterArtifact.model_dump()
+            )
+        if report.recommendedIntegrationId is not None:
+            selected_integration = next(
+                value
+                for value in integration_evaluations
+                if value.integrationId == report.recommendedIntegrationId
+            )
+            if selected_integration.graphArtifact is not None:
+                stage_artifacts["final_graph"] = ArtifactReferenceModel.model_validate(
+                    selected_integration.graphArtifact.model_dump()
+                )
+        elif report.graphAssay is not None:
+            assay_reports = report.assayReports or {report.fromAssay: report}
+            graph_artifact = assay_reports[report.graphAssay].selectedArtifacts[
+                "connectivityMap"
+            ]
+            stage_artifacts["final_graph"] = ArtifactReferenceModel.model_validate(
+                graph_artifact.model_dump()
             )
         checkpoint_ids = {
             f"{journal._stage_execution_id(started)}_integration_{method}"
@@ -610,6 +640,11 @@ class TuningStagesMixin:
                         "primaryAssay": plan.primaryAssay,
                         "markerAssay": plan.markerAssay,
                         "pairedAssays": list(paired),
+                        "cellSelection": (
+                            experimental_handoff.cellSelection.model_dump(mode="json")
+                            if experimental_handoff.cellSelection is not None
+                            else None
+                        ),
                         "maxCandidateBranches": request_record.config.maxCandidateBranches,
                     },
                     artifacts=stage_artifacts,
@@ -633,10 +668,12 @@ class TuningStagesMixin:
                             mode="json"
                         ),
                         "phase": candidate_evaluation.phase,
+                        "cellSelection": (
+                            experimental_handoff.cellSelection.model_dump(mode="json")
+                        ),
                         "harmonyBatchColumns": list(
                             candidate_evaluation.harmonyBatchColumns
                         ),
-                        "updateState": False,
                         "identityFeatureLimit": (
                             request_record.config.maxIdentityFeatures
                         ),
@@ -647,27 +684,43 @@ class TuningStagesMixin:
                         },
                     }
                 )
-        token = workflow.workflowRunId[:12]
         seen_integrated_graphs: set[tuple[str, str]] = set()
         for integration_evaluation in integration_evaluations:
-            graph_artifact = integration_evaluation.graphArtifact
-            graph_id = graph_artifact.artifactId if graph_artifact is not None else ""
+            integration_graph = integration_evaluation.graphArtifact
+            graph_id = (
+                integration_graph.artifactId if integration_graph is not None else ""
+            )
             graph_key = (integration_evaluation.method, graph_id)
             if graph_id and graph_key not in seen_integrated_graphs:
-                assert graph_artifact is not None
+                assert integration_graph is not None
                 seen_integrated_graphs.add(graph_key)
+                source_key = (
+                    "connectivityMap"
+                    if integration_evaluation.method == "snn"
+                    else "neighbors"
+                )
+                source_artifacts = []
+                for assay in integration_evaluation.assays:
+                    assay_report = report.assayReports[assay]
+                    selected = next(
+                        value
+                        for value in assay_report.evaluations
+                        if value.candidateId == assay_report.recommendedCandidateId
+                    )
+                    source_artifacts.append(
+                        selected.artifacts[source_key].model_dump(mode="json")
+                    )
                 operations.append(
                     {
                         "operation": "integrate_assays",
                         "method": integration_evaluation.method,
-                        "assays": list(integration_evaluation.assays),
-                        "label": f"agent_{token}_{integration_evaluation.method}",
+                        "sources": source_artifacts,
                         "invalidateCache": True,
                         "l2Normalize": True,
-                        "artifact": graph_artifact.model_dump(mode="json"),
+                        "artifact": integration_graph.model_dump(mode="json"),
                     }
                 )
-            if graph_artifact is None:
+            if integration_graph is None:
                 continue
             operations.append(
                 {
@@ -675,18 +728,15 @@ class TuningStagesMixin:
                     "integrationId": integration_evaluation.integrationId,
                     "status": integration_evaluation.status,
                     "resolution": integration_evaluation.resolution,
-                    "fromAssay": plan.primaryAssay,
-                    "cellKey": "I",
+                    "graph": integration_graph.model_dump(mode="json"),
+                    "cellSelection": (
+                        integration_evaluation.cellSelection.model_dump(mode="json")
+                        if integration_evaluation.cellSelection is not None
+                        else None
+                    ),
                     "backend": "igraph",
                     "symmetricGraph": False,
                     "graphUpperOnly": False,
-                    "label": (
-                        integration_evaluation.clusterColumn.removeprefix(
-                            f"agent_{token}_{integration_evaluation.method}_"
-                        )
-                        if integration_evaluation.clusterColumn is not None
-                        else None
-                    ),
                     "randomSeed": 4444,
                     "invalidateCache": False,
                     "artifact": (
@@ -749,12 +799,6 @@ class TuningStagesMixin:
                     "candidateCount": report.totalCandidates,
                     "recommendedByAssay": report.recommendedByAssay,
                     "recommendedIntegrationId": report.recommendedIntegrationId,
-                    "finalClusterColumn": report.finalClusterColumn,
-                    "metadataColumns": [
-                        evaluation.clusterColumn
-                        for evaluation in integration_evaluations
-                        if evaluation.clusterColumn is not None
-                    ],
                     "operations": operations,
                 },
                 actions=actions,
@@ -932,6 +976,16 @@ class TuningStagesMixin:
             }
         )
         artifacts: dict[str, ArtifactReferenceModel] = {}
+        cell_selection = next(
+            (
+                evaluation.cellSelection
+                for evaluation in evaluations
+                if evaluation.cellSelection is not None
+            ),
+            None,
+        )
+        if cell_selection is not None:
+            artifacts["cellSelection"] = cell_selection
         for evaluation in evaluations:
             if evaluation.graphArtifact is not None:
                 artifacts[f"{evaluation.integrationId}_graph"] = (
@@ -952,6 +1006,11 @@ class TuningStagesMixin:
                 "orchestrationExecutionId": checkpoint_id,
                 "stageExecutionId": journal._stage_execution_id(started),
                 "method": method,
+                "cellSelection": (
+                    cell_selection.model_dump(mode="json")
+                    if cell_selection is not None
+                    else None
+                ),
             },
             artifacts=artifacts,
         )
@@ -1018,6 +1077,9 @@ class TuningStagesMixin:
             f"Evaluating SNN and WNN across {len(resolutions)} resolution(s) "
             f"for {len(assays)} paired assay(s)"
         )
+        if report.cellSelection is None:
+            raise ValueError("Parameter tuning report lacks an exact cell selection")
+        cell_selection = report.cellSelection
         native_labels: dict[str, np.ndarray[Any, Any]] = {}
         for assay, assay_report in report.assayReports.items():
             if assay not in assays:
@@ -1045,10 +1107,10 @@ class TuningStagesMixin:
                     assays,
                     resolutions,
                     native_labels,
-                    plan,
                     report,
                     experimental_handoff,
                     config,
+                    cell_selection,
                     started=started,
                     parent_reports=parent_reports,
                     actions=actions,
@@ -1064,10 +1126,10 @@ class TuningStagesMixin:
         assays: list[str],
         resolutions: Sequence[float],
         native_labels: Mapping[str, np.ndarray[Any, Any]],
-        plan: AutomatedPreprocessingPlan,
         report: ParameterTuningReport,
         experimental_handoff: ExperimentalTuningHandoff,
         config: AutomatedWorkflowConfig,
+        cell_selection: ArtifactReferenceModel,
         *,
         started: WorkflowStageAttempt | None,
         parent_reports: Sequence[AgentReportLink],
@@ -1084,11 +1146,22 @@ class TuningStagesMixin:
             f"{len(resolutions)} resolution(s)"
         )
         evaluations: list[IntegrationCandidateEvaluation] = []
-        graph_label = f"agent_{token}_{method}"
+        source_key = "connectivityMap" if method == "snn" else "neighbors"
+        sources = []
+        for assay in assays:
+            assay_report = report.assayReports[assay]
+            selected = next(
+                value
+                for value in assay_report.evaluations
+                if value.candidateId == assay_report.recommendedCandidateId
+            )
+            source_model = ArtifactReferenceModel.model_validate(
+                selected.artifacts[source_key].model_dump()
+            )
+            sources.append(artifact_model_to_ref(source_model))
         try:
             graph_ref = store.integrate_assays(
-                assays,
-                graph_label,
+                sources,
                 method=method,
                 invalidate_cache=True,
                 l2_normalize=True,
@@ -1117,6 +1190,7 @@ class TuningStagesMixin:
                         method=cast(Any, method),
                         assays=assays,
                         status="failed",
+                        cellSelection=cell_selection,
                         resolution=resolution,
                         error=f"{type(exc).__name__}: {exc}",
                     )
@@ -1135,23 +1209,18 @@ class TuningStagesMixin:
             return evaluations
         for index, resolution in enumerate(resolutions):
             integration_id = f"{method}_{token}_{index}"
-            cluster_label = f"agent_{token}_{method}_r_{index}"
             warnings: list[str] = []
             evidence_ids = [f"integration:{integration_id}:clusters"]
             try:
                 cluster_ref = store.run_leiden_clustering(
-                    graph=graph_ref,
-                    from_assay=plan.primaryAssay,
-                    cell_key="I",
+                    graph_ref,
                     resolution=resolution,
                     backend="igraph",
                     symmetric_graph=False,
                     graph_upper_only=False,
-                    label=cluster_label,
                     random_seed=4444,
                     invalidate_cache=False,
                 )
-                cluster_column = f"{graph_label}_{cluster_label}"
                 cluster_group = store.load_artifact(cluster_ref)
                 cluster_values = cast(Any, cluster_group["values"])
                 values = np.asarray(cluster_values[:])
@@ -1180,9 +1249,7 @@ class TuningStagesMixin:
                         value = float(
                             store.metric_graph_connectivity(
                                 column,
-                                graph=graph_ref,
-                                from_assay=plan.primaryAssay,
-                                cell_key="I",
+                                graph_ref,
                             )
                         )
                         if np.isfinite(value):
@@ -1222,10 +1289,10 @@ class TuningStagesMixin:
                         assays=assays,
                         status="done",
                         eligible=not reasons,
+                        cellSelection=cell_selection,
                         resolution=resolution,
                         graphArtifact=ArtifactRecord.from_ref(graph_ref),
                         clusterArtifact=ArtifactRecord.from_ref(cluster_ref),
-                        clusterColumn=cluster_column,
                         metrics=metrics,
                         evidenceIds=evidence_ids,
                         eligibilityReasons=reasons,
@@ -1239,6 +1306,7 @@ class TuningStagesMixin:
                         method=cast(Any, method),
                         assays=assays,
                         status="failed",
+                        cellSelection=cell_selection,
                         resolution=resolution,
                         graphArtifact=ArtifactRecord.from_ref(graph_ref),
                         evidenceIds=evidence_ids,

@@ -30,6 +30,7 @@ from scarf.agent.data_enrichment import (
 from scarf.agent.experimental_context import (
     BatchCorrectionPlan,
     CellQcPlan,
+    CovariateEvidence,
     ExperimentalContextDecision,
 )
 from scarf.agent.orchestrator import (
@@ -47,6 +48,7 @@ from scarf.agent.orchestrator import (
     WorkflowQuestion,
     WorkflowStageAttempt,
     WorkflowStageLink,
+    artifact_model_to_ref,
 )
 from scarf.agent.persistence import (
     load_agent_record,
@@ -56,6 +58,7 @@ from scarf.agent.parameter_tuning import (
     FinalGraphSelection,
     ParameterTuningReport,
 )
+from scarf.datastore.datastore import DataStore
 from tests.test_agent_ingest import _write_h5ad
 
 
@@ -172,8 +175,17 @@ def _rna_workflow_model() -> tuple[FunctionModel, dict[str, int]]:
                     ]
                 )
             state["context"] = 3
-            profile_id = "cellQc:RNA:RNA:I:skip"
-            evidence_id = f"qcProfile:{profile_id}"
+            context_evidence = tool_result(
+                messages,
+                "analyze_experimental_design",
+                CovariateEvidence,
+            )
+            profile = next(
+                value
+                for value in context_evidence.qcProfiles
+                if value.action == "globalGaussian"
+            )
+            evidence_id = profile.evidenceId
             decision = ExperimentalContextDecision(
                 batchCorrection=BatchCorrectionPlan(
                     action="skip",
@@ -181,12 +193,13 @@ def _rna_workflow_model() -> tuple[FunctionModel, dict[str, int]]:
                     evidenceIds=[evidence_id],
                 ),
                 cellQc=CellQcPlan(
-                    action="skip",
-                    profileId=profile_id,
-                    driverAssay="RNA",
-                    driverAssayType="RNA",
-                    cellKey="I",
-                    rationale="Keep every cell in this deterministic fixture.",
+                    action=profile.action,
+                    profileId=profile.profileId,
+                    driverAssay=profile.driverAssay,
+                    driverAssayType=profile.driverAssayType,
+                    attributes=profile.attributes,
+                    artifactMetrics=profile.artifactMetrics,
+                    rationale="Apply the bounded global RNA QC profile.",
                     evidenceIds=[evidence_id],
                 ),
                 rationale="No experimental covariates were supplied.",
@@ -361,6 +374,16 @@ def test_public_orchestrator_models_have_factories_and_camelcase_fields() -> Non
         assert isinstance(model.get_blank(), model)
         assert isinstance(model.get_example(), model)
         assert all("_" not in field_name for field_name in model.model_fields)
+    for model in (
+        AutomatedPreprocessingPlan,
+        PreprocessedAssayHandoff,
+        FinalAnalysisHandoff,
+    ):
+        assert "cellSelection" in model.model_fields
+        assert "cellKey" not in model.model_fields
+    for model in (NativeAnalysisHandoff, FinalAnalysisHandoff):
+        assert "clusterColumn" not in model.model_fields
+        assert "umapColumns" not in model.model_fields
 
 
 def test_orchestrator_package_preserves_the_public_facade() -> None:
@@ -466,14 +489,45 @@ def test_rna_h5ad_completes_public_automated_workflow(tmp_path: Path) -> None:
         "biological_interpretation",
     ]
     assert result.finalAnalysis is not None
+    assert result.preprocessingPlan is not None
     final = result.finalAnalysis
     assert final.graphMethod == "native"
     assert final.primaryAssay == final.markerAssay == "RNA"
     assert final.graph is not None
     assert final.clusters is not None
+    assert final.cellSelection is not None
+    assert final.embeddingInitialization is not None
+    assert final.umap is not None
     assert final.markers is not None
-    assert final.clusterColumn
-    assert len(final.umapColumns) == 2
+    assert final.cellSelection.kind == "cell_selection"
+    assert final.clusters.kind == "cluster_labels"
+    assert final.embeddingInitialization.kind == "embedding_initialization"
+    assert final.umap.kind == "embedding"
+    assert final.cellSelection != result.preprocessingPlan.cellSelection
+    persisted = DataStore(
+        str(target),
+        default_assay="RNA",
+        min_features_per_cell=-1,
+        mito_pattern="",
+        ribo_pattern="",
+        zarr_mode="r",
+    )
+    umap_inputs = persisted.inspect_artifact(artifact_model_to_ref(final.umap)).inputs
+    assert umap_inputs is not None
+    assert umap_inputs["graph"] == artifact_model_to_ref(final.graph).to_dict()
+    assert (
+        umap_inputs["initialization"]
+        == artifact_model_to_ref(final.embeddingInitialization).to_dict()
+    )
+    marker_inputs = persisted.inspect_artifact(
+        artifact_model_to_ref(final.markers)
+    ).inputs
+    assert marker_inputs is not None
+    assert marker_inputs["clusters"] == artifact_model_to_ref(final.clusters).to_dict()
+    assert (
+        marker_inputs["cell_selection"]
+        == artifact_model_to_ref(final.cellSelection).to_dict()
+    )
 
     biology_reference = next(
         reference
@@ -489,7 +543,9 @@ def test_rna_h5ad_completes_public_automated_workflow(tmp_path: Path) -> None:
     assert len(record.invocation.parentReports) == 3
     assert record.invocation.tuningBiologyHandoff is not None
     assert set(record.invocation.artifacts) == {
+        "cellSelection",
         "clusters",
         "markers",
         "markerFeatures",
     }
+    assert record.invocation.artifacts["cellSelection"] == final.cellSelection

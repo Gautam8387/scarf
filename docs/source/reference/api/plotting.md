@@ -3,9 +3,37 @@
 `scarf.plotting` is Scarf's plotting API.
 Import it as `splt` and call functions such as `splt.embedding(...)`, `splt.dotplot(...)`, and `splt.cluster_tree(...)`.
 For functions whose first argument is a datastore, `ds.plots.embedding(...)` and related accessor methods provide the same behavior with that argument already bound.
-Store-backed graph plotters mirror their `DataStore` counterparts: `graph=None` uses the current connectivity map and an explicit `graph=` pins a branch.
-Feature-consuming plotters require `features=` as a feature-selection label or reference.
+Store-backed graph plotters mirror their `DataStore` counterparts and require an exact `graph=`
+reference.
+Feature-consuming plotters require `features=` as a feature-selection ref.
 Diagnostics remain standalone: `qc` takes a DataFrame, `elbow` and `highly_variable_features` take arrays, and `graph_qc` takes a sparse graph.
+
+A completed {py:class}`~scarf.PipelineRun` can be passed to
+`ds.plots.embedding(run=run, layout="umap", color_by="clusters")`. The datastore accessor reads only
+frozen run cell fields and does not require live metadata columns. A string `color_by` names a
+frozen run field such as `clusters` or `doublet_score`. To color by another artifact or a gene, use
+the granular `layout=ArtifactRef` route with typed refs. There is no live fallback in run mode.
+`layout_key=` remains the live-metadata source. Mixed source modes are rejected. For large
+continuous fields, `ds.plots.embedding_raster(run=run, layout="umap",
+color_by="doublet_score")` uses the same frozen run selection blockwise.
+
+Granular workflows pass exact refs to the same datastore-owned plotting surface:
+
+| Plot | Explicit artifact inputs |
+|---|---|
+| embedding | `layout=embedding_ref`, optionally `color_by=cluster_ref` |
+| dot or matrix plot | `groups=cluster_ref` |
+| composition | `categories=cluster_ref` |
+| distribution | `grouping=cluster_ref` |
+| cluster connectivity | `graph=graph_ref`, `groups=cluster_ref`, `layout=embedding_ref` |
+| Paris hierarchy | `graph=graph_ref`, `clusters=paris_ref` |
+| marker heatmap | `marker=marker_ref` |
+| pseudotime heatmap | `aggregation=aggregation_ref` |
+| mapping score | `mapping_score(result_ref, reference=reference, layout=embedding_ref)` |
+
+`layout_key` and string forms on plotters that still accept them refer to deliberate live metadata
+inputs. Distribution grouping instead requires either an exact categorical artifact or an explicit
+`CellField`, with `cell_selection=` when a frozen metadata subset is intended.
 
 Store-backed plotters and diagnostics generally return a `PlotResult` and render by default with `show=True`.
 Pass `show=False` before accessing, saving, or reusing an owned figure.

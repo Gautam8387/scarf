@@ -192,11 +192,21 @@ def _invocation(
     values: dict[str, object] = {
         "agentName": agent_name,
         "parentReports": parents or [],
-        "inputs": {"fromAssay": "RNA", "cellKey": "I"},
+        "inputs": {"fromAssay": "RNA"},
         "artifacts": {"input": ArtifactReferenceModel.get_example()},
         "runConfig": AgentRunConfig.get_example(),
     }
     values.update(updates)
+    artifacts = dict(values["artifacts"])
+    for handoff_name in (
+        "experimentalTuningHandoff",
+        "experimentalBiologyHandoff",
+    ):
+        handoff = values.get(handoff_name)
+        selection = getattr(handoff, "cellSelection", None)
+        if isinstance(selection, ArtifactReferenceModel):
+            artifacts["cellSelection"] = selection
+    values["artifacts"] = artifacts
     return AgentInvocation.model_validate(values)
 
 
@@ -309,7 +319,7 @@ def test_reports_are_plain_json_under_metadata_only_zarr_group(
         record = load_agent_record(path, reference)
 
         assert reference.agentName == agent_name
-        assert record.invocation.inputs == {"fromAssay": "RNA", "cellKey": "I"}
+        assert record.invocation.inputs == {"fromAssay": "RNA"}
         assert record.invocation.runConfig == AgentRunConfig.get_example()
         assert load_agent_report(path, reference).model_dump(mode="json") == (
             report.model_dump(mode="json")
@@ -613,7 +623,7 @@ def test_typed_handoffs_must_match_their_cited_parent_reports(
             ),
             agent_run_id="missing-handoff",
         )
-    with pytest.raises(ValueError, match="does not match"):
+    with pytest.raises(ValueError, match="does not descend"):
         save_agent_report(
             path,
             "workflow-1",

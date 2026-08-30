@@ -99,7 +99,7 @@ class BatchSafetyEvidence(AgentDataModel):
 class ExperimentalTuningHandoff(AgentDataModel):
     """Validated Experimental Context inputs for Parameter Tuning."""
 
-    cellKey: str = "I"
+    cellSelection: ArtifactReferenceModel | None = None
     batchAction: BatchCorrectionAction = "needsInput"
     batchColumns: list[str] = Field(default_factory=list)
     preservationColumns: list[str] = Field(default_factory=list)
@@ -111,7 +111,7 @@ class ExperimentalTuningHandoff(AgentDataModel):
 class ExperimentalBiologyHandoff(AgentDataModel):
     """One explicitly selected experimental coefficient for interpretation."""
 
-    cellKey: str = "I"
+    cellSelection: ArtifactReferenceModel | None = None
     conditionColumn: str = ""
     observationUnit: str | None = None
     independentUnit: str | None = None
@@ -123,12 +123,11 @@ class ExperimentalBiologyHandoff(AgentDataModel):
 class TuningBiologyHandoff(AgentDataModel):
     """Exact selected clustering branch for Biological Interpretation."""
 
+    cellSelection: ArtifactReferenceModel | None = None
     fromAssay: str = ""
     graphAssay: str | None = None
     markerAssay: str | None = None
-    cellKey: str = "I"
     recommendedCandidateId: str = ""
-    clusterColumn: str = ""
     clusterArtifact: ArtifactReferenceModel | None = None
     evidenceIds: list[str] = Field(default_factory=list)
 
@@ -139,11 +138,16 @@ class TuningBiologyHandoff(AgentDataModel):
     @classmethod
     def get_example(cls) -> "TuningBiologyHandoff":
         return cls(
+            cellSelection=ArtifactReferenceModel(
+                scope="datastore",
+                assay=None,
+                kind="cell_selection",
+                artifactId="c" * 64,
+            ),
             fromAssay="RNA",
             graphAssay="RNA",
             markerAssay="RNA",
             recommendedCandidateId="baseline",
-            clusterColumn="RNA_agent_tuning_baseline",
             clusterArtifact=ArtifactReferenceModel(
                 assay="RNA",
                 kind="cluster_labels",

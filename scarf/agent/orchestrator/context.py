@@ -1,7 +1,10 @@
 """Ingest, enrichment, HTO, and experimental-context workflow stages."""
 
+import re
 from collections.abc import Mapping, Sequence
 from typing import Any, cast
+
+import numpy as np
 
 from ...datastore.datastore import DataStore
 from ...utils.logging import logger
@@ -13,6 +16,7 @@ from ..data_enrichment import (
 from ..experimental_context import (
     ExperimentalContextAgent,
     ExperimentalContextResult,
+    NamedArtifactSource,
 )
 from ..ingest import IngestResult
 from ..persistence import (
@@ -20,6 +24,7 @@ from ..persistence import (
     AgentReportReference,
     AgentWorkflowRun,
 )
+from ..types import ArtifactReferenceModel
 from . import journal
 from .models import (
     OrchestrationRequestRecord,
@@ -28,6 +33,7 @@ from .models import (
     WorkflowQuestion,
     WorkflowStageAttempt,
     WorkflowStageLink,
+    artifact_model_to_ref,
 )
 
 
@@ -35,6 +41,71 @@ class ContextStagesMixin:
     """Stages that establish study and experimental context."""
 
     model: Any
+
+    @staticmethod
+    def _experimental_context_artifacts(
+        cell_selection: ArtifactReferenceModel,
+        quality_metric_artifacts: Sequence[NamedArtifactSource],
+        hto_identity_artifacts: Sequence[NamedArtifactSource],
+    ) -> dict[str, ArtifactReferenceModel]:
+        artifacts = {"cellSelection": cell_selection}
+        for sources, expected_kind in (
+            (quality_metric_artifacts, "quality_metric"),
+            (hto_identity_artifacts, "hto_identity"),
+        ):
+            for source in sources:
+                if not isinstance(source, NamedArtifactSource):
+                    raise TypeError(
+                        "Experimental Context artifacts must be named sources"
+                    )
+                if source.artifact.kind != expected_kind:
+                    raise ValueError(
+                        f"Experimental Context source {source.name!r} must "
+                        f"reference a {expected_kind!r} artifact"
+                    )
+                if source.name in artifacts:
+                    raise ValueError(
+                        f"Duplicate Experimental Context artifact name {source.name!r}"
+                    )
+                artifacts[source.name] = source.artifact
+        return artifacts
+
+    @staticmethod
+    def _named_stage_artifacts(
+        outcome: WorkflowStageAttempt,
+        output_name: str,
+        expected_kind: str,
+    ) -> list[NamedArtifactSource]:
+        raw_sources = outcome.outputs.get(output_name)
+        if not isinstance(raw_sources, list):
+            raise ValueError(f"{output_name} must be a list of named artifacts")
+        sources = [
+            NamedArtifactSource.model_validate(raw_source) for raw_source in raw_sources
+        ]
+        named_artifacts: dict[str, ArtifactReferenceModel] = {}
+        for source in sources:
+            if source.name in named_artifacts:
+                raise ValueError(f"{output_name} artifact names must be unique")
+            if source.artifact.kind != expected_kind:
+                raise ValueError(
+                    f"{output_name} must reference {expected_kind!r} artifacts"
+                )
+            if outcome.artifacts.get(source.name) != source.artifact:
+                raise ValueError(
+                    f"{output_name} artifact {source.name!r} is not persisted "
+                    "as a stage artifact"
+                )
+            named_artifacts[source.name] = source.artifact
+        persisted_artifacts = {
+            name: artifact
+            for name, artifact in outcome.artifacts.items()
+            if artifact.kind == expected_kind
+        }
+        if named_artifacts != persisted_artifacts:
+            raise ValueError(
+                f"{output_name} must name every persisted {expected_kind!r} artifact"
+            )
+        return sources
 
     def record_ingest_stage(
         self,
@@ -57,6 +128,8 @@ class ContextStagesMixin:
                 f"Workflow {workflow.workflowRunId}: reusing persisted ingest stage"
             )
             return existing
+        cell_selection = store.snapshot_cell_selection("I")
+        cell_selection_model = ArtifactReferenceModel.from_artifact_ref(cell_selection)
         started = journal._start_attempt(
             store.zw,
             prefix,
@@ -69,11 +142,13 @@ class ContextStagesMixin:
                 "zarrPath": ingest_result.zarrPath,
                 "format": ingest_result.format,
                 "acceptedActions": ingest_result.acceptedActions,
+                "sourceCellColumn": "I",
             },
         )
         outcome = journal._complete_attempt(
             started,
             status="done",
+            artifacts={"cellSelection": cell_selection_model},
             outputs={
                 "format": ingest_result.format,
                 "assayNames": ingest_result.assayNames,
@@ -84,8 +159,15 @@ class ContextStagesMixin:
                     else None
                 ),
                 "summary": ingest_result.summary,
+                "operations": [
+                    {
+                        "operation": "snapshot_cell_selection",
+                        "sourceColumn": "I",
+                        "artifact": cell_selection_model.model_dump(mode="json"),
+                    }
+                ],
             },
-            actions=ingest_result.actions,
+            actions=[*ingest_result.actions, "snapshot_cell_selection"],
             notes=ingest_result.notes,
         )
         journal._save_outcome(store.zw, prefix, outcome)
@@ -101,6 +183,7 @@ class ContextStagesMixin:
         workflow: AgentWorkflowRun,
         request_record: OrchestrationRequestRecord,
         parents: Sequence[WorkflowStageLink],
+        cell_selection: ArtifactReferenceModel,
         answers: Mapping[str, Any],
         *,
         resume_record: OrchestrationResumeRecord | None = None,
@@ -135,6 +218,7 @@ class ContextStagesMixin:
                 "data_enrichment",
                 parents,
                 f"Unknown requested assays: {unknown}",
+                artifacts={"cellSelection": cell_selection},
                 resume_record=resume_record,
             ), DataEnrichmentReport.get_blank()
         started = journal._start_attempt(
@@ -147,6 +231,7 @@ class ContextStagesMixin:
             inputs={
                 "studyContext": request.studyContext,
                 "assays": selected_assays,
+                "cellSelection": cell_selection.model_dump(mode="json"),
                 "allowDownload": request_record.config.allowDownloads,
                 "dataEnrichmentContext": answers.get("dataEnrichmentContext"),
             },
@@ -155,9 +240,6 @@ class ContextStagesMixin:
         actions: list[str] = []
         operations: list[dict[str, Any]] = []
         try:
-            reset_selection = self.should_reset_selection(
-                request_record, prefix, store, workflow
-            )
             context_payload: dict[str, Any] = {"studyContext": request.studyContext}
             supplied_context = answers.get("dataEnrichmentContext")
             if isinstance(supplied_context, Mapping):
@@ -171,25 +253,6 @@ class ContextStagesMixin:
                 agent_name="data_enrichment",
                 expected_type=DataEnrichmentReport,
             )
-            if reset_selection:
-                if recovered is None:
-                    store.filter_cells([], [], [], reset_previous=True)
-                logger.info(
-                    f"Workflow {workflow.workflowRunId}: reset the shared cell "
-                    "selection before agent-managed QC"
-                )
-                actions.append("reset_cell_selection")
-                operations.append(
-                    {
-                        "operation": "filter_cells",
-                        "attrs": [],
-                        "lows": [],
-                        "highs": [],
-                        "resetPrevious": True,
-                        "keepBounds": False,
-                        "invalidateCache": False,
-                    }
-                )
             if recovered is not None:
                 recovered_report, reference = recovered
                 report = cast(DataEnrichmentReport, recovered_report)
@@ -218,9 +281,11 @@ class ContextStagesMixin:
                         inputs={
                             "context": enrichment_context.model_dump(mode="json"),
                             "assays": selected_assays,
+                            "cellSelection": cell_selection.model_dump(mode="json"),
                             "cacheDir": request_record.config.cacheDir,
                             "allowDownload": request_record.config.allowDownloads,
                         },
+                        artifacts={"cellSelection": cell_selection},
                         runConfig=agent.config,
                     ),
                     expected_type=DataEnrichmentReport,
@@ -246,6 +311,7 @@ class ContextStagesMixin:
                     started,
                     status="needsInput",
                     report_references=[reference],
+                    artifacts={"cellSelection": cell_selection},
                     actions=actions,
                     outputs={"operations": operations},
                     needs_input=WorkflowNeedsInput(questions=questions),
@@ -256,6 +322,7 @@ class ContextStagesMixin:
                     started,
                     status="failed",
                     report_references=[reference],
+                    artifacts={"cellSelection": cell_selection},
                     actions=actions,
                     outputs={"operations": operations},
                     error="; ".join(report.limitations),
@@ -265,6 +332,7 @@ class ContextStagesMixin:
                     started,
                     status="done",
                     report_references=[reference],
+                    artifacts={"cellSelection": cell_selection},
                     actions=actions,
                     outputs={
                         "studyContextSummary": report.studyContextSummary.model_dump(
@@ -287,6 +355,7 @@ class ContextStagesMixin:
                 workflow,
                 started,
                 exc,
+                artifacts={"cellSelection": cell_selection},
                 actions=actions,
                 outputs={"operations": operations},
             )
@@ -299,6 +368,7 @@ class ContextStagesMixin:
         request_record: OrchestrationRequestRecord,
         parents: Sequence[WorkflowStageLink],
         enrichment: DataEnrichmentReport,
+        cell_selection: ArtifactReferenceModel,
         *,
         resume_record: OrchestrationResumeRecord | None = None,
     ) -> WorkflowStageAttempt:
@@ -312,10 +382,21 @@ class ContextStagesMixin:
             parents,
         )
         if existing is not None:
+            self._named_stage_artifacts(
+                existing,
+                "qualityMetricArtifacts",
+                "quality_metric",
+            )
+            self._named_stage_artifacts(
+                existing,
+                "htoIdentityArtifacts",
+                "hto_identity",
+            )
             logger.info(
                 f"Workflow {workflow.workflowRunId}: reusing HTO demultiplexing stage"
             )
             return existing
+        cell_selection_ref = artifact_model_to_ref(cell_selection)
         eligible_hto = sum(
             policy.assayModality == "HTO" and policy.demultiplexEligible
             for policy in enrichment.policies
@@ -332,20 +413,21 @@ class ContextStagesMixin:
             request_record,
             parents,
             inputs={
+                "cellSelection": cell_selection.model_dump(mode="json"),
                 "policies": [
                     value.model_dump(mode="json") for value in enrichment.policies
-                ]
+                ],
             },
             resume_record=resume_record,
         )
         actions: list[str] = []
         outputs: dict[str, Any] = {
-            "htoIdentityColumns": [],
+            "htoIdentityArtifacts": [],
+            "qualityMetricArtifacts": [],
             "operations": [],
         }
+        artifacts: dict[str, ArtifactReferenceModel] = {"cellSelection": cell_selection}
         try:
-            metadata_columns: list[str] = []
-            token = workflow.workflowRunId[:12]
             inspections = {value.assay: value for value in enrichment.inspections}
             for policy in enrichment.policies:
                 if policy.assayModality == "RNA":
@@ -360,75 +442,136 @@ class ContextStagesMixin:
                         else set()
                     )
                     assay = store.get_assay(policy.assay)
-                    if "mitochondrial" in observed_families:
-                        column = f"{policy.assay}_percentMito"
-                        if column not in store.cells.columns:
-                            assay.add_percent_feature(r"^(MT-|mt-)", column)
-                            actions.append(f"compute_percent_mito:{policy.assay}")
-                        if column in store.cells.columns:
-                            metadata_columns.append(column)
-                        cast(list[dict[str, Any]], outputs["operations"]).append(
-                            {
-                                "operation": "add_percent_feature",
-                                "assay": policy.assay,
-                                "pattern": r"^(MT-|mt-)",
-                                "column": column,
-                            }
+                    feature_ids = np.asarray(assay.feats.fetch_all("ids")).astype(str)
+                    feature_names = np.asarray(assay.feats.fetch_all("names")).astype(
+                        str
+                    )
+                    family_patterns = (
+                        (
+                            "mitochondrial",
+                            r"^(MT-|mt-)",
+                            "percentMito",
+                            "percent_mito",
+                        ),
+                        (
+                            "ribosomal",
+                            r"^(RPS|RPL|MRPS|MRPL|Rps|Rpl|Mrps|Mrpl)",
+                            "percentRibo",
+                            "percent_ribo",
+                        ),
+                    )
+                    for (
+                        family,
+                        pattern,
+                        artifact_suffix,
+                        action_suffix,
+                    ) in family_patterns:
+                        if family not in observed_families:
+                            continue
+                        compiled = re.compile(pattern)
+                        mask = np.fromiter(
+                            (
+                                compiled.search(feature_id) is not None
+                                or compiled.search(feature_name) is not None
+                                for feature_id, feature_name in zip(
+                                    feature_ids,
+                                    feature_names,
+                                    strict=True,
+                                )
+                            ),
+                            dtype=bool,
+                            count=assay.feats.N,
                         )
-                    if "ribosomal" in observed_families:
-                        column = f"{policy.assay}_percentRibo"
-                        pattern = r"^(RPS|RPL|MRPS|MRPL|Rps|Rpl|Mrps|Mrpl)"
-                        if column not in store.cells.columns:
-                            assay.add_percent_feature(pattern, column)
-                            actions.append(f"compute_percent_ribo:{policy.assay}")
-                        if column in store.cells.columns:
-                            metadata_columns.append(column)
+                        if not mask.any():
+                            continue
+                        features_ref = store.set_feature_selection(
+                            from_assay=policy.assay,
+                            mask=mask,
+                            invalidate_cache=False,
+                        )
+                        metric_ref = store.run_feature_percentage(
+                            cell_selection_ref,
+                            features_ref,
+                            invalidate_cache=False,
+                        )
+                        features_model = ArtifactReferenceModel.from_artifact_ref(
+                            features_ref
+                        )
+                        metric_model = ArtifactReferenceModel.from_artifact_ref(
+                            metric_ref
+                        )
+                        artifact_name = f"{policy.assay}_{artifact_suffix}"
+                        if artifact_name in artifacts:
+                            raise ValueError(
+                                f"Duplicate generated artifact name {artifact_name!r}"
+                            )
+                        source = NamedArtifactSource(
+                            name=artifact_name,
+                            artifact=metric_model,
+                        )
+                        artifacts[f"{artifact_name}_features"] = features_model
+                        artifacts[artifact_name] = metric_model
+                        cast(
+                            list[dict[str, Any]],
+                            outputs["qualityMetricArtifacts"],
+                        ).append(source.model_dump(mode="json"))
                         cast(list[dict[str, Any]], outputs["operations"]).append(
                             {
-                                "operation": "add_percent_feature",
+                                "operation": "run_feature_percentage",
                                 "assay": policy.assay,
+                                "family": family,
                                 "pattern": pattern,
-                                "column": column,
+                                "cellSelection": cell_selection.model_dump(mode="json"),
+                                "features": features_model.model_dump(mode="json"),
+                                "artifact": metric_model.model_dump(mode="json"),
                             }
                         )
+                        actions.append(f"compute_{action_suffix}:{policy.assay}")
                 if policy.assayModality != "HTO" or not policy.demultiplexEligible:
                     continue
-                label = f"agent_{token}_{journal._safe_label(policy.assay)}_identity"
-                column = store.mark_hto_identities(
+                identity_ref = store.run_hto_demultiplexing(
+                    cell_selection_ref,
                     from_assay=policy.assay,
-                    cell_key="I",
-                    label=label,
                     random_seed=0,
                     invalidate_cache=False,
                 )
-                cast(list[str], outputs["htoIdentityColumns"]).append(column)
+                identity_model = ArtifactReferenceModel.from_artifact_ref(identity_ref)
+                artifact_name = f"{policy.assay}_htoIdentity"
+                if artifact_name in artifacts:
+                    raise ValueError(
+                        f"Duplicate generated artifact name {artifact_name!r}"
+                    )
+                source = NamedArtifactSource(
+                    name=artifact_name,
+                    artifact=identity_model,
+                )
+                artifacts[artifact_name] = identity_model
+                cast(list[dict[str, Any]], outputs["htoIdentityArtifacts"]).append(
+                    source.model_dump(mode="json")
+                )
                 cast(list[dict[str, Any]], outputs["operations"]).append(
                     {
-                        "operation": "mark_hto_identities",
+                        "operation": "run_hto_demultiplexing",
                         "assay": policy.assay,
-                        "cellKey": "I",
-                        "label": label,
+                        "cellSelection": cell_selection.model_dump(mode="json"),
                         "randomSeed": 0,
                         "invalidateCache": False,
+                        "artifact": identity_model.model_dump(mode="json"),
                     }
                 )
                 actions.append(f"demultiplex_hto:{policy.assay}")
-            outputs["metadataColumns"] = list(
-                dict.fromkeys(
-                    [*metadata_columns, *cast(list[str], outputs["htoIdentityColumns"])]
-                )
-            )
             outcome = journal._complete_attempt(
                 started,
                 status="done",
+                artifacts=artifacts,
                 outputs=outputs,
                 actions=actions,
             )
             journal._save_outcome(store.zw, prefix, outcome)
             logger.info(
                 f"Workflow {workflow.workflowRunId}: HTO stage produced "
-                f"{len(cast(list[str], outputs['htoIdentityColumns']))} "
-                "identity column(s)"
+                f"{len(cast(list[dict[str, Any]], outputs['htoIdentityArtifacts']))} "
+                "identity artifact(s)"
             )
             return outcome
         except Exception as exc:
@@ -438,6 +581,7 @@ class ContextStagesMixin:
                 workflow,
                 started,
                 exc,
+                artifacts=artifacts,
                 actions=actions,
                 outputs=outputs,
             )
@@ -448,13 +592,20 @@ class ContextStagesMixin:
         workflow: AgentWorkflowRun,
         request_record: OrchestrationRequestRecord,
         parents: Sequence[WorkflowStageLink],
+        cell_selection: ArtifactReferenceModel,
         enrichment_reference: AgentReportReference,
-        hto_identity_columns: Sequence[str],
+        quality_metric_artifacts: Sequence[NamedArtifactSource],
+        hto_identity_artifacts: Sequence[NamedArtifactSource],
         answers: Mapping[str, Any],
         *,
         resume_record: OrchestrationResumeRecord | None = None,
     ) -> tuple[WorkflowStageAttempt, ExperimentalContextResult]:
         prefix = journal._ensure_orchestration_store(store)
+        context_artifacts = self._experimental_context_artifacts(
+            cell_selection,
+            quality_metric_artifacts,
+            hto_identity_artifacts,
+        )
         existing = journal._validated_done_outcome(
             store,
             prefix,
@@ -471,7 +622,33 @@ class ContextStagesMixin:
             report = journal.load_stage_report(
                 store, existing, ExperimentalContextResult
             )
-            return existing, cast(ExperimentalContextResult, report)
+            resolved_report = cast(ExperimentalContextResult, report)
+            if existing.artifacts != context_artifacts:
+                raise ValueError(
+                    "Persisted Experimental Context stage artifacts are stale"
+                )
+            if resolved_report.cellSelection != cell_selection:
+                raise ValueError(
+                    "Persisted Experimental Context cell selection is stale"
+                )
+            if resolved_report.qualityMetricArtifacts != list(quality_metric_artifacts):
+                raise ValueError(
+                    "Persisted Experimental Context quality artifacts are stale"
+                )
+            if resolved_report.htoIdentityArtifacts != list(hto_identity_artifacts):
+                raise ValueError(
+                    "Persisted Experimental Context HTO artifacts are stale"
+                )
+            record = journal.load_agent_record(
+                store,
+                existing.reportReferences[0],
+            )
+            if record.invocation.artifacts != context_artifacts:
+                raise ValueError(
+                    "Persisted Experimental Context invocation artifacts are stale"
+                )
+            return existing, resolved_report
+        cell_selection_ref = artifact_model_to_ref(cell_selection)
         paused = journal._validated_done_outcome(
             store,
             prefix,
@@ -482,7 +659,6 @@ class ContextStagesMixin:
             required_status="needsInput",
         )
         directions = dict(request_record.request.experimentalDirections)
-        directions["htoIdentityColumns"] = list(hto_identity_columns)
         supplied_directions = answers.get("experimentalDirections")
         if isinstance(supplied_directions, Mapping):
             directions.update(dict(supplied_directions))
@@ -497,14 +673,22 @@ class ContextStagesMixin:
             parents,
             inputs={
                 "studyContext": request_record.request.studyContext,
-                "cellKey": "I",
+                "cellSelection": cell_selection.model_dump(mode="json"),
                 "directions": directions,
+                "qualityMetricArtifacts": [
+                    source.model_dump(mode="json")
+                    for source in quality_metric_artifacts
+                ],
+                "htoIdentityArtifacts": [
+                    source.model_dump(mode="json") for source in hto_identity_artifacts
+                ],
             },
             resume_record=resume_record,
         )
         logger.info(
             f"Workflow {workflow.workflowRunId}: Experimental Context will evaluate "
-            f"{len(hto_identity_columns)} HTO identity column(s)"
+            f"{len(quality_metric_artifacts)} quality metric artifact(s) and "
+            f"{len(hto_identity_artifacts)} HTO identity artifact(s)"
         )
         try:
             unsafe_resolution = (
@@ -523,6 +707,11 @@ class ContextStagesMixin:
             if recovered is not None:
                 recovered_report, reference = recovered
                 report = cast(ExperimentalContextResult, recovered_report)
+                recovered_record = journal.load_agent_record(store, reference)
+                if recovered_record.invocation.artifacts != context_artifacts:
+                    raise ValueError(
+                        "Recovered Experimental Context invocation artifacts are stale"
+                    )
                 actions.append("recover_persisted_experimental_context_report")
             else:
                 parent_reports = [journal._report_link(enrichment_reference)]
@@ -540,6 +729,28 @@ class ContextStagesMixin:
                             ExperimentalContextResult,
                         ),
                     )
+                    if paused.artifacts != context_artifacts:
+                        raise ValueError(
+                            "Paused Experimental Context stage artifacts are stale"
+                        )
+                    if (
+                        prior_report.cellSelection != cell_selection
+                        or prior_report.qualityMetricArtifacts
+                        != list(quality_metric_artifacts)
+                        or prior_report.htoIdentityArtifacts
+                        != list(hto_identity_artifacts)
+                    ):
+                        raise ValueError(
+                            "Paused Experimental Context exact inputs are stale"
+                        )
+                    paused_record = journal.load_agent_record(
+                        store,
+                        paused.reportReferences[0],
+                    )
+                    if paused_record.invocation.artifacts != context_artifacts:
+                        raise ValueError(
+                            "Paused Experimental Context invocation artifacts are stale"
+                        )
                     prior_plan = prior_report.decision.batchCorrection
                     skip_plan = prior_plan.model_copy(
                         update={
@@ -587,8 +798,10 @@ class ContextStagesMixin:
                     report = agent.run(
                         store,
                         study_context=request_record.request.studyContext,
-                        cell_key="I",
+                        cell_selection=cell_selection_ref,
                         directions=directions,
+                        quality_metric_artifacts=quality_metric_artifacts,
+                        hto_identity_artifacts=hto_identity_artifacts,
                     )
                     run_config = agent.config
                 saved_report, reference = journal._save_stage_report(
@@ -600,15 +813,36 @@ class ContextStagesMixin:
                         parentReports=parent_reports,
                         inputs={
                             "studyContext": request_record.request.studyContext,
-                            "cellKey": "I",
+                            "cellSelection": cell_selection.model_dump(mode="json"),
                             "directions": directions,
+                            "qualityMetricArtifacts": [
+                                source.model_dump(mode="json")
+                                for source in quality_metric_artifacts
+                            ],
+                            "htoIdentityArtifacts": [
+                                source.model_dump(mode="json")
+                                for source in hto_identity_artifacts
+                            ],
                             "unsafeResolution": unsafe_resolution,
                         },
+                        artifacts=context_artifacts,
                         runConfig=run_config,
                     ),
                     expected_type=ExperimentalContextResult,
                 )
                 report = cast(ExperimentalContextResult, saved_report)
+            if report.cellSelection != cell_selection:
+                raise ValueError(
+                    "Experimental Context returned a different cell selection"
+                )
+            if report.qualityMetricArtifacts != list(quality_metric_artifacts):
+                raise ValueError(
+                    "Experimental Context returned different quality metric artifacts"
+                )
+            if report.htoIdentityArtifacts != list(hto_identity_artifacts):
+                raise ValueError(
+                    "Experimental Context returned different HTO identity artifacts"
+                )
             logger.info(
                 f"Workflow {workflow.workflowRunId}: Experimental Context returned "
                 f"status={report.status!r}, batchAction="
@@ -629,6 +863,7 @@ class ContextStagesMixin:
                     started,
                     status="needsInput",
                     report_references=[reference],
+                    artifacts=context_artifacts,
                     needs_input=WorkflowNeedsInput(questions=questions),
                     notes=report.notes,
                 )
@@ -637,6 +872,7 @@ class ContextStagesMixin:
                     started,
                     status="failed",
                     report_references=[reference],
+                    artifacts=context_artifacts,
                     error="; ".join(report.notes) or "Experimental Context failed",
                 )
             elif report.decision.batchCorrection.action == "unsafe":
@@ -645,6 +881,7 @@ class ContextStagesMixin:
                     started,
                     status="needsInput",
                     report_references=[reference],
+                    artifacts=context_artifacts,
                     outputs={
                         "unsafeBatchCorrection": True,
                         "batchCorrection": batch_plan.model_dump(mode="json"),
@@ -670,12 +907,21 @@ class ContextStagesMixin:
                     started,
                     status="done",
                     report_references=[reference],
+                    artifacts=context_artifacts,
                     outputs={
                         "cellQc": report.cellQc.model_dump(mode="json"),
                         "qcProfiles": [
                             value.model_dump(mode="json") for value in report.qcProfiles
                         ],
                         "htoIdentityColumns": report.htoIdentityColumns,
+                        "htoIdentityArtifacts": [
+                            source.model_dump(mode="json")
+                            for source in report.htoIdentityArtifacts
+                        ],
+                        "qualityMetricArtifacts": [
+                            source.model_dump(mode="json")
+                            for source in quality_metric_artifacts
+                        ],
                         "metadataColumns": report.htoIdentityColumns,
                     },
                     actions=actions,
@@ -688,29 +934,12 @@ class ContextStagesMixin:
                 )
             return outcome, report
         except Exception as exc:
-            outcome = journal.finish_exception(store, prefix, workflow, started, exc)
+            outcome = journal.finish_exception(
+                store,
+                prefix,
+                workflow,
+                started,
+                exc,
+                artifacts=context_artifacts,
+            )
             return outcome, ExperimentalContextResult.get_blank()
-
-    def should_reset_selection(
-        self,
-        request_record: OrchestrationRequestRecord,
-        prefix: str,
-        store: DataStore,
-        workflow: AgentWorkflowRun | None,
-    ) -> bool:
-        request = request_record.request
-        if workflow is None:
-            return False
-        ingest_outcome = journal._validated_done_outcome(
-            store,
-            prefix,
-            workflow.workflowRunId,
-            "ingest",
-            request_record,
-            [],
-        )
-        if ingest_outcome is None:
-            raise RuntimeError("Cannot resolve reset policy without ingest outcome")
-        if ingest_outcome.outputs.get("format") != "zarr":
-            return True
-        return request.resetCellSelection is True

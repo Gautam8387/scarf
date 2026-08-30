@@ -50,7 +50,7 @@ import pandas as pd
 
 import scarf
 
-scarf.configure_output(level="WARNING", progress=True)
+scarf.configure_output(level="WARNING", progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "swanson_7K_pbmc_teaseq",
@@ -65,32 +65,29 @@ ds = scarf.DataStore(
 ```
 
 Read the stored shapes instead of loading a complete matrix.
-The ATAC count array retains all 240,122 peaks, while the analysis chain selects 25,000 peaks for reduction.
+The ATAC count array retains all 240,122 peaks, while the stored reduction lineage selects 25,000 peaks.
 
 ```{code-cell} ipython3
-assay_inventory = []
-for assay_name in ("RNA", "ATAC", "ADT"):
-    assay = ds.get_assay(assay_name)
-    assay_inventory.append(
-        {
-            "assay": assay_name,
-            "cells": assay.rawData.shape[0],
-            "raw features": assay.rawData.shape[1],
-            "active features": int(assay.feats.fetch_all("I").sum()),
+pd.DataFrame.from_dict(
+    {
+        name: {
+            "cells": ds.get_assay(name).rawData.shape[0],
+            "raw features": ds.get_assay(name).rawData.shape[1],
+            "active features": int(ds.get_assay(name).feats.fetch_all("I").sum()),
         }
-    )
-
-pd.DataFrame(assay_inventory)
+        for name in ("RNA", "ATAC", "ADT")
+    },
+    orient="index",
+)
 ```
 
 The active key identifies the exact publication matches used by every stored analysis artifact.
 
 ```{code-cell} ipython3
-active_cells = int(ds.cells.fetch_all("I").sum())
 pd.Series(
     {
         "source cells retained": ds.cells.N,
-        "active exact W3 matches": active_cells,
+        "active exact W3 matches": int(ds.cells.fetch_all("I").sum()),
         "Figure 4 W3 labels": 6_333,
         "Figure 4 labels absent from the pinned RDS": 139,
     }
@@ -105,91 +102,14 @@ pd.Series(ds.cells.fetch("tea_cell_type", key="I")).value_counts()
 
 ## 2. Fixed preprocessing recipe
 
-The recipe below is recorded in the dataset manifest and represented by complete artifacts in the store.
+The recipe is recorded in the dataset manifest and represented by complete artifacts in the store.
 This page does not refit normalization, reductions, neighbour graphs, UMAP, or clustering.
 
-```{code-cell} ipython3
-preprocessing = pd.DataFrame(
-    [
-        {
-            "assay": "RNA",
-            "normalization": "library-size log1p",
-            "feature selection": "2,000 HVGs",
-            "reduction": "30-component PCA",
-        },
-        {
-            "assay": "ATAC",
-            "normalization": "TF-IDF",
-            "feature selection": "25,000 prevalent peaks",
-            "reduction": "30-component streaming LSI, first component skipped",
-        },
-        {
-            "assay": "ADT",
-            "normalization": "CLR",
-            "feature selection": "exclude isotype control",
-            "reduction": "15-component PCA",
-        },
-    ]
-)
-preprocessing
-```
-
-Confirm the same chain from completed artifacts rather than the manifest alone.
-
-```{code-cell} ipython3
-artifact_rows = []
-for assay in ("RNA", "ATAC", "ADT"):
-    for kind in (
-        "normalized",
-        "feature_selection",
-        "reduction",
-        "neighbors",
-    ):
-        for ref in ds.list_artifacts(
-            from_assay=assay,
-            kind=kind,
-            complete_only=True,
-        ):
-            status = ds.inspect_artifact(ref)
-            parameters = status.parameters or {}
-            artifact_rows.append(
-                {
-                    "assay": assay,
-                    "kind": kind,
-                    "operation": status.operation,
-                    "artifact": ref.artifact_id[:12],
-                    "label": None,
-                    "method": None,
-                    "dims": parameters.get("dims"),
-                    "k": parameters.get("k"),
-                    "top_n": parameters.get("top_n"),
-                    "skip_first": parameters.get("skip_first"),
-                }
-            )
-for ref in ds.list_artifacts(
-    scope="datastore",
-    kind="integrated_graph",
-    complete_only=True,
-):
-    status = ds.inspect_artifact(ref)
-    options = status.execution_options or {}
-    parameters = status.parameters or {}
-    artifact_rows.append(
-        {
-            "assay": "datastore",
-            "kind": ref.kind,
-            "operation": status.operation,
-            "artifact": ref.artifact_id[:12],
-            "label": options.get("label"),
-            "method": parameters.get("method"),
-            "dims": None,
-            "k": None,
-            "top_n": None,
-            "skip_first": None,
-        }
-    )
-pd.DataFrame(artifact_rows)
-```
+| Assay | Normalization | Feature selection | Reduction |
+| --- | --- | --- | --- |
+| RNA | Library-size log1p | 2,000 HVGs | 30-component PCA |
+| ATAC | TF-IDF | 25,000 prevalent peaks | 30-component streaming LSI, first component skipped |
+| ADT | CLR | Exclude isotype control | 15-component PCA |
 
 Each modality has a 20-neighbour self-free row over the same active cells.
 Those matched rows feed both integrations.
@@ -204,28 +124,58 @@ These layouts are independent outputs.
 Similar broad populations support a shared signal, while local differences can reflect complementary measurements or modality-specific noise.
 
 ```{code-cell} ipython3
+modality_layouts = {}
+for assay in ("RNA", "ATAC", "ADT"):
+    [modality_layouts[assay]] = ds.list_artifacts(
+        from_assay=assay,
+        kind="embedding",
+        complete_only=True,
+    )
+
+integrated_graphs = {
+    ds.inspect_artifact(ref).parameters["method"]: ref
+    for ref in ds.list_artifacts(
+        scope="datastore",
+        kind="integrated_graph",
+        complete_only=True,
+    )
+}
+
+
+def linked_output(graph, kind):
+    [result] = [
+        ref
+        for ref in ds.list_artifacts(scope="datastore", kind=kind, complete_only=True)
+        if scarf.ArtifactRef.from_dict(ds.inspect_artifact(ref).inputs["graph"])
+        == graph
+    ]
+    return result
+
+
+snn_ref = integrated_graphs["snn"]
+wnn_ref = integrated_graphs["wnn"]
+snn_layout = linked_output(snn_ref, "embedding")
+wnn_layout = linked_output(wnn_ref, "embedding")
+```
+
+```{code-cell} ipython3
 figure, axes = plt.subplots(2, 2, figsize=(10, 8))
-layout_panels = (
-    ("RNA", "RNA_UMAP"),
-    ("ATAC", "ATAC_UMAP"),
-    ("ADT", "ADT_UMAP"),
-    ("Three-way SNN", "RNA+ATAC+ADT_UMAP"),
-)
-for index, (axis, (title, layout_key)) in enumerate(
-    zip(axes.flat, layout_panels, strict=True)
+for axis, (label, layout) in zip(
+    axes.flat,
+    (*modality_layouts.items(), ("SNN", snn_layout)),
+    strict=True,
 ):
     ds.plots.embedding(
-        layout_key=layout_key,
+        layout=layout,
         color_by="tea_cell_type",
         point_size=5,
         legend_loc="right",
-        show_legend=index == len(layout_panels) - 1,
-        show_titles=False,
         target=axis,
         show=False,
     )
-    axis.set_title(title)
+    axis.set_title(label)
 figure.tight_layout()
+figure
 ```
 
 The SNN layout is a joint view, not a reference truth.
@@ -233,59 +183,44 @@ Differences between panels should be checked against markers and assay quality r
 This store keeps Ensembl IDs as RNA feature names, so the panel below uses ADT proteins for T, B, monocyte, and NK-like landmarks.
 
 ```{code-cell} ipython3
-snn_markers = ds.plots.embedding(
-    layout_key="RNA+ATAC+ADT_UMAP",
+ds.plots.embedding(
+    layout=snn_layout,
     from_assay="ADT",
     color_by=["CD3", "CD19", "CD14", "CD56"],
     n_columns=2,
     point_size=5,
     sort_values=True,
     show_titles=True,
-    show=False,
+    figsize=(10, 8),
 )
-snn_markers.figure.set_size_inches(10, 8)
 ```
 
 ## 4. Inspect the three-way WNN graph
 
 The prepared WNN result has an immutable artifact reference and records its assays in order.
-New calls to `integrate_assays` pair each `source_i` neighbour artifact with the exact native coordinate artifact it names, capture every source before planning, and never search for a latest graph or decode a storage path. This prepared download predates that final input schema and retains legacy analysis state, so it is inspected as a historical result rather than used as input to a new computation.
+`integrate_assays` consumes exact neighbour artifacts, whose lineage includes their native
+coordinate artifacts, and captures every source before planning.
 
 ```{code-cell} ipython3
-assays = ["RNA", "ATAC", "ADT"]
-wnn_ref = next(
-    ref
-    for ref in ds.list_artifacts(
-        scope="datastore",
-        kind="integrated_graph",
-        complete_only=True,
-    )
-    if (ds.inspect_artifact(ref).execution_options or {}).get("label")
-    == "RNA+ATAC+ADT_wnn"
-)
 wnn_status = ds.inspect_artifact(wnn_ref)
+assays = list(wnn_status.parameters["assays"])
 
-assert wnn_status.parameters["assays"] == assays
+assert assays == ["RNA", "ATAC", "ADT"]
 pd.Series(
     {
         "artifact kind": wnn_ref.kind,
         "artifact id": wnn_ref.artifact_id,
         "complete": wnn_status.complete,
         "ordered assays": ", ".join(wnn_status.parameters["assays"]),
-        "historical input roles": ", ".join(sorted(wnn_status.inputs)),
+        "input roles": ", ".join(sorted(wnn_status.inputs)),
     }
 )
 ```
 
-The artifact publishes its modality weights as cell metadata in the same order as the input assays.
+The artifact stores its modality weights in the same order as the input assays.
 
 ```{code-cell} ipython3
-weight_columns = [
-    f"RNA+ATAC+ADT_wnn_{assay}_weight" for assay in assays
-]
-weight_values = np.column_stack(
-    [ds.cells.fetch(column, key="I") for column in weight_columns]
-)
+weight_values = np.asarray(ds.load_artifact(wnn_ref)["modality_weights"][:])
 
 assert weight_values.shape == (6_194, 3)
 assert np.isfinite(weight_values).all()
@@ -297,9 +232,7 @@ pd.Series(
         "shape": str(weight_values.shape),
         "minimum weight": float(weight_values.min()),
         "maximum weight": float(weight_values.max()),
-        "maximum row-sum error": float(
-            np.abs(weight_values.sum(axis=1) - 1).max()
-        ),
+        "maximum row-sum error": float(np.abs(weight_values.sum(axis=1) - 1).max()),
     }
 )
 ```
@@ -308,36 +241,34 @@ Mean modality weight by publication label shows which populations lean on RNA, A
 
 ```{code-cell} ipython3
 weight_frame = pd.DataFrame(
-    {
-        "RNA weight": weight_values[:, 0],
-        "ATAC weight": weight_values[:, 1],
-        "ADT weight": weight_values[:, 2],
-        "tea_cell_type": ds.cells.fetch("tea_cell_type", key="I"),
-    }
+    weight_values,
+    columns=[f"{assay} weight" for assay in assays],
 )
-weight_frame.groupby("tea_cell_type")[
-    ["RNA weight", "ATAC weight", "ADT weight"]
-].agg(["count", "mean"]).round(3)
+weight_frame["tea_cell_type"] = ds.cells.fetch("tea_cell_type", key="I")
+weight_columns = [f"{assay} weight" for assay in assays]
+weight_frame.groupby("tea_cell_type")[weight_columns].agg(["count", "mean"]).round(3)
 ```
 
 Plotting all three weights on the integrated layout shows where the graph relies more strongly on each local neighbourhood.
 
 ```{code-cell} ipython3
-wnn_view = ds.plots.embedding(
-    layout_key="RNA+ATAC+ADT_wnn_UMAP",
-    color_by=["tea_cell_type", *weight_columns],
-    n_columns=2,
-    point_size=5,
-    show_titles=False,
-    show=False,
-)
-for axis, title in zip(
-    wnn_view.axes.values(),
-    ("Cell type", "RNA weight", "ATAC weight", "ADT weight"),
+wnn_coordinates = np.asarray(ds.load_artifact(wnn_layout)["values"][:])
+figure, axes = plt.subplots(1, 3, figsize=(12, 4))
+for axis, values, title in zip(
+    axes,
+    weight_values.T,
+    weight_columns,
     strict=True,
 ):
+    points = axis.scatter(
+        wnn_coordinates[:, 0],
+        wnn_coordinates[:, 1],
+        c=values,
+        s=5,
+    )
     axis.set_title(title)
-wnn_view.figure.set_size_inches(10, 8)
+    figure.colorbar(points, ax=axis)
+figure.tight_layout()
 ```
 
 Place the three-way SNN and WNN layouts side by side under the same cell-type colouring.
@@ -345,41 +276,37 @@ Broad populations should agree; local rearrangements need marker and weight supp
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 2, figsize=(10, 4))
-integration_panels = (
-    ("Three-way SNN", "RNA+ATAC+ADT_UMAP"),
-    ("Three-way WNN", "RNA+ATAC+ADT_wnn_UMAP"),
-)
-for index, (axis, (title, layout_key)) in enumerate(
-    zip(axes, integration_panels, strict=True)
+for axis, (label, layout) in zip(
+    axes,
+    (("SNN", snn_layout), ("WNN", wnn_layout)),
+    strict=True,
 ):
     ds.plots.embedding(
-        layout_key=layout_key,
+        layout=layout,
         color_by="tea_cell_type",
         point_size=5,
         legend_loc="right",
-        show_legend=index == 1,
-        show_titles=False,
         target=axis,
         show=False,
     )
-    axis.set_title(title)
+    axis.set_title(label)
 figure.tight_layout()
+figure
 ```
 
 The same ADT panel on the WNN layout checks whether lineage landmarks remain coherent after per-cell reweighting.
 
 ```{code-cell} ipython3
-wnn_markers = ds.plots.embedding(
-    layout_key="RNA+ATAC+ADT_wnn_UMAP",
+ds.plots.embedding(
+    layout=wnn_layout,
     from_assay="ADT",
     color_by=["CD3", "CD19", "CD14", "CD56"],
     n_columns=2,
     point_size=5,
     sort_values=True,
     show_titles=True,
-    show=False,
+    figsize=(10, 8),
 )
-wnn_markers.figure.set_size_inches(10, 8)
 ```
 
 ## 5. How N-way WNN combines the assays

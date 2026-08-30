@@ -27,6 +27,7 @@ from .experimental_context import (
     CellQcPlan,
     ExperimentalContextAgent,
     ExperimentalContextResult,
+    NamedArtifactSource,
 )
 from .ingest import IngestResult, detect_format, ingest
 from .orchestrator import (
@@ -134,6 +135,7 @@ __all__ = [
     "IntegrationCandidateEvaluation",
     "IntegrationMetrics",
     "NativeAnalysisHandoff",
+    "NamedArtifactSource",
     "NeedsInput",
     "ParameterCandidate",
     "ParameterSearchPlan",

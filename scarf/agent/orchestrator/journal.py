@@ -855,6 +855,7 @@ def failed_stage(
     parents: Sequence[WorkflowStageLink],
     error: str,
     *,
+    artifacts: Mapping[str, ArtifactReferenceModel] | None = None,
     resume_record: OrchestrationResumeRecord | None = None,
 ) -> WorkflowStageAttempt:
     logger.error(
@@ -870,7 +871,12 @@ def failed_stage(
         parents,
         resume_record=resume_record,
     )
-    outcome = _complete_attempt(started, status="failed", error=error)
+    outcome = _complete_attempt(
+        started,
+        status="failed",
+        artifacts=artifacts,
+        error=error,
+    )
     _save_outcome(store.zw, prefix, outcome)
     finalize_failed(store, workflow, error)
     return outcome
