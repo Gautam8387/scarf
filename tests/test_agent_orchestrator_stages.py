@@ -581,12 +581,23 @@ def test_explicit_no_inference_skip_resolves_context_without_provider_rerun(
     assert resolved_report.decision.batchCorrection.action == "skip"
     assert resolved_report.decision.batchCorrection.batchColumns == []
     assert resolved_report.decision.needsInput == []
+    assert resolved_report.runInfo.agentName == "experimental_context_resolution"
+    assert resolved_report.runInfo.runId == ""
+    assert resolved_report.runInfo.usage.requests == 0
     assert NeedsInputAgent.calls == 1
+    paused_record = load_agent_record(
+        store,
+        paused_outcome.reportReferences[0],
+    )
     resolved_record = load_agent_record(
         store,
         resolved_outcome.reportReferences[0],
     )
     assert resolved_record.invocation.artifacts == resolved_outcome.artifacts
+    assert resolved_record.invocation.runConfig == paused_record.invocation.runConfig
+    assert resolved_record.invocation.inputs["deterministicResolution"] == (
+        "resolve_experimental_context:no_inference_skip_harmony"
+    )
     assert resolved_record.invocation.parentReports[-1].agentRunId == (
         paused_outcome.reportReferences[0].agentRunId
     )

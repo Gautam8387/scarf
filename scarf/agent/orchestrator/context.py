@@ -24,7 +24,7 @@ from ..persistence import (
     AgentReportReference,
     AgentWorkflowRun,
 )
-from ..types import ArtifactReferenceModel
+from ..types import AgentRunInfo, ArtifactReferenceModel
 from . import journal
 from .models import (
     OrchestrationRequestRecord,
@@ -812,13 +812,16 @@ class ContextStagesMixin:
                             "status": "done",
                             "decision": decision,
                             "notes": [*prior_report.notes, resolution_note],
+                            "runInfo": AgentRunInfo(
+                                agentName="experimental_context_resolution"
+                            ),
                         }
                     )
                     actions.append(resolution_action)
                     parent_reports.append(
                         journal._report_link(paused.reportReferences[0])
                     )
-                    run_config = request_record.config.agentRunConfig
+                    run_config = paused_record.invocation.runConfig
                 else:
                     logger.info(
                         f"Workflow {workflow.workflowRunId}: invoking Experimental "
@@ -857,6 +860,9 @@ class ContextStagesMixin:
                                 for source in hto_identity_artifacts
                             ],
                             "unsafeResolution": unsafe_resolution,
+                            "deterministicResolution": (
+                                actions[-1] if actions else None
+                            ),
                         },
                         artifacts=context_artifacts,
                         runConfig=run_config,

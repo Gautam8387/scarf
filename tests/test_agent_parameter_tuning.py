@@ -1799,6 +1799,14 @@ def test_batched_refinement_planning_allows_a_validator_retry() -> None:
     assert model_calls == 3
     assert result.status == "done"
     assert result.recommendedByAssay == {"RNA": "baseline"}
+    assert result.searchPlan is not None
+    assert result.searchPlan.runInfo.agentName == "parameter_batch_search_planning"
+    assert result.searchPlan.runInfo.usage.requests == 2
+    assay_plan = result.assayReports["RNA"].searchPlan
+    assert assay_plan is not None
+    assert assay_plan.runInfo == result.searchPlan.runInfo
+    assert result.runInfo.agentName == "parameter_tuning_batch"
+    assert result.runInfo.usage.requests == 1
 
 
 def test_batched_tuning_falls_back_after_structured_output_exhaustion(

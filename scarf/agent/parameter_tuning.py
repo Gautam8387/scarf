@@ -774,7 +774,11 @@ def parameter_search_system_prompt() -> str:
         Cite only evidenceIds from the initial evaluations. Identify the successful
         initial candidates that motivate refinement, state focused objectives, and
         provide concrete stopping criteria. Do not invent metrics, artifacts, or
-        candidate ids.
+        candidate ids. Treat pcaSilhouette, macroF1, and weightedF1 only as PCA
+        cluster-separability metrics. Biological preservation evidence exists only
+        in a non-empty biologicalPreservation map. Check every exact value before
+        stating a ranking or trend, and keep narrative fields as plain prose
+        without serialized JSON.
         """
     ).strip()
 
@@ -869,7 +873,13 @@ def parameter_tuning_system_prompt(min_cluster_cells: int) -> str:
         Balance cluster separation, cluster sizes, batch mixing, and biological
         preservation. High batch mixing alone can indicate overcorrection, so do
         not collapse the metrics into an invented score. UMAP appearance is not
-        evidence for parameter quality. When multiple candidates complete,
+        evidence for parameter quality. Treat pcaSilhouette, macroF1, and
+        weightedF1 only as PCA cluster-separability metrics. Biological
+        preservation evidence exists only in a non-empty biologicalPreservation
+        map. Do not call any metric highest, lowest, improved, degraded, or
+        monotonic without checking its exact value across every relevant
+        candidate. Narrative fields contain plain prose only and must not contain
+        serialized JSON keys or objects. When multiple candidates complete,
         return one comparison for every non-selected successful candidate. Each
         comparison must cite evidence from both the selected candidate and that
         comparator. Return only model-owned selection fields. Leave evaluations,
@@ -1002,7 +1012,12 @@ def parameter_batch_selection_system_prompt() -> str:
             exactly one grounded single-assay report in assayReports per assay.
             Apply eligibility, evidence, and comparison requirements independently.
             Do not invent joint scores, artifacts, candidates, or evidence. UMAP
-            appearance is not evidence. Inside each assay report, return only
+            appearance is not evidence. Treat pcaSilhouette, macroF1, and
+            weightedF1 only as PCA cluster-separability metrics; biological
+            preservation exists only when biologicalPreservation is non-empty.
+            Check all exact values before making ranking or trend claims, and keep
+            narrative fields as plain prose without serialized JSON. Inside each
+            assay report, return only
             model-owned selection, rationale, comparison, trade-off, limitation,
             evidence, and stop fields. Leave evaluations, selectedArtifacts,
             searchPlan, nested assayReports, integration fields, final graph fields,
@@ -3271,12 +3286,23 @@ def tune_parameters_batch(
                 planning_execution.output, ParameterTuningBatchSearchPlan
             ):
                 raise TypeError("Batched parameter planner returned an unexpected type")
-            batch_plan = validate_parameter_batch_search_plan(
+            validated_batch_plan = validate_parameter_batch_search_plan(
                 planning_execution.output,
                 dependencies,
                 initial_candidate_ids=initial_ids,
                 max_refined_by_assay=max_refined_by_assay,
-            ).model_copy(update={"runInfo": planning_execution.runInfo})
+            )
+            batch_plan = validated_batch_plan.model_copy(
+                update={
+                    "assayPlans": {
+                        assay: plan.model_copy(
+                            update={"runInfo": planning_execution.runInfo}
+                        )
+                        for assay, plan in validated_batch_plan.assayPlans.items()
+                    },
+                    "runInfo": planning_execution.runInfo,
+                }
+            )
             logger.info(
                 "Completed batched parameter refinement plan: "
                 + ", ".join(

@@ -1969,6 +1969,34 @@ def validate_experimental_context(
     deps: ExperimentalContextDependencies,
 ) -> ExperimentalContextDecision:
     """Recompute and validate every model-authored design choice."""
+    narrative_fields = {
+        "rationale": decision.rationale,
+        "batchCorrection.rationale": decision.batchCorrection.rationale,
+        "cellQc.rationale": decision.cellQc.rationale,
+        **{
+            f"needsInput[{index}]": question
+            for index, question in enumerate(decision.needsInput)
+        },
+    }
+    serialized_field_markers = (
+        '"evidenceIds":',
+        '"needsInput":',
+        '"runInfo":',
+        '"batchCorrection":',
+        '"cellQc":',
+    )
+    invalid_narratives = [
+        name
+        for name, value in narrative_fields.items()
+        if any(
+            marker in value.replace('\\"', '"') for marker in serialized_field_markers
+        )
+    ]
+    if invalid_narratives:
+        raise ModelRetry(
+            "Narrative fields must contain plain prose without serialized sibling "
+            f"fields: {invalid_narratives}"
+        )
     directions = dict(deps.directions)
     column_domains = dict(decision.columnDomains)
     column_domains.update(dict(directions.get("columnDomains") or {}))
@@ -2262,8 +2290,10 @@ class ExperimentalContextAgent:
 
             Cite only evidenceIds returned by tools. Ask for input when study
             design cannot be resolved. Never propose Python, shell commands,
-            direct Zarr access, or any datastore mutation. Return only fields
-            defined by the structured output schema.
+            direct Zarr access, or any datastore mutation. Every rationale and
+            question must be plain prose. Never place serialized JSON, schema
+            field names, or sibling output fields inside a narrative string.
+            Return only fields defined by the structured output schema.
                 """
             )
             .strip()

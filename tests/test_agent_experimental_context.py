@@ -429,6 +429,15 @@ def test_system_prompt_does_not_embed_fictional_output_values() -> None:
     assert "estimability:treatment" not in prompt
 
 
+def test_validator_rejects_serialized_fields_inside_narrative() -> None:
+    decision = ExperimentalContextDecision(
+        rationale='Study design is unresolved.", "evidenceIds": ["column:batch"]',
+    )
+
+    with pytest.raises(ModelRetry, match="plain prose"):
+        validate_experimental_context(decision, _context(_Store()).deps)
+
+
 def test_agent_runs_only_read_only_tools_and_returns_a_grounded_report() -> None:
     store = _Store()
     tool_names: set[str] = set()
