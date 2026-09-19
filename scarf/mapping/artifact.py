@@ -11,7 +11,12 @@ from ..graph.distances import (
     validate_distance_provenance,
     validate_neighbors_payload,
 )
-from ..storage.ann_index import validate_ann_index_payload
+from ..neighbors.stages import AnnIndexStage, NeighborQueryStage
+from ..storage.ann_index import (
+    has_ann_index,
+    load_ann_index,
+    validate_ann_index_payload,
+)
 from ..storage.arrays import create_zarr_dataset, create_zarr_obj_array
 from ..storage.artifacts import (
     ArtifactRef,
@@ -40,6 +45,7 @@ _COMMON_ARRAYS = frozenset(
         "feature_ids",
         "feature_means",
         "feature_scales",
+        "center",
         "loadings",
         "reference_distance_quantiles",
         "reference_distance_values",
@@ -58,6 +64,7 @@ _COMMON_ARRAY_ORDER = (
     "feature_ids",
     "feature_means",
     "feature_scales",
+    "center",
     "loadings",
     "reference_distance_quantiles",
     "reference_distance_values",
@@ -132,6 +139,7 @@ def write_artifact_mapping_reference(
     create_zarr_obj_array(group, "feature_ids", np.asarray(feature_ids))
     _write_array(group, "feature_means", model.feature_means)
     _write_array(group, "feature_scales", model.feature_scales)
+    _write_array(group, "center", model.center)
     _write_array(group, "loadings", model.loadings)
     _write_array(
         group,
@@ -169,6 +177,7 @@ def write_artifact_mapping_reference_from_sources(
     *,
     feature_means: zarr.Array,
     feature_scales: zarr.Array,
+    center: zarr.Array,
     loadings: zarr.Array,
     symphony_sources: Mapping[str, zarr.Array] | None,
     feature_ids: np.ndarray,
@@ -180,6 +189,7 @@ def write_artifact_mapping_reference_from_sources(
     create_zarr_obj_array(group, "feature_ids", np.asarray(feature_ids))
     _write_array_from_source(group, "feature_means", feature_means)
     _write_array_from_source(group, "feature_scales", feature_scales)
+    _write_array_from_source(group, "center", center)
     _write_array_from_source(group, "loadings", loadings)
     _write_array(
         group,
@@ -509,6 +519,7 @@ def _validate_and_load_artifact_mapping_reference(
     feature_ids_array = as_zarr_array(group["feature_ids"], name="feature_ids")
     feature_means_array = _numeric_payload_array(group, "feature_means", ndim=1)
     feature_scales_array = _numeric_payload_array(group, "feature_scales", ndim=1)
+    center_array = _numeric_payload_array(group, "center", ndim=1)
     loadings_array = _numeric_payload_array(group, "loadings", ndim=2)
     n_features = int(loadings_array.shape[0])
     n_dims = int(loadings_array.shape[1])
@@ -521,8 +532,10 @@ def _validate_and_load_artifact_mapping_reference(
         or not _stored_string_values_are_unique(feature_ids_array)
         or feature_means_array.shape != (n_features,)
         or feature_scales_array.shape != (n_features,)
+        or center_array.shape != (n_features,)
         or not _numeric_values_are_valid(feature_means_array)
         or not _numeric_values_are_valid(feature_scales_array, positive=True)
+        or not _numeric_values_are_valid(center_array)
         or not _numeric_values_are_valid(loadings_array)
     ):
         raise _contract_error("Mapping reference PCA model is invalid")
@@ -539,6 +552,11 @@ def _validate_and_load_artifact_mapping_reference(
     scaling_group = artifact_group(datastore.zw, feature_scaling)
     source_feature_means = as_zarr_array(scaling_group["mean"], name="mean")
     source_feature_scales = as_zarr_array(scaling_group["scale"], name="scale")
+    if "center" not in reduction_group:
+        raise _contract_error(
+            "Reference PCA has no fitted center; recompute PCA and its descendants"
+        )
+    source_center = as_zarr_array(reduction_group["center"], name="center")
     source_loadings = as_zarr_array(reduction_group["loadings"], name="loadings")
     reduction_data = as_zarr_array(reduction_group["data"], name="data")
     if (
@@ -569,6 +587,7 @@ def _validate_and_load_artifact_mapping_reference(
                 feature_scales_array,
                 source_feature_scales,
             ),
+            _stored_array_matches_array(center_array, source_center),
             _stored_array_matches_array(
                 loadings_array,
                 source_loadings,
@@ -674,6 +693,7 @@ def _validate_and_load_artifact_mapping_reference(
         validate_mapping_reference_sources(
             feature_means=source_feature_means,
             feature_scales=source_feature_scales,
+            center=source_center,
             loadings=source_loadings,
             symphony_sources=source_arrays,
         )
@@ -750,6 +770,7 @@ def _validate_and_load_artifact_mapping_reference(
     model = ScaledPCAProjectionModel(
         feature_means=_values(group, "feature_means"),
         feature_scales=_values(group, "feature_scales"),
+        center=_values(group, "center"),
         loadings=_values(group, "loadings"),
     )
     symphony_state = (
@@ -825,7 +846,7 @@ def validate_mapping_reference_binding(
         and isinstance(reference.model, ScaledPCAProjectionModel)
         and all(
             _stored_array_matches_values(group[name], getattr(reference.model, name))
-            for name in ("feature_means", "feature_scales", "loadings")
+            for name in ("feature_means", "feature_scales", "center", "loadings")
         )
         and _stored_array_matches_values(
             group["feature_ids"],
@@ -895,7 +916,7 @@ def mapping_reference_payload_matches_expected(
             matches
             and all(
                 _stored_array_matches_values(group[name], getattr(model, name))
-                for name in ("feature_means", "feature_scales", "loadings")
+                for name in ("feature_means", "feature_scales", "center", "loadings")
             )
             and _stored_array_matches_values(
                 group["feature_ids"],
@@ -936,6 +957,7 @@ def mapping_reference_payload_matches_sources(
     *,
     feature_means: zarr.Array,
     feature_scales: zarr.Array,
+    center: zarr.Array,
     loadings: zarr.Array,
     symphony_sources: Mapping[str, zarr.Array] | None,
     feature_ids: np.ndarray,
@@ -955,6 +977,7 @@ def mapping_reference_payload_matches_sources(
             and mapping_reference_source_fingerprint(
                 feature_means=feature_means,
                 feature_scales=feature_scales,
+                center=center,
                 loadings=loadings,
                 symphony_sources=symphony_sources,
             )
@@ -969,6 +992,10 @@ def mapping_reference_payload_matches_sources(
             and _stored_array_matches_array(
                 as_zarr_array(group["feature_scales"], name="feature_scales"),
                 feature_scales,
+            )
+            and _stored_array_matches_array(
+                as_zarr_array(group["center"], name="center"),
+                center,
             )
             and _stored_array_matches_array(
                 as_zarr_array(group["loadings"], name="loadings"),
@@ -1009,6 +1036,7 @@ def validate_mapping_reference_sources(
     *,
     feature_means: zarr.Array,
     feature_scales: zarr.Array,
+    center: zarr.Array,
     loadings: zarr.Array,
     symphony_sources: Mapping[str, zarr.Array] | None,
 ) -> tuple[int, int]:
@@ -1017,15 +1045,18 @@ def validate_mapping_reference_sources(
         raise ValueError("Reference PCA loadings have incompatible dimensions")
     n_features = int(loadings.shape[0])
     n_dims = int(loadings.shape[1])
-    pca_arrays = (feature_means, feature_scales, loadings)
+    pca_arrays = (feature_means, feature_scales, center, loadings)
     if (
         feature_means.ndim != 1
         or feature_scales.ndim != 1
+        or center.ndim != 1
         or feature_means.shape != (n_features,)
         or feature_scales.shape != (n_features,)
+        or center.shape != (n_features,)
         or any(np.dtype(array.dtype) != np.dtype(np.float64) for array in pca_arrays)
         or not _numeric_values_are_valid(feature_means)
         or not _numeric_values_are_valid(feature_scales, positive=True)
+        or not _numeric_values_are_valid(center)
         or not _numeric_values_are_valid(loadings)
     ):
         raise ValueError("Reference PCA model arrays are invalid")
@@ -1072,6 +1103,7 @@ def mapping_reference_source_fingerprint(
     *,
     feature_means: zarr.Array,
     feature_scales: zarr.Array,
+    center: zarr.Array,
     loadings: zarr.Array,
     symphony_sources: Mapping[str, zarr.Array] | None,
 ) -> str:
@@ -1079,6 +1111,7 @@ def mapping_reference_source_fingerprint(
     sources: list[tuple[str, zarr.Array]] = [
         ("feature_means", feature_means),
         ("feature_scales", feature_scales),
+        ("center", center),
         ("loadings", loadings),
     ]
     if symphony_sources is not None:
@@ -1338,10 +1371,14 @@ def _validate_payload_names(group: zarr.Group, method: str) -> None:
     missing = expected - arrays
     unexpected = arrays - expected
     if missing:
-        raise _contract_error(
-            "Mapping reference is missing required arrays: "
-            + ", ".join(sorted(missing))
+        message = "Mapping reference is missing required arrays: " + ", ".join(
+            sorted(missing)
         )
+        if "center" in missing:
+            message += (
+                ". Recompute PCA and its descendants before rebuilding this reference."
+            )
+        raise _contract_error(message)
     if unexpected:
         raise _contract_error(
             "Mapping reference contains arrays outside the current contract: "
@@ -1460,3 +1497,100 @@ def _write_array_from_source(
 
 def _contract_error(detail: str) -> ValueError:
     return ValueError(f"{detail}. {MAPPING_REFERENCE_REBUILD_MESSAGE}")
+
+
+def _reference_available_k(reference: MappingReference) -> int:
+    root = reference.datastore.zw
+    rebuild = "Rebuild it with build_mapping_reference(neighbors)."
+    reference.validate_frozen_axes()
+    if reference.ref.assay != reference.assay_name:
+        raise ValueError(f"Mapping reference assay identity is inconsistent. {rebuild}")
+    if reference.model.n_features != len(reference.feature_ids):
+        raise ValueError(
+            f"Mapping reference feature dimensions are inconsistent. {rebuild}"
+        )
+    if reference.method == "pca":
+        if reference.symphony_state is not None:
+            raise ValueError(f"Plain mapping reference has Symphony state. {rebuild}")
+    elif reference.method == "symphony":
+        if reference.symphony_state is None:
+            raise ValueError(
+                f"Symphony mapping reference has no correction state. {rebuild}"
+            )
+    else:
+        raise ValueError(f"Mapping reference method is unsupported. {rebuild}")
+
+    expected = (
+        (reference.ref, "build_mapping_reference"),
+        (reference.reduction, "run_pca"),
+        (reference.ann_index, "build_ann_index"),
+        (reference.neighbors, "query_neighbors"),
+    )
+    statuses = {}
+    for ref, operation in expected:
+        status = inspect_artifact(root, ref)
+        if not status.exists or not status.complete or status.operation != operation:
+            raise ValueError(f"Mapping reference graph chain is incomplete. {rebuild}")
+        statuses[ref] = status
+
+    ann_status = statuses[reference.ann_index]
+    ann_parameters = ann_status.parameters or {}
+    if ann_parameters.get("ann_metric") != reference.ann_metric:
+        raise ValueError(f"Mapping reference ANN metric is inconsistent. {rebuild}")
+    ann_ef = ann_parameters.get("ann_ef", 50)
+    if isinstance(ann_ef, bool) or not isinstance(ann_ef, int) or ann_ef < 1:
+        raise ValueError(f"Mapping reference ANN search depth is invalid. {rebuild}")
+
+    neighbors_status = statuses[reference.neighbors]
+    raw_ann = (neighbors_status.inputs or {}).get("ann_index")
+    if (
+        not isinstance(raw_ann, dict)
+        or ArtifactRef.from_dict(raw_ann) != reference.ann_index
+    ):
+        raise ValueError(
+            f"Mapping reference neighbors use another ANN index. {rebuild}"
+        )
+    if (neighbors_status.parameters or {}).get(
+        "distance_metric"
+    ) != reference.ann_metric:
+        raise ValueError(
+            f"Mapping reference neighbor metric is inconsistent. {rebuild}"
+        )
+
+    neighbors_group = artifact_group(root, reference.neighbors)
+    indices = as_zarr_array(neighbors_group["indices"], name="indices")
+    distances = as_zarr_array(neighbors_group["distances"], name="distances")
+    if (
+        indices.ndim != 2
+        or distances.shape != indices.shape
+        or int(indices.shape[0]) != reference.selected_cell_count
+        or int(indices.shape[1]) < 1
+    ):
+        raise ValueError(f"Mapping reference neighbor payload is invalid. {rebuild}")
+    ann_group = artifact_group(root, reference.ann_index)
+    if not has_ann_index(ann_group):
+        raise ValueError(f"Mapping reference ANN index is missing. {rebuild}")
+    return int(indices.shape[1])
+
+
+def _load_reference_neighbor_query(
+    reference: MappingReference,
+    *,
+    save_k: int,
+    workers: int,
+) -> NeighborQueryStage:
+    root = reference.datastore.zw
+    ann_status = inspect_artifact(root, reference.ann_index)
+    parameters = ann_status.parameters or {}
+    index = load_ann_index(
+        artifact_group(root, reference.ann_index),
+        reference.ann_metric,
+        reference.model.n_dims,
+        expected_count=reference.selected_cell_count,
+    )
+    configured = AnnIndexStage.configure(
+        index,
+        ef=int(parameters.get("ann_ef", 50)),
+        threads=workers,
+    )
+    return NeighborQueryStage(configured, save_k, reference.ann_metric)
