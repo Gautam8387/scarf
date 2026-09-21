@@ -12,9 +12,10 @@ from scipy.sparse import csr_matrix, vstack
 
 from ..matrix import ChunkedArray
 from ..metadata import MetaData
+from ..storage.artifacts import provenance_hash
 from ..storage.budget import ResourceBudget, resolve_budget
 from ..storage.types import as_zarr_array, as_zarr_group
-from ..utils.arrays import array_digest
+from ..utils.arrays import array_digest, regex_match_mask
 from ..utils.compute import controlled_compute, compute_with_progress
 from ..utils.logging import logger
 from .normalization import NormMethod, norm_dummy, norm_lib_size
@@ -144,6 +145,21 @@ class Assay:
             return {}
         return {str(k): str(v) for k, v in raw.items()}
 
+    def _cell_count_totals(self, cell_idx: np.ndarray) -> np.ndarray:
+        """Read cell totals, computing missing read-only totals from raw counts."""
+        if len(cell_idx) == 0:
+            return np.empty(0, dtype=np.float64)
+        column = self.name + "_nCounts"
+        if column in self.cells.columns or not self.z.read_only:
+            totals = self.cells.fetch_all(column)[cell_idx]
+        else:
+            totals = compute_with_progress(
+                self.rawData[cell_idx, :].sum(axis=1),
+                f"({self.name}) Computing total counts for normalization",
+                self.nthreads,
+            )
+        return np.asarray(totals, dtype=np.float64)
+
     def normed(
         self,
         cell_idx: np.ndarray | None = None,
@@ -196,6 +212,8 @@ class Assay:
 
     def _ini_feature_props(self) -> None:
         """ """
+        if self.z.read_only:
+            return
         if "nCells" in self.feats.columns and "dropOuts" in self.feats.columns:
             return
         if _DEFER_FEATURE_PROPS.get():
@@ -409,46 +427,74 @@ class Assay:
         self,
         feat_pattern: str,
         name: str,
-    ) -> np.ndarray | None:
-        percent_features = self._percent_features()
-        if name in percent_features:
-            if percent_features[name] == feat_pattern:
-                return None
-            logger.debug(f"Pattern for percentage feature {name} updated")
-        self.attrs["percentFeatures"] = {
-            **percent_features,
-            **{name: feat_pattern},
-        }
-        feat_idx = sorted(
-            self.feats.get_index_by(self.feats.grep(feat_pattern), "names")
+    ) -> tuple[np.ndarray, str] | None:
+        feat_idx = np.flatnonzero(
+            regex_match_mask(self.feats.fetch_all("names"), feat_pattern)
         )
+        fingerprint = provenance_hash(
+            {
+                "pattern": feat_pattern,
+                "feature_indices": feat_idx.tolist(),
+                "feature_ids": self.feats.fetch_all("ids")[feat_idx].tolist(),
+            }
+        )
+        percent_features = self._percent_features()
+        has_column = name in self.cells.columns
+        if has_column and percent_features.get(name) == feat_pattern:
+            if (
+                self.cells._get_array(name).attrs.get("feature_selection_fingerprint")
+                == fingerprint
+            ):
+                return None
+            logger.info(
+                f"Recomputing {name}: matched-feature provenance has changed or is missing"
+            )
+        elif has_column:
+            logger.warning(
+                f"Recomputing {name}: feature pattern changed from "
+                f"{percent_features.get(name)!r} to {feat_pattern!r}"
+            )
+        if name in percent_features:
+            del percent_features[name]
+            self.attrs["percentFeatures"] = percent_features
+        if has_column:
+            self.cells.drop(name)
         if len(feat_idx) == 0:
             logger.warning(
-                f"No matches found for pattern {feat_pattern}."
-                f" Will not add/update percentage feature"
+                f"No matches found for pattern {feat_pattern}. "
+                f"Percentage feature {name} is unavailable"
             )
             return None
-        return np.asarray(feat_idx, dtype=np.int64)
+        return feat_idx, fingerprint
 
     def _write_percent_feature(
         self,
         name: str,
         total: np.ndarray,
         *,
+        feat_pattern: str,
+        feature_fingerprint: str,
         n_counts: np.ndarray | None = None,
     ) -> None:
-        if total.sum() == 0:
-            logger.warning(
-                f"Percentage feature {name} not added because not detected in any cell"
-            )
-            return
         if n_counts is None:
             n_counts = self.cells.fetch_all(self.name + "_nCounts")
         self.cells.insert(
             name,
-            100 * total / n_counts,
+            np.divide(
+                100 * total,
+                n_counts,
+                out=np.full(total.shape, np.nan, dtype=np.float64),
+                where=n_counts != 0,
+            ),
             overwrite=True,
         )
+        self.cells._get_array(name).attrs["feature_selection_fingerprint"] = (
+            feature_fingerprint
+        )
+        self.attrs["percentFeatures"] = {
+            **self._percent_features(),
+            name: feat_pattern,
+        }
 
     def _compute_feature_percentage(
         self,

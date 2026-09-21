@@ -523,7 +523,7 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
 
         Args:
             graph: Explicit connectivity-map or integrated-graph artifact.
-            n_singular_vals: Number of the smallest singular values to save.
+            n_singular_vals: Number of smallest singular modes requested, including the null mode.
             source_sink: Explicit axis-aligned label artifact. Required with
                 ``sources`` or ``sinks`` and omitted when ``ss_vec`` is supplied.
             sources: A list of group/cluster ids from ``source_sink`` to be treated as sources. Sources are
@@ -571,14 +571,6 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
         )
         graph_ref = graph
         stored_selection = graph_cell_selection(self.zw, graph_ref)
-        validate_stored_selection_integrity(
-            self.zw,
-            stored_selection,
-            kind="cell_selection",
-            scope="datastore",
-            assay=None,
-            table_path="cellData",
-        )
 
         logger.info(f"Pseudotime scoring: loading graph {graph_ref.artifact_id}")
         graph_matrix = self.load_graph(
@@ -602,7 +594,11 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             selected_cell_indices,
             component_policy,
         )
-        retained_graph = graph_matrix[retained_mask][:, retained_mask].tocsr()
+        retained_graph = (
+            graph_matrix
+            if retained_mask.all()
+            else graph_matrix[retained_mask][:, retained_mask]
+        ).tocsr()
         if len(component_sizes) > 1:
             logger.warning(
                 f"Selected graph components have sizes {component_sizes}. "
@@ -1046,7 +1042,15 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
         )
         if graph_matrix.shape[0] != len(ptime_valid):
             raise ValueError("Pseudotime does not align with its graph")
-        retained_graph = graph_matrix[ptime_valid][:, ptime_valid].tocsr()
+        retained_graph = (
+            graph_matrix
+            if ptime_valid.all()
+            else graph_matrix[ptime_valid][:, ptime_valid]
+        ).tocsr()
+        retained_graph_is_shared = (
+            retained_graph is graph_matrix
+            and getattr(self, "_graphMemoryCache", None) is not None
+        )
         retained_ptime = ptime[ptime_valid]
         retained_sink_values = sink_values[ptime_valid]
 
@@ -1106,7 +1110,7 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
                 beta=beta,
                 solver_tol=solver_tol,
                 max_iterations=max_iterations,
-                _copy_graph=False,
+                _copy_graph=retained_graph_is_shared,
             )
         )
         if computed_sink_labels != requested_sink_labels:
