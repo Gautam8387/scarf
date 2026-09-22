@@ -2607,12 +2607,12 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             required_arrays=(
                 ArrayRequirement(
                     "edges",
-                    shape=(None, 2),
+                    shape=(n_cells * n_neighbors, 2),
                     dtype=np.uint32,
                 ),
                 ArrayRequirement(
                     "weights",
-                    shape=(None,),
+                    shape=(n_cells * n_neighbors,),
                     dtype=np.float32,
                 ),
             ),

@@ -443,9 +443,12 @@ def _collect_cluster_structure_metrics(
     try:
         graph_group = store.load_artifact(graph_ref)
         graph_edges = as_zarr_array(graph_group["edges"], name="edges")
+        graph_weights = as_zarr_array(graph_group["weights"], name="weights")
         connectivity = _cached_candidate_metric(
             (id(store), "cluster_connectivity", graph_ref, cluster_ref),
-            lambda: float(graph_connectivity(graph_edges, cluster_values)),
+            lambda: float(
+                graph_connectivity(graph_edges, cluster_values, weights=graph_weights)
+            ),
         )
         if np.isfinite(connectivity):
             metrics.clusterConnectivity = connectivity
@@ -728,6 +731,9 @@ def _collect_covariate_metrics(
                         graph_connectivity(
                             as_zarr_array(graph_group["edges"], name="edges"),
                             labels,
+                            weights=as_zarr_array(
+                                graph_group["weights"], name="weights"
+                            ),
                         )
                     ),
                 },

@@ -63,7 +63,7 @@ def build_connectivity_arrays(
     local_connectivity: float,
     bandwidth: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Build compact edge and weight arrays for a complete KNN matrix."""
+    """Build edge and weight arrays retaining every KNN entry."""
     local_connectivity, bandwidth = validate_connectivity_parameters(
         local_connectivity,
         bandwidth,
@@ -106,8 +106,7 @@ def build_connectivity_arrays(
     weights = np.asarray(values, dtype=np.float32)
     if not np.all(np.isfinite(weights)):
         raise ValueError("Connectivity weights must be finite")
-    positive = weights > 0
-    return edges[positive], weights[positive]
+    return edges, weights
 
 
 def take_nearest_per_row(
@@ -119,9 +118,8 @@ def take_nearest_per_row(
     """Keep the ``use_k`` nearest stored edges of every cell.
 
     Edges are stored row major and ordered by increasing distance inside a cell,
-    so a row's leading entries are its nearest neighbors. Row widths are counted
-    rather than assumed, because zero-weight edges are dropped before storage and
-    can leave a cell with fewer than ``k`` edges.
+    so a row's leading entries are its nearest neighbors. Rows with fewer than
+    ``use_k`` stored edges keep all their entries.
     """
     sources = np.asarray(edges[:, 0], dtype=np.intp)
     if np.any(np.diff(sources) < 0):

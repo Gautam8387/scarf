@@ -590,7 +590,7 @@ def test_build_connectivity_arrays_runs_in_memory():
     np.testing.assert_allclose(weights, expected_weights, rtol=1e-6, atol=1e-7)
 
 
-def test_connectivity_omits_zero_membership_edges():
+def test_connectivity_preserves_zero_weight_neighbors():
     n_cells, n_neighbors = 10, 5
     indices = np.array(
         [
@@ -611,10 +611,13 @@ def test_connectivity_omits_zero_membership_edges():
     )
 
     expected = np.tile(
-        np.array([1.0, 1.0, 1.0, 0.9512299], dtype=np.float32),
+        np.array([1.0, 1.0, 1.0, 0.9512299, 0.0], dtype=np.float32),
         n_cells,
     )
-    assert len(edges) == n_cells * 4
+    np.testing.assert_array_equal(
+        edges,
+        np.column_stack((np.repeat(np.arange(n_cells), n_neighbors), indices.ravel())),
+    )
     np.testing.assert_allclose(weights, expected, rtol=1e-6, atol=1e-7)
 
 

@@ -364,18 +364,44 @@ def test_graph_connectivity_matches_materialized_symmetric_reference():
     ) == pytest.approx(1 / 3)
 
 
-def test_graph_connectivity_matches_chunked_zarr_and_chunk_sizes():
-    labels = np.array([0, 0, 0, 1, 1])
+@pytest.mark.parametrize("batch_rows", [1, 3, 10])
+@pytest.mark.parametrize("stored", [False, True])
+def test_graph_connectivity_ignores_zero_weight_bridges(batch_rows, stored):
+    labels = np.zeros(4, dtype=int)
     edges = np.array(
-        [[0, 1], [1, 0], [1, 2], [3, 4], [4, 3]],
+        [[0, 1], [1, 0], [2, 3], [3, 2], [1, 2]],
         dtype=np.uint64,
     )
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    z_edges = root.create_array("edges", data=edges, chunks=(2, 2))
-    expected = graph_connectivity(edges, labels, batch_rows=len(edges))
+    weights = np.array([1.0, 0.5, 0.25, 1.0, 0.0], dtype=np.float32)
+    if stored:
+        root = zarr.open_group(store=MemoryStore(), mode="w")
+        edges = root.create_array("edges", data=edges, chunks=(2, 2))
+        weights = root.create_array("weights", data=weights, chunks=(3,))
 
-    assert graph_connectivity(edges, labels, batch_rows=1) == pytest.approx(expected)
-    assert graph_connectivity(z_edges, labels, batch_rows=3) == pytest.approx(expected)
+    assert (
+        graph_connectivity(edges, labels, batch_rows=batch_rows, weights=weights) == 0.5
+    )
+    assert graph_connectivity(edges, labels, batch_rows=batch_rows) == 1.0
+
+
+@pytest.mark.parametrize(
+    ("weights", "error", "message"),
+    [
+        (np.ones((2, 1)), ValueError, "one value per edge"),
+        (np.ones(1), ValueError, "one value per edge"),
+        (np.array(["1", "0"]), TypeError, "real numbers"),
+        (np.array([1.0, np.nan]), ValueError, "finite and non-negative"),
+        (np.array([1.0, -1.0]), ValueError, "finite and non-negative"),
+    ],
+)
+def test_graph_connectivity_rejects_invalid_weights(weights, error, message):
+    with pytest.raises(error, match=message):
+        graph_connectivity(
+            np.array([[0, 1], [1, 0]]),
+            np.zeros(2),
+            batch_rows=1,
+            weights=weights,
+        )
 
 
 def test_graph_connectivity_validates_inputs():

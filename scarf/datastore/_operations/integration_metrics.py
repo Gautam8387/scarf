@@ -454,7 +454,8 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
             name=status.path,
         )
         edges = as_zarr_array(graph_grp["edges"], name="edges")
-        return graph_connectivity(edges, labels)
+        weights = as_zarr_array(graph_grp["weights"], name="weights")
+        return graph_connectivity(edges, labels, weights=weights)
 
     def metric_graph_silhouette(
         self,

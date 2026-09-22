@@ -53,12 +53,15 @@ def graph_connectivity(
     edges: np.ndarray | ZarrArray,
     labels: Sequence[object] | np.ndarray,
     batch_rows: int = _CONNECTIVITY_BATCH_ROWS,
+    *,
+    weights: np.ndarray | ZarrArray | None = None,
 ) -> float:
     """Score label connectivity on a persisted, implicitly undirected graph.
 
     Each directed edge is treated as an undirected connection. The result is
     the mean, across labels, of the fraction of cells in the largest connected
-    component for that label.
+    component for that label. When weights are supplied, zero-weight edges
+    do not connect cells.
 
     This follows the original scIB symmetrized-graph definition. It does not
     match the directed strong-component calculation currently implemented by
@@ -73,6 +76,11 @@ def graph_connectivity(
         raise TypeError("Graph edges must contain integers")
     if batch_rows < 1:
         raise ValueError("batch_rows must be greater than zero")
+    if weights is not None:
+        if weights.shape != (edges.shape[0],):
+            raise ValueError("Graph weights must have one value per edge")
+        if weights.dtype.kind not in "fiu":
+            raise TypeError("Graph weights must be real numbers")
 
     categorical = pd.Categorical(labels)
     n_cells = len(categorical)
@@ -90,6 +98,8 @@ def graph_connectivity(
     chunk_rows = batch_rows
     if isinstance(edges, zarr.Array):
         chunk_rows = min(chunk_rows, int(edges.chunks[0]))
+    if isinstance(weights, zarr.Array):
+        chunk_rows = min(chunk_rows, int(weights.chunks[0]))
 
     n_edges = edges.shape[0]
     total = (n_edges + chunk_rows - 1) // chunk_rows
@@ -102,6 +112,11 @@ def graph_connectivity(
         edge_block = np.asarray(edges[start:end])
         if np.any(edge_block < 0) or np.any(edge_block >= n_cells):
             raise IndexError("Graph edge index is outside the label array")
+        if weights is not None:
+            weight_block = np.asarray(weights[start:end])
+            if not np.all(np.isfinite(weight_block)) or np.any(weight_block < 0):
+                raise ValueError("Graph weights must be finite and non-negative")
+            edge_block = edge_block[weight_block > 0]
         _union_same_label_edges(
             np.asarray(edge_block, dtype=np.int64),
             label_codes,

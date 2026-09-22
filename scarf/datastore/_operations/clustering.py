@@ -789,7 +789,8 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             symmetric=False,
             upper_only=False,
             use_k=use_k,
-        )
+        ).copy()
+        graph_matrix.eliminate_zeros()
 
         if len(cluster_values) != graph_matrix.shape[0]:
             raise ValueError(
