@@ -219,6 +219,8 @@ def _mapping_reference(
         },
         reference_distance_quantiles=np.array([0.5]),
         reference_distance_values=np.array([1.0]),
+        payload_fingerprint="payload",
+        model_digest="model",
     )
     return reference, root
 

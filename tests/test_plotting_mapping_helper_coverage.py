@@ -84,6 +84,8 @@ def _reference(*, metadata: Mapping[str, Any] | None = None) -> MappingReference
         },
         reference_distance_quantiles=np.array([0.0, 1.0]),
         reference_distance_values=np.array([0.1, 0.2]),
+        payload_fingerprint="payload",
+        model_digest="model",
     )
 
 

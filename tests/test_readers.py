@@ -799,34 +799,34 @@ def test_h5ad_reader_streams_sparse_matrix(h5ad_reader):
     )
 
 
+@pytest.mark.parametrize("batch_size", [1, 2, 4, 5, 8, 9])
 @pytest.mark.parametrize(
-    ("values", "batch_size"),
+    "values",
     [
-        (
-            np.array(
-                [
-                    [1, 0, 2],
-                    [0, 0, 0],
-                    [0, 3, 0],
-                    [0, 0, 0],
-                ],
-                dtype=np.uint32,
-            ),
-            2,
+        np.array(
+            [
+                [1, 0, 2],
+                [0, 0, 0],
+                [0, 3, 0],
+                [0, 0, 0],
+            ],
+            dtype=np.uint32,
         ),
-        (
-            np.array(
-                [
-                    [1, 0, 0],
-                    [0, 2, 0],
-                    [0, 0, 0],
-                    [3, 0, 4],
-                    [0, 5, 0],
-                ],
-                dtype=np.uint32,
-            ),
-            2,
+        np.array(
+            [
+                [1, 0, 0],
+                [0, 2, 0],
+                [0, 0, 0],
+                [3, 0, 4],
+                [0, 5, 0],
+            ],
+            dtype=np.uint32,
         ),
+        np.array(
+            [[0, 0, 0]] * 5 + [[6, 0, 0], [0, 7, 0], [0, 0, 8]],
+            dtype=np.uint32,
+        ),
+        np.zeros((8, 3), dtype=np.uint32),
     ],
 )
 def test_h5ad_reader_preserves_sparse_batches(tmp_path, values, batch_size):
@@ -845,6 +845,7 @@ def test_h5ad_reader_preserves_sparse_batches(tmp_path, values, batch_size):
         )
         assert reader.max_batch_nnz(batch_size) == expected_max_nnz
         chunks = list(reader.consume(batch_size=batch_size))
+        assert all(0 < chunk.shape[0] <= batch_size for chunk in chunks)
         assert sum(chunk.shape[0] for chunk in chunks) == values.shape[0]
         assert sum(chunk.nnz for chunk in chunks) == np.count_nonzero(values)
         np.testing.assert_array_equal(
@@ -907,7 +908,11 @@ def test_h5ad_reader_converts_csc_sparse_encoding(tmp_path):
     assert root["RNA/countsT"].attrs["complete"] is True
 
 
-def test_h5ad_to_zarr_preserves_exact_sparse_batch(tmp_path):
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
+@pytest.mark.parametrize("leading_empty_cells", [0, 4])
+def test_h5ad_to_zarr_preserves_exact_sparse_batch(
+    tmp_path, batch_size, leading_empty_cells
+):
     import zarr
 
     from scarf.readers import H5adReader
@@ -922,13 +927,14 @@ def test_h5ad_to_zarr_preserves_exact_sparse_batch(tmp_path):
         ],
         dtype=np.uint32,
     )
+    values = np.pad(values, ((leading_empty_cells, 0), (0, 0)))
     file_name = tmp_path / "exact_batch.h5ad"
     zarr_path = tmp_path / "exact_batch.zarr"
     _write_sparse_h5ad(file_name, values)
     reader = H5adReader(str(file_name), feature_name_key="feature_name")
     try:
         writer = H5adToZarr(reader, zarr_loc=str(zarr_path))
-        writer.dump(batch_size=2)
+        writer.dump(batch_size=batch_size)
     finally:
         reader.h5.close()
 
@@ -936,6 +942,7 @@ def test_h5ad_to_zarr_preserves_exact_sparse_batch(tmp_path):
     np.testing.assert_array_equal(root["RNA/counts"][:], values)
     assert "countsT" in root["RNA"]
     assert root["RNA/countsT"].attrs["complete"] is True
+    np.testing.assert_array_equal(root["RNA/countsT"][:], values.T)
 
 
 def test_h5ad_reader_streams_cell_and_feature_metadata(h5ad_reader):

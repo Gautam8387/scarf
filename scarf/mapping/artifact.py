@@ -35,7 +35,7 @@ from ..storage.types import as_zarr_array, as_zarr_group
 from .confidence import _distance_quantile_summary
 from .features import _normalization_parameters
 from .models import ScaledPCAProjectionModel, SymphonyCorrectionModel
-from .reference import MappingReference
+from .reference import MappingReference, mapping_reference_model_digest
 
 MAPPING_REFERENCE_REBUILD_MESSAGE = (
     "Rebuild it with build_mapping_reference(neighbors)."
@@ -759,81 +759,99 @@ def _validate_and_load_artifact_mapping_reference(
         metadata=metadata,
         reference_distance_quantiles=distance_quantiles,
         reference_distance_values=distance_values,
+        payload_fingerprint=stored_payload_fingerprint,
+        model_digest=mapping_reference_model_digest(
+            model=model,
+            symphony_state=symphony_state,
+            feature_ids=feature_ids,
+            metadata=metadata,
+            reference_distance_quantiles=distance_quantiles,
+            reference_distance_values=distance_values,
+        ),
     )
 
 
 def validate_mapping_reference_binding(
     reference: MappingReference,
 ) -> MappingReference:
-    """Reject an in-memory handle that differs from its stored artifact."""
+    """Reject an in-memory handle that differs from its stored artifact.
+
+    The stored chain is validated in full when ``get_mapping_reference`` loads
+    a handle. Later operations compare the artifact record and its attributes
+    with the handle and the handle's arrays with the digest recorded at load,
+    so a bound handle costs a few metadata reads per operation rather than a
+    pass over the payload, the index and the neighbours.
+    """
     if not isinstance(reference, MappingReference):
         raise TypeError("reference must be a MappingReference")
-    validate_artifact_mapping_reference(reference.datastore, reference.ref)
-    status = inspect_artifact(reference.datastore.zw, reference.ref)
+    mismatch = ValueError(
+        "MappingReference handle does not match its stored artifact. "
+        "Reload it with get_mapping_reference(reference.ref)."
+    )
+    ref = reference.ref
+    if (
+        not isinstance(ref, ArtifactRef)
+        or ref.scope != "assay"
+        or ref.assay is None
+        or ref.kind != "mapping_reference"
+    ):
+        raise mismatch
+    root = reference.datastore.zw
+    status = inspect_artifact(root, ref)
+    if not status.exists or not status.complete:
+        raise _contract_error("Mapping reference artifact is missing or incomplete")
+    if status.operation != "build_mapping_reference":
+        raise mismatch
+    get_assay = getattr(reference.datastore, "_get_assay", None)
+    if callable(get_assay):
+        stored_dataset_fingerprint = get_assay(reference.assay_name).attrs.get(
+            "dataset_fingerprint"
+        )
+        if (
+            isinstance(stored_dataset_fingerprint, str)
+            and stored_dataset_fingerprint
+            and stored_dataset_fingerprint != reference.dataset_fingerprint
+        ):
+            raise _contract_error(
+                "Live assay dataset fingerprint does not match the mapping reference"
+            )
     method = (status.parameters or {}).get("method")
-    group = artifact_group(reference.datastore.zw, reference.ref)
+    if method not in {"pca", "symphony"}:
+        raise mismatch
+    group = artifact_group(root, ref)
     raw_metadata = group.attrs.get("reference_metadata")
-    assert isinstance(raw_metadata, Mapping)
+    stored_payload_fingerprint = group.attrs.get("payload_fingerprint")
+    if not isinstance(raw_metadata, Mapping):
+        raise mismatch
     metadata = dict(raw_metadata)
-    expected_scalars = {
-        "ref": reference.ref,
-        "assay_name": metadata["assay"],
-        "reduction": _ref_from_input(status, "reduction"),
-        "ann_index": _ref_from_input(status, "ann_index"),
-        "neighbors": _ref_from_input(status, "neighbors"),
-        "cell_selection": _ref_from_input(status, "cell_selection"),
-        "feature_selection": _ref_from_input(status, "feature_selection"),
-        "batch_correction": (
-            _ref_from_input(status, "batch_correction")
-            if method == "symphony"
-            else None
-        ),
-        "dataset_fingerprint": metadata["dataset_fingerprint"],
-        "selected_cell_count": metadata["selected_cell_count"],
-    }
+    try:
+        expected_scalars = {
+            "ref": ref,
+            "assay_name": metadata["assay"],
+            "reduction": _ref_from_input(status, "reduction"),
+            "ann_index": _ref_from_input(status, "ann_index"),
+            "neighbors": _ref_from_input(status, "neighbors"),
+            "cell_selection": _ref_from_input(status, "cell_selection"),
+            "feature_selection": _ref_from_input(status, "feature_selection"),
+            "batch_correction": (
+                _ref_from_input(status, "batch_correction")
+                if method == "symphony"
+                else None
+            ),
+            "dataset_fingerprint": metadata["dataset_fingerprint"],
+            "selected_cell_count": metadata["selected_cell_count"],
+            "payload_fingerprint": stored_payload_fingerprint,
+        }
+    except (KeyError, TypeError, ValueError):
+        raise mismatch from None
     matches = all(
         getattr(reference, name) == expected
         for name, expected in expected_scalars.items()
     )
-    matches = (
-        matches
-        and isinstance(reference.model, ScaledPCAProjectionModel)
-        and all(
-            _stored_array_matches_values(group[name], getattr(reference.model, name))
-            for name in ("feature_means", "feature_scales", "center", "loadings")
-        )
-        and _stored_array_matches_values(
-            group["feature_ids"],
-            reference.feature_ids,
-            strings=True,
-            require_dtype=False,
-        )
-        and _stored_array_matches_values(
-            group["reference_distance_quantiles"],
-            reference.reference_distance_quantiles,
-        )
-        and _stored_array_matches_values(
-            group["reference_distance_values"],
-            reference.reference_distance_values,
-        )
-    )
+    matches = matches and isinstance(reference.model, ScaledPCAProjectionModel)
     if method == "symphony":
-        matches = (
-            matches
-            and isinstance(reference.symphony_state, SymphonyCorrectionModel)
-            and all(
-                _stored_array_matches_values(
-                    group[name],
-                    getattr(reference.symphony_state, name),
-                )
-                for name in (
-                    "centroids",
-                    "raw_centroids",
-                    "corrected_centroids",
-                    "cluster_mass",
-                    "sigma",
-                )
-            )
+        matches = matches and isinstance(
+            reference.symphony_state, SymphonyCorrectionModel
         )
     else:
         matches = matches and reference.symphony_state is None
@@ -841,13 +859,12 @@ def validate_mapping_reference_binding(
         matches = matches and canonical_bytes(reference.metadata) == canonical_bytes(
             metadata
         )
+        matches = matches and reference.current_model_digest() == reference.model_digest
     except (TypeError, ValueError):
         matches = False
     if not matches:
-        raise ValueError(
-            "MappingReference handle does not match its stored artifact. "
-            "Reload it with get_mapping_reference(reference.ref)."
-        )
+        raise mismatch
+    reference._validate_cell_selection()
     return reference
 
 
