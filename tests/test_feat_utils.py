@@ -475,6 +475,26 @@ def test_binned_sampling_advances_between_bins_without_changing_global_rng():
     assert before[2:] == after[2:]
 
 
+@pytest.mark.parametrize(
+    ("ctrl_size", "n_bins", "error", "message"),
+    [
+        (True, 4, TypeError, "ctrl_size must be a positive integer"),
+        (1.5, 4, TypeError, "ctrl_size must be a positive integer"),
+        (0, 4, ValueError, "ctrl_size must be a positive integer"),
+        (2, True, TypeError, "n_bins must be an integer greater than one"),
+        (2, 1, ValueError, "n_bins must be greater than one"),
+        (2, 20, ValueError, "n_bins is too large"),
+    ],
+)
+def test_binned_sampling_rejects_invalid_controls_and_bins(
+    ctrl_size, n_bins, error, message
+):
+    values = pd.Series(np.arange(6), index=[f"g{i}" for i in range(6)])
+
+    with pytest.raises(error, match=message):
+        binned_sampling(values, ["g0"], ctrl_size, n_bins, 4466)
+
+
 def test_hto_negative_binomial_cutoff_is_unshifted(monkeypatch):
     assert _negative_binomial_cutoff(mu=1, alpha=1) == 6
 

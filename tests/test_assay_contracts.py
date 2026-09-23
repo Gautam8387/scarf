@@ -505,6 +505,46 @@ def test_rna_gene_major_kernel_accumulates_selected_cells():
     np.testing.assert_allclose(squares, np.array([2.0, 9.0]))
 
 
+def test_rna_gene_major_kernel_log_transform_matches_log1p():
+    from scarf.assay.rna import _hvg_stats_gene_major_kernel
+
+    values = np.array(
+        [
+            [1, 0, 2],
+            [0, 5, 0],
+            [3, 4, 0],
+        ],
+        dtype=np.uint32,
+    )
+    destinations = np.array([0, -1, 1], dtype=np.int64)
+    selected = np.array([0, 2], dtype=np.int64)
+    inverse_scalars = np.array([0.5, 0.25])
+    logged = np.log1p(2.0 * values[[0, 2]][:, selected] * inverse_scalars)
+
+    for kernel in (
+        _hvg_stats_gene_major_kernel.py_func,
+        _hvg_stats_gene_major_kernel,
+    ):
+        nonzero = np.zeros(2)
+        totals = np.zeros(2)
+        squares = np.zeros(2)
+        kernel(
+            values,
+            inverse_scalars,
+            2.0,
+            destinations,
+            selected,
+            nonzero,
+            totals,
+            squares,
+            True,
+        )
+
+        np.testing.assert_array_equal(nonzero, np.array([2.0, 1.0]))
+        np.testing.assert_allclose(totals, logged.sum(axis=1))
+        np.testing.assert_allclose(squares, np.square(logged).sum(axis=1))
+
+
 @pytest.mark.parametrize(
     ("values", "error_type", "match"),
     [

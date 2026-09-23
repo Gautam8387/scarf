@@ -561,6 +561,34 @@ def test_imputation_rejects_budget_before_reading_sparse_payload(
     assert reads == []
 
 
+def test_imputation_rejects_invalid_names_and_budget_after_sparse_conversion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _memory_graph_store()
+    graph_ref = _add_test_graph(store)
+    selection = _add_test_cell_selection(
+        store, feature_values=np.array([1.0, 2.0, 4.0])
+    )
+    _patch_trajectory_graph_resolution(monkeypatch, graph_ref, selection)
+    store.load_graph = Mock(return_value=csr_matrix(np.ones((3, 3)) - np.eye(3)))
+    diffusion = store.run_diffusion_operator(graph_ref, t=1)
+
+    with pytest.raises(TypeError, match="string or a sequence of strings"):
+        store.get_imputed(1, diffusion)
+
+    # The loader preflight estimates index widths; this guard measures the
+    # converted operator, so bypass the preflight with an already loaded one.
+    operator = store.load_diffusion_operator(diffusion)
+    monkeypatch.setattr(
+        store,
+        "_load_diffusion_operator_with_lineage",
+        Mock(return_value=(operator, graph_ref, selection)),
+    )
+    store.memoryBytes = 1
+    with pytest.raises(MemoryError, match="Imputed output and diffusion operator"):
+        store.get_imputed("gene", diffusion)
+
+
 def test_diffusion_operator_loader_rejects_mismatched_lineage_and_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

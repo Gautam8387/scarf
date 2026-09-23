@@ -4,7 +4,7 @@ import zarr
 from zarr.storage import MemoryStore
 
 from scarf.assay import ATACassay, RNAassay
-from scarf.assay.feature_summary import feature_summary_values
+from scarf.assay.feature_summary import ensure_feature_summary, feature_summary_values
 from scarf.datastore.datastore import DataStore
 from scarf.metadata import MetaData
 from scarf.metadata.arguments import CellCycleArguments, PrevalentPeakArguments
@@ -61,6 +61,19 @@ def test_rna_summary_derives_zero_safe_values_without_persisting_them() -> None:
     )
     assert "avg" not in group
     assert "nz_mean" not in group
+
+
+def test_log_transformed_feature_summary_requires_an_rna_assay() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    assay = ATACassay.__new__(ATACassay)
+
+    with pytest.raises(TypeError, match="require an RNA assay"):
+        ensure_feature_summary(
+            root,
+            assay,
+            _ref("cell_selection", "a", scope="datastore"),
+            log_transform=True,
+        )
 
 
 def test_cell_cycle_and_prevalence_records_have_exact_direct_inputs() -> None:

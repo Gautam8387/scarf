@@ -644,6 +644,163 @@ def test_completed_artifact_reuse_reads_metadata_and_new_work_validates_inputs(
         calls[operation](invalidate_cache=True)
 
 
+def _normalized_qc_dataset() -> tuple[DataStore, ArtifactRef, ArtifactRef]:
+    store, _ = _qc_store()
+    dataset = _open_qc_store(store)
+    cells = dataset.snapshot_cell_selection()
+    features = dataset.select_all_features(from_assay="RNA")
+    return dataset, cells, dataset.run_normalization(cells, features)
+
+
+def test_new_normalization_rejects_an_empty_cell_selection():
+    dataset, _, _ = _normalized_qc_dataset()
+    dataset.cells.insert("none", np.zeros(dataset.cells.N, dtype=bool))
+    empty = dataset.snapshot_cell_selection("none")
+    features = dataset.select_all_features(from_assay="RNA")
+
+    with pytest.raises(ValueError, match="requires selected cells and features"):
+        dataset.run_normalization(empty, features)
+
+
+def test_new_reduction_rejects_underdetermined_inputs():
+    dataset, cells, normalized = _normalized_qc_dataset()
+    two_features = dataset.set_feature_selection(
+        from_assay="RNA", feature_indexes=[0, 1]
+    )
+    narrow = dataset.run_normalization(cells, two_features)
+
+    with pytest.raises(ValueError, match=r"at least dims \+ 1 selected features"):
+        dataset.run_pca(narrow, dims=2, local_cache=False)
+    # The public wrapper widens batch_size, so only direct callers reach this guard.
+    with pytest.raises(ValueError, match=r"batch_size must be at least dims \+ 1"):
+        dataset._run_reduction_artifact_impl(
+            method="pca",
+            normalized=normalized,
+            dims=3,
+            pca_cell_selection=None,
+            feat_scaling=True,
+            lsi_skip_first=False,
+            custom_loadings=None,
+            rand_state=4466,
+            batch_size=3,
+            show_elbow_plot=False,
+            invalidate_cache=False,
+        )
+    with pytest.raises(ValueError, match="exceed the normalized matrix rank"):
+        dataset.run_lsi(normalized, dims=6, local_cache=False)
+
+
+@pytest.mark.parametrize(
+    ("axis", "message"),
+    [(1, "columns do not match"), (0, "rows do not match")],
+)
+def test_new_reduction_rejects_normalized_shape_that_disagrees_with_lineage(
+    axis, message
+):
+    from scarf.storage.errors import ArtifactResolutionError
+
+    dataset, _, normalized = _normalized_qc_dataset()
+    group = artifact_group(dataset.zw, normalized)
+    data = np.asarray(group["data"][:])
+    truncated = data[:, :-1] if axis == 1 else data[:-1]
+    group.create_array("data", data=truncated, overwrite=True)
+
+    with pytest.raises(ArtifactResolutionError, match=message):
+        dataset.run_pca(normalized, dims=2, local_cache=False)
+
+
+def test_reused_pca_warns_that_no_elbow_plot_is_available():
+    from scarf.utils.logging import logger
+
+    dataset, _, normalized = _normalized_qc_dataset()
+    pca = dataset.run_pca(normalized, dims=2, local_cache=False)
+    messages: list[str] = []
+    sink = logger.add(
+        lambda message: messages.append(message.record["message"]),
+        level="WARNING",
+    )
+    try:
+        reused = dataset.run_pca(
+            normalized, dims=2, local_cache=False, show_elbow_plot=True
+        )
+    finally:
+        logger.remove(sink)
+
+    assert reused == pca
+    assert "PCA was not fitted so no elbow plot is available" in messages
+
+
+def test_pca_streams_scaling_statistics_when_normalized_sums_are_absent():
+    dataset, _, normalized = _normalized_qc_dataset()
+    expected = dataset.load_artifact(
+        dataset.run_pca(normalized, dims=2, local_cache=False)
+    )
+    other, _, other_normalized = _normalized_qc_dataset()
+    group = artifact_group(other.zw, other_normalized)
+    del group["feature_sum"]
+    del group["feature_squared_sum"]
+
+    observed = other.load_artifact(
+        other.run_pca(other_normalized, dims=2, local_cache=False)
+    )
+
+    np.testing.assert_allclose(observed["data"][:], expected["data"][:], atol=1e-5)
+    np.testing.assert_allclose(
+        observed["loadings"][:], expected["loadings"][:], atol=1e-6
+    )
+
+
+def test_ann_index_rejects_non_coordinates_and_projects_unmaterialized_pca():
+    dataset, _, normalized = _normalized_qc_dataset()
+    with pytest.raises(ValueError, match="Coordinates must reference"):
+        dataset.build_ann_index(normalized)
+
+    pca = dataset.run_pca(normalized, dims=2, local_cache=False)
+    expected = dataset.load_artifact(
+        dataset.query_neighbors(dataset.build_ann_index(pca), coordinates=pca, k=2)
+    )
+    other, _, other_normalized = _normalized_qc_dataset()
+    other_pca = other.run_pca(other_normalized, dims=2, local_cache=False)
+    del artifact_group(other.zw, other_pca)["data"]
+
+    observed = other.load_artifact(
+        other.query_neighbors(
+            other.build_ann_index(other_pca), coordinates=other_pca, k=2
+        )
+    )
+
+    for name in expected.array_keys():
+        np.testing.assert_allclose(observed[name][:], expected[name][:], atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    ("options", "error", "message"),
+    [
+        ({"ctrl_size": True}, TypeError, "ctrl_size must be a positive integer"),
+        ({"ctrl_size": 2.0}, TypeError, "ctrl_size must be a positive integer"),
+        ({"ctrl_size": 0}, ValueError, "ctrl_size must be a positive integer"),
+        ({"log_transform": 1}, TypeError, "log_transform must be a bool"),
+    ],
+)
+def test_cell_cycle_rejects_invalid_controls_before_summarizing(
+    options, error, message
+):
+    from scarf.storage.artifacts import list_artifacts
+
+    store, _ = _qc_store()
+    dataset = _open_qc_store(store)
+    cells = dataset.snapshot_cell_selection()
+
+    with pytest.raises(error, match=message):
+        dataset.run_cell_cycle_scoring(
+            cells, s_genes=["GENE_A"], g2m_genes=["RPS3"], **options
+        )
+
+    assert not list_artifacts(
+        dataset.zw, scope="assay", assay="RNA", kind="feature_summary"
+    )
+
+
 def test_score_features_rejects_a_target_set_without_controls():
     store, _ = _qc_store()
     dataset = _open_qc_store(store)

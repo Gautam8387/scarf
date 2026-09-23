@@ -423,6 +423,9 @@ def run_stage_job(
     memory=32_768,
     cpu=8.0,
     ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
+    # The whole funnel lives on one container's ephemeral disk; a preempted
+    # container restarts the input without the store.
+    nonpreemptible=True,
 )
 def run_local_funnel_job(
     configDict: dict[str, Any],
