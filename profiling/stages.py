@@ -19,6 +19,7 @@ from scarf.storage.budget import resolve_budget
 from scarf.storage.selections import validate_stored_selection_integrity
 from scarf.storage.stores import open_store
 from scarf.storage.types import as_zarr_array, as_zarr_group
+from scarf.utils.process import process_rss_mb
 
 from profiling.config import (
     CONSUME_STAGES,
@@ -551,6 +552,7 @@ def _write_counts_t(
         context.group,
         profile=profile,
         resources=context.budget,
+        residentBytes=int(process_rss_mb() * 1024**2),
         policy=policy,
         io=_storage_io_policy(storageIo),
         metrics=writer_metrics,

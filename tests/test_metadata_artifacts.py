@@ -514,6 +514,76 @@ def test_cell_cycle_scoring_returns_one_artifact_without_writing_columns(
     assert set(datastore.cells.columns) == columns_before
 
 
+def test_imputation_batches_preserve_requested_columns_and_stream_rows(
+    datastore_ephemeral,
+    monkeypatch,
+) -> None:
+    from scarf.storage.selections import read_stored_selection_indices
+
+    store = datastore_ephemeral
+    graph = _ensure_graph(store)
+    diffusion = store.run_diffusion_operator(graph)
+    operator, _graph, selection = store._load_diffusion_operator_with_lineage(diffusion)
+    rows = read_stored_selection_indices(
+        store.zw,
+        selection,
+        kind="cell_selection",
+        scope="datastore",
+        assay=None,
+        table_path="cellData",
+    )
+    genes = np.flatnonzero(store.RNA.feats.fetch_all("nCells") > 10)[:3]
+    names = store.RNA.feats.fetch_all("names").copy()
+    names[genes[:2]] = "duplicate"
+    store.RNA.feats.insert("names", names, overwrite=True)
+    numeric = np.arange(store.cells.N, dtype=np.float64)
+    metadata_name = str(names[genes[2]])
+    store.cells.insert(metadata_name, numeric)
+    expression = store.RNA.normed(rows, genes[:2]).compute().mean(axis=1)
+    expected = np.column_stack(
+        (
+            operator.dot(numeric[rows]),
+            operator.dot(expression),
+            operator.dot(expression),
+        )
+    )
+    original_load = store._load_diffusion_operator_with_lineage
+    calls = []
+    original_columns = store.cells._column_map
+    column_scans = []
+
+    def columns():
+        column_scans.append(True)
+        return original_columns()
+
+    def load(ref, **kwargs):
+        calls.append(ref)
+        return original_load(ref, **kwargs)
+
+    original_normed = store.RNA.normed
+
+    def normed(*args, **kwargs):
+        return original_normed(*args, **kwargs)._with_block_size(29)
+
+    monkeypatch.setattr(store, "_load_diffusion_operator_with_lineage", load)
+    monkeypatch.setattr(store.cells, "_column_map", columns)
+    monkeypatch.setattr(store.RNA, "normed", normed)
+    actual = store.get_imputed([metadata_name, "DUPLICATE", "duplicate"], diffusion)
+    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+    assert calls == [diffusion]
+    assert len(column_scans) <= 2
+    assert store.get_imputed([metadata_name], diffusion).shape == (len(rows), 1)
+    assert store.get_imputed(metadata_name, diffusion).shape == (len(rows),)
+    for invalid in ([], [""], [None]):
+        with pytest.raises(ValueError, match="non-empty strings"):
+            store.get_imputed(invalid, diffusion)
+    with pytest.raises(ValueError, match="not found"):
+        store.get_imputed(["not_a_gene"], diffusion)
+    monkeypatch.setattr(store, "memoryBytes", 1)
+    with pytest.raises(MemoryError, match="fewer features"):
+        store.get_imputed([metadata_name, "duplicate"], diffusion)
+
+
 def test_explicit_graph_consumers_ignore_later_live_selection_changes(
     datastore_ephemeral,
 ) -> None:

@@ -94,6 +94,7 @@ _CONTRACTS = (
             "lsi_n_oversamples",
             "lsi_solver",
             "lsi_skip_first",
+            "local_cache",
             "method",
             "pca_cell_selection",
             "rand_state",
@@ -169,12 +170,9 @@ _CONTRACTS = (
         aliases={
             "g2m_genes": "g2m_gene_indices",
             "s_genes": "s_gene_indices",
+            "ctrl_size": "control_size",
         },
         model_only=_classified(
-            "derived",
-            "control_size",
-        )
-        | _classified(
             "resolved_input",
             "feature_summary",
         ),

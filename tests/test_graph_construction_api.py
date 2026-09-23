@@ -1067,7 +1067,7 @@ def test_connectivity_rebuild_requires_named_distance_metric(
     assert datastore.inspect_artifact(rebuilt).complete
 
 
-def test_corrupt_ann_bytes_are_not_reused(
+def test_ann_reuse_checks_metadata_and_explicit_validation_checks_bytes(
     datastore_ephemeral,
 ) -> None:
     datastore = datastore_ephemeral
@@ -1088,7 +1088,12 @@ def test_corrupt_ann_bytes_are_not_reused(
 
     ann_group = datastore.zw[artifact_path(current)]
     ann_group["ann_idx_bytes"][:] = 0
-    repaired = datastore.build_ann_index(reduction)
+    assert datastore.build_ann_index(reduction) == current
+    from scarf.storage.ann_index import validate_ann_index_payload
+
+    with pytest.raises(ValueError, match="payload digest"):
+        validate_ann_index_payload(ann_group, "l2", 3)
+    repaired = datastore.build_ann_index(reduction, invalidate_cache=True)
     assert repaired != current
     assert datastore.build_ann_index(reduction) == repaired
     assert datastore.inspect_artifact(repaired).complete

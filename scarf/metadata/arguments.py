@@ -129,6 +129,7 @@ class CellCycleArguments(OperationArguments):
     s_gene_indices: tuple[int, ...] = parameter()
     g2m_gene_indices: tuple[int, ...] = parameter()
     control_size: int = parameter()
+    log_transform: bool = parameter()
     n_bins: int = parameter()
     rand_seed: int = parameter()
     invalidate_cache: bool = execution()

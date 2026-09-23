@@ -440,25 +440,22 @@ class Assay:
         )
         percent_features = self._percent_features()
         has_column = name in self.cells.columns
-        if has_column and percent_features.get(name) == feat_pattern:
+        if has_column:
             if (
-                self.cells._get_array(name).attrs.get("feature_selection_fingerprint")
+                percent_features.get(name) == feat_pattern
+                and self.cells._get_array(name).attrs.get(
+                    "feature_selection_fingerprint"
+                )
                 == fingerprint
             ):
                 return None
-            logger.info(
-                f"Recomputing {name}: matched-feature provenance has changed or is missing"
+            raise ValueError(
+                f"Cannot apply pattern {feat_pattern!r} to existing {name}: "
+                "its recorded pattern or matched-feature provenance differs or "
+                "is missing. Omit the pattern to preserve the stored values. "
+                "Use run_feature_percentage with an explicit feature selection "
+                "to compute a separate quality-metric artifact."
             )
-        elif has_column:
-            logger.warning(
-                f"Recomputing {name}: feature pattern changed from "
-                f"{percent_features.get(name)!r} to {feat_pattern!r}"
-            )
-        if name in percent_features:
-            del percent_features[name]
-            self.attrs["percentFeatures"] = percent_features
-        if has_column:
-            self.cells.drop(name)
         if len(feat_idx) == 0:
             logger.warning(
                 f"No matches found for pattern {feat_pattern}. "
@@ -486,7 +483,7 @@ class Assay:
                 out=np.full(total.shape, np.nan, dtype=np.float64),
                 where=n_counts != 0,
             ),
-            overwrite=True,
+            overwrite=False,
         )
         self.cells._get_array(name).attrs["feature_selection_fingerprint"] = (
             feature_fingerprint
@@ -919,6 +916,8 @@ class Assay:
         ctrl_size: int,
         n_bins: int,
         rand_seed: int,
+        *,
+        log_transform: bool = False,
     ) -> np.ndarray:
         """Calculates the scores (mean values) of selection of features over a
         randomly sampled selected feature set in given cells (as marked by
@@ -947,6 +946,7 @@ class Assay:
             summary = self._compute_feature_summary(
                 cell_idx,
                 np.arange(self.feats.N, dtype=np.int64),
+                log_transform=log_transform,
             )
             totals = np.asarray(summary["normed_tot"], dtype=np.float64)
             obs_avg = (
@@ -955,15 +955,13 @@ class Assay:
                 else np.zeros(self.feats.N, dtype=np.float64)
             )
         elif len(cell_idx) > 0:
-            obs_avg = np.asarray(
-                self.normed(
-                    cell_idx=cell_idx,
-                    feat_idx=np.arange(self.feats.N, dtype=np.int64),
-                )
-                .mean(axis=0)
-                .compute(),
-                dtype=np.float64,
+            values = self.normed(
+                cell_idx=cell_idx,
+                feat_idx=np.arange(self.feats.N, dtype=np.int64),
             )
+            if log_transform:
+                values = cast(ChunkedArray, np.log1p(values))
+            obs_avg = np.asarray(values.mean(axis=0).compute(), dtype=np.float64)
         else:
             obs_avg = np.zeros(self.feats.N, dtype=np.float64)
         return self._score_feature_indices(
@@ -973,6 +971,7 @@ class Assay:
             ctrl_size=ctrl_size,
             n_bins=n_bins,
             rand_seed=rand_seed,
+            log_transform=log_transform,
         )
 
     def _compute_feature_summary(
@@ -994,6 +993,7 @@ class Assay:
         ctrl_size: int,
         n_bins: int,
         rand_seed: int,
+        log_transform: bool = False,
     ) -> np.ndarray:
         """Score feature indexes against controls using supplied feature means."""
         from ..features.scoring import binned_sampling
@@ -1020,6 +1020,10 @@ class Assay:
             dtype=np.int64,
         )
 
+        if len(control_idx) == 0:
+            raise ValueError(
+                "No control features were sampled. Reduce n_bins or increase ctrl_size."
+            )
         if isinstance(self, RNAassay) and self.normMethod is norm_lib_size:
             means = self._mean_normed_feature_groups(
                 cell_idx,
@@ -1027,15 +1031,15 @@ class Assay:
                     "target": feature_idx,
                     "control": control_idx,
                 },
+                log_transform=log_transform,
             )
             return np.asarray(means["target"] - means["control"])
 
         def calc_mean(index: np.ndarray) -> np.ndarray:
-            return np.asarray(
-                self.normed(cell_idx=cell_idx, feat_idx=np.sort(index))
-                .mean(axis=1)
-                .compute()
-            )
+            values = self.normed(cell_idx=cell_idx, feat_idx=np.sort(index))
+            if log_transform:
+                values = cast(ChunkedArray, np.log1p(values))
+            return np.asarray(values.mean(axis=1).compute())
 
         return np.asarray(calc_mean(feature_idx) - calc_mean(control_idx))
 

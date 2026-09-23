@@ -129,6 +129,8 @@ def iter_normalized_feature_blocks(
     resolved: Sequence[ResolvedFeature],
     cell_idx: np.ndarray,
     normalization: NormalizationSpec | None = None,
+    *,
+    resident_bytes: int = 0,
 ) -> Iterator[tuple[list[int], int, np.ndarray]]:
     """Yield feature slots, selected-row offsets, and normalized value blocks."""
     normalization = normalization or NormalizationSpec()
@@ -153,7 +155,13 @@ def iter_normalized_feature_blocks(
         blocks = (
             (values,)
             if isinstance(values, np.ndarray)
-            else values.stream_blocks(nthreads=store.nthreads)
+            else values._stream_blocks(
+                nthreads=store.nthreads,
+                msg=None,
+                prefetch=None,
+                row_mask=None,
+                resident_bytes=resident_bytes,
+            )
         )
         local_indices = [
             np.searchsorted(physical_indices, resolved[slot].indices) for slot in slots

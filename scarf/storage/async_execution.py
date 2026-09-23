@@ -114,7 +114,7 @@ def resolve_execution_plan(
         threadsPerComputeWorker = operation.threadsPerComputeWorker
     workers = max(1, int(resources.workers))
     host_cores = max(1, detect_workers())
-    codec_workers = host_cores
+    codec_workers = min(workers, host_cores)
     compute_workers = min(workers, max(1, int(computeWorkerLimit)))
     threads = max(1, int(threadsPerComputeWorker))
     if compute_workers * threads > workers:
@@ -140,7 +140,7 @@ def ensure_zarr_host_ceiling(maxWorkers: int | None = None) -> int:
     requested = host if maxWorkers is None else max(1, int(maxWorkers))
     with _ZARR_CONFIG_LOCK:
         if _HOST_THREAD_CEILING is None:
-            ceiling = max(host, requested)
+            ceiling = min(host, requested)
             zarr.config.set({"threading.max_workers": ceiling})
             _HOST_THREAD_CEILING = ceiling
     return _HOST_THREAD_CEILING
@@ -291,7 +291,7 @@ class AsyncStorageRunner:
         operation: Callable[["AsyncStorageRunner"], Awaitable[T]],
     ) -> T:
         loop = asyncio.get_running_loop()
-        ensure_zarr_host_ceiling()
+        ensure_zarr_host_ceiling(self.plan.codecWorkerLimit)
         self._codec_pool = ThreadPoolExecutor(
             max_workers=self.plan.codecWorkerLimit,
             thread_name_prefix="scarf-zarr-codec",

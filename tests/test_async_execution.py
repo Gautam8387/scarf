@@ -175,6 +175,8 @@ def test_writer_reuses_complete_matching_destination() -> None:
 
 
 def test_writer_resident_bytes_reduce_destination_width() -> None:
+    from scarf.storage.sharding import _counts_t_read_peak, _counts_t_write_peak
+
     values = np.arange(64 * 64, dtype=np.uint16).reshape(64, 64)
     group, counts = _write_counts(values)
     plan = plan_count_matrix_pair(
@@ -190,7 +192,9 @@ def test_writer_resident_bytes_reduce_destination_width() -> None:
         * int(plan.countsT.shards[1])
         * int(values.dtype.itemsize)
     )
-    per_destination_set = dest_unit + int(plan.sourceBufferBytes)
+    per_destination_set = _counts_t_write_peak(plan.countsT) + _counts_t_read_peak(
+        plan.counts
+    )
     resident = budget - per_destination_set
     metrics: dict[str, object] = {}
     write_counts_t(
@@ -208,6 +212,61 @@ def test_writer_resident_bytes_reduce_destination_width() -> None:
     assert int(metrics["effectiveDestShardsInFlight"]) == 1
     assert int(metrics["plannedDestinationSetBytes"]) == dest_unit
     assert int(metrics["peakLedgerBytes"]) + resident <= budget
+
+
+def test_writer_rejects_a_budget_that_only_fits_uncompressed_buffers() -> None:
+    values = np.arange(64 * 64, dtype=np.uint16).reshape(64, 64)
+    group, counts = _write_counts(values)
+    plan = plan_count_matrix_pair(64, 64, values.dtype, policy=_scaled_policy())
+
+    with pytest.raises(MemoryError, match="countsT write needs"):
+        write_counts_t(
+            counts,
+            group,
+            policy=_scaled_policy(),
+            resources=ResourceBudget(
+                plan.destinationBufferBytes + plan.sourceBufferBytes, 2
+            ),
+        )
+
+    assert "countsT" not in group
+
+
+def test_writer_holds_encoding_reservation_until_store_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from zarr.core.array import AsyncArray
+
+    values = np.random.default_rng(0).integers(1, 65535, (64, 64), dtype=np.uint16)
+    group, counts = _write_counts(values)
+    active: list[AsyncStorageRunner] = []
+    original_run = AsyncStorageRunner.run
+    original_setitem = AsyncArray.setitem
+    admitted: list[tuple[int, int]] = []
+
+    def run(self, operation):
+        active.append(self)
+        return original_run(self, operation)
+
+    async def setitem(self, selection, value, **kwargs):
+        if self.path.endswith("countsT"):
+            admitted.append((active[-1].ledger.held_bytes(), value.nbytes))
+        return await original_setitem(self, selection, value, **kwargs)
+
+    monkeypatch.setattr(AsyncStorageRunner, "run", run)
+    monkeypatch.setattr(AsyncArray, "setitem", setitem)
+    result = write_counts_t(
+        counts,
+        group,
+        policy=_scaled_policy(),
+        resources=ResourceBudget(64 * 1024, 1),
+    )
+
+    np.testing.assert_array_equal(result[:], values.T)
+    assert admitted
+    assert all(held > 3 * raw for held, raw in admitted)
+    assert active[-1].ledger.peak_bytes() <= 64 * 1024
+    assert active[-1].ledger.is_empty()
 
 
 def test_writer_bounds_grouped_source_reads_by_inner_chunk_plan() -> None:
@@ -315,17 +374,33 @@ def test_sequential_runners_keep_their_own_plans() -> None:
     second = AsyncStorageRunner(ResourceBudget(1024, 4), chunksPerShard=1)
     third = AsyncStorageRunner(ResourceBudget(1024, 4), chunksPerShard=10)
 
-    assert first.plan.codecWorkerLimit == host
-    assert first.plan.zarrAsyncConcurrency == min(host, 10)
-    assert second.plan.codecWorkerLimit == host
+    assert first.plan.codecWorkerLimit == min(host, 2)
+    assert first.plan.zarrAsyncConcurrency == min(host, 2)
+    assert second.plan.codecWorkerLimit == min(host, 4)
     assert second.plan.zarrAsyncConcurrency == 1
-    assert third.plan.codecWorkerLimit == host
-    assert third.plan.zarrAsyncConcurrency == min(host, 10)
+    assert third.plan.codecWorkerLimit == min(host, 4)
+    assert third.plan.zarrAsyncConcurrency == min(host, 4)
 
     assert first.run(_current_async_concurrency) == first.plan.zarrAsyncConcurrency
     assert second.run(_current_async_concurrency) == 1
     assert third.run(_current_async_concurrency) == third.plan.zarrAsyncConcurrency
     assert zarr.config.get("async.concurrency") == 10
+
+
+def test_codec_tasks_use_the_worker_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("scarf.storage.async_execution.detect_workers", lambda: 64)
+    runner = AsyncStorageRunner(ResourceBudget(1024, 2))
+    barrier = threading.Barrier(2, timeout=5)
+
+    def codec_task() -> int:
+        barrier.wait()
+        return threading.get_ident()
+
+    async def operation(_active: AsyncStorageRunner) -> list[int]:
+        return await asyncio.gather(*(asyncio.to_thread(codec_task) for _ in range(8)))
+
+    assert len(set(runner.run(operation))) == 2
+    assert zarr.config.get("threading.max_workers") == 2
 
 
 def test_runner_scopes_async_concurrency_and_restores_configured_default() -> None:

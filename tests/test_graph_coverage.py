@@ -83,6 +83,7 @@ def _memory_graph_store(
     store._defaultAssay = "RNA"
     store._assay_names = assay_names or []
     store.nthreads = 1
+    store.memoryBytes = 64 * 1024**2
     store.storageProfile = "fast_local"
     return store
 
@@ -529,6 +530,35 @@ def test_diffusion_operator_round_trip_and_explicit_imputation(
         )
         == 3
     )
+
+
+def test_imputation_rejects_budget_before_reading_sparse_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _memory_graph_store()
+    graph_ref = _add_test_graph(store)
+    selection = _add_test_cell_selection(
+        store, feature_values=np.array([1.0, 2.0, 4.0])
+    )
+    _patch_trajectory_graph_resolution(monkeypatch, graph_ref, selection)
+    store.load_graph = Mock(return_value=csr_matrix(np.ones((3, 3)) - np.eye(3)))
+    diffusion = store.run_diffusion_operator(graph_ref, t=1)
+    payload_path = artifact_path(diffusion)
+    reads: list[str] = []
+    original_getitem = zarr.Array.__getitem__
+
+    def getitem(self, key):
+        if self.path.startswith(payload_path + "/"):
+            reads.append(self.path)
+        return original_getitem(self, key)
+
+    monkeypatch.setattr(zarr.Array, "__getitem__", getitem)
+    store.memoryBytes = 128
+
+    with pytest.raises(MemoryError, match="loading or sparse conversion"):
+        store.get_imputed("gene", diffusion)
+
+    assert reads == []
 
 
 def test_diffusion_operator_loader_rejects_mismatched_lineage_and_payload(

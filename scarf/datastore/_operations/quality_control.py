@@ -99,6 +99,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         feature_snapshot: ArtifactRef | None = None,
         s_genes: list[str] | None = None,
         g2m_genes: list[str] | None = None,
+        ctrl_size: int | None = None,
+        log_transform: bool = True,
         n_bins: int = 50,
         rand_seed: int = 4466,
         invalidate_cache: bool = False,
@@ -121,7 +123,17 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             from ...quality_control.cell_cycle_genes import g2m_phase_genes
 
             g2m_genes = list(g2m_phase_genes)
-        control_size = min(len(s_genes), len(g2m_genes))
+        control_size = (
+            min(len(s_genes), len(g2m_genes)) if ctrl_size is None else ctrl_size
+        )
+        if isinstance(control_size, (bool, np.bool_)) or not isinstance(
+            control_size, (int, np.integer)
+        ):
+            raise TypeError("ctrl_size must be a positive integer")
+        if control_size < 1:
+            raise ValueError("ctrl_size must be a positive integer")
+        if not isinstance(log_transform, bool):
+            raise TypeError("log_transform must be a bool")
         if feature_names is None:
             s_gene_indices = assay.feats.get_index_by(
                 s_genes,
@@ -156,6 +168,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             self.zw,
             assay,
             cell_selection,
+            log_transform=log_transform,
             invalidate_cache=invalidate_cache,
         )
         n_cells = feature_summary_selected_count(
@@ -169,6 +182,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             s_gene_indices=tuple(s_gene_indices),
             g2m_gene_indices=tuple(g2m_gene_indices),
             control_size=control_size,
+            log_transform=log_transform,
             n_bins=n_bins,
             rand_seed=rand_seed,
             invalidate_cache=invalidate_cache,
@@ -217,6 +231,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             ctrl_size=control_size,
             n_bins=n_bins,
             rand_seed=rand_seed,
+            log_transform=log_transform,
         )
         g2m_score = assay._score_feature_indices(
             np.asarray(g2m_gene_indices, dtype=np.int64),
@@ -225,6 +240,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             ctrl_size=control_size,
             n_bins=n_bins,
             rand_seed=rand_seed,
+            log_transform=log_transform,
         )
         phase = np.asarray(assign_cell_cycle_phase(s_score, g2m_score))
         write_cell_data_artifact(
@@ -1564,6 +1580,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         from_assay: str | None = None,
         s_genes: list[str] | None = None,
         g2m_genes: list[str] | None = None,
+        ctrl_size: int | None = None,
+        log_transform: bool = True,
         n_bins: int = 50,
         rand_seed: int = 4466,
         invalidate_cache: bool = False,
@@ -1572,8 +1590,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         expression of S and G2M phase genes respectively. Following steps are
         taken for each phase:
 
-        - Average expression of all the genes in across `cell_key` cells is calculated
-        - The log average expression is divided in `n_bins` bins
+        - Normalized expression is log1p transformed when `log_transform` is True.
+        - Genes are ranked into `n_bins` bins by mean expression across selected cells.
         - A control set of genes is identified by sampling genes from same expression bins where phase's genes are present.
         - The average expression of phase genes (Ep) and control genes (Ec) is calculated per cell.
         - A phase score is calculated as ``Ep - Ec``.
@@ -1588,6 +1606,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                      `scarf.quality_control.s_phase_genes`
             g2m_genes: A list of G2M phase genes. If not provided then Scarf loads pre-saved genes accessible at
                      `scarf.quality_control.g2m_phase_genes`
+            ctrl_size: Controls sampled per bin. None uses the shorter input gene list.
+            log_transform: Apply log1p before binning and scoring. Defaults to True.
             n_bins: Number of bins into which average expression of genes is divided.
             rand_seed: A random values to set seed while sampling cells from a cluster randomly. (Default value: 4466)
         Returns:
@@ -1612,6 +1632,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             cell_selection=cell_selection,
             s_genes=s_genes,
             g2m_genes=g2m_genes,
+            ctrl_size=ctrl_size,
+            log_transform=log_transform,
             n_bins=n_bins,
             rand_seed=rand_seed,
             invalidate_cache=invalidate_cache,

@@ -91,9 +91,10 @@ class BaseDataStore:
                        when DataStore loads a Zarr file for the first time
         min_features_per_cell: Minimum number of non-zero features in a cell. If lower than this then the cell
                                will be filtered out.
-        mito_pattern: Regex pattern to capture mitochondrial genes. When None, uses ``^MT-``.
-        ribo_pattern: Regex pattern to capture ribosomal genes. When None, uses
-                      ``RPS|RPL|MRPS|MRPL``.
+        mito_pattern: Pattern for missing mitochondrial percentages. None preserves existing values
+                      and uses ``^MT-`` for new values. Explicit patterns must match existing provenance.
+        ribo_pattern: Pattern for missing ribosomal percentages. None preserves existing values
+                      and uses ``RPS|RPL|MRPS|MRPL`` for new values.
         zarr_mode: For read-write mode use ``r+`` or for read-only use ``r``.
                    (Default value: ``r+``)
         workspace: Workspace name within the Zarr store (None for legacy single-workspace layout).
@@ -656,11 +657,13 @@ class BaseDataStore:
             percent_feature_indices: dict[str, np.ndarray] = {}
             percent_feature_provenance: dict[str, tuple[str, str]] = {}
             if isinstance(assay, RNAassay):
-                if mito_pattern != "":
+                percent_mito_name = from_assay + "_percentMito"
+                if mito_pattern != "" and not (
+                    mito_pattern is None and percent_mito_name in self.cells.columns
+                ):
                     resolved_mito_pattern = (
                         "^MT-" if mito_pattern is None else mito_pattern
                     )
-                    percent_mito_name = from_assay + "_percentMito"
                     mito_plan = assay._plan_percent_feature(
                         resolved_mito_pattern,
                         percent_mito_name,
@@ -673,11 +676,13 @@ class BaseDataStore:
                             fingerprint,
                         )
 
-                if ribo_pattern != "":
+                percent_ribo_name = from_assay + "_percentRibo"
+                if ribo_pattern != "" and not (
+                    ribo_pattern is None and percent_ribo_name in self.cells.columns
+                ):
                     resolved_ribo_pattern = (
                         "RPS|RPL|MRPS|MRPL" if ribo_pattern is None else ribo_pattern
                     )
-                    percent_ribo_name = from_assay + "_percentRibo"
                     ribo_plan = assay._plan_percent_feature(
                         resolved_ribo_pattern,
                         percent_ribo_name,

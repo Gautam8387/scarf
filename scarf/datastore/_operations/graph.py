@@ -72,6 +72,7 @@ from ...storage.artifacts import (
     artifact_path,
     group_at,
     inspect_artifact,
+    list_artifacts,
     require_complete_artifact,
 )
 from ...storage.errors import ArtifactResolutionError
@@ -1133,25 +1134,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         if assay_name is None:
             raise ValueError("Feature-selection artifact has no assay")
         assay = self._get_assay(assay_name)
-        feature_selection = self.resolve_features(assay_name, features)
-        validated_cells = validate_stored_selection_integrity(
-            self.zw,
-            cell_selection,
-            kind="cell_selection",
-            scope="datastore",
-            assay=None,
-            table_path="cellData",
-        )
-        cell_values = np.asarray(validated_cells.values[:], dtype=bool)
-        feature_group = artifact_group(self.zw, feature_selection)
-        feature_values = np.asarray(
-            as_zarr_array(feature_group["values"], name="values")[:],
-            dtype=bool,
-        )
-        n_cells = validated_cells.selected_count
-        n_features = int(feature_values.sum())
-        if n_cells < 1 or n_features < 1:
-            raise ValueError("Normalization requires selected cells and features")
+        feature_selection = features
+        self._require_complete_artifact(features, "feature_selection", assay=assay_name)
+        self._require_complete_artifact(cell_selection, "cell_selection")
         from ...assay import ATACassay
 
         if isinstance(assay, ATACassay):
@@ -1189,7 +1174,40 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     "artifact_identity for provenance"
                 )
         raw_size_factor = getattr(assay, "sf", None)
+        size_factor = (
+            float(cast(int | float, raw_size_factor))
+            if raw_size_factor is not None
+            else None
+        )
+        normalization_parameters: dict[str, Any] = {
+            "normalization_method": normalization_method,
+            "size_factor": size_factor,
+            "log_transform": log_transform,
+            "renormalize_subset": renormalize_subset,
+        }
         raw_dataset_fingerprint = assay.attrs.get("dataset_fingerprint")
+        if raw_dataset_fingerprint is None and not invalidate_cache:
+            candidates = [
+                inspect_artifact(self.zw, ref)
+                for ref in list_artifacts(
+                    self.zw,
+                    scope="assay",
+                    assay=assay_name,
+                    kind="normalized",
+                    operation="run_normalization",
+                    parameters=normalization_parameters,
+                    inputs={
+                        "cell_selection": cell_selection,
+                        "feature_selection": features,
+                    },
+                    complete_only=True,
+                )
+            ]
+            if candidates:
+                latest = max(candidates, key=lambda status: status.created_at_ns or 0)
+                raw_dataset_fingerprint = (latest.inputs or {}).get(
+                    "dataset_fingerprint"
+                )
         dataset_fingerprint = (
             raw_dataset_fingerprint
             if isinstance(raw_dataset_fingerprint, str) and raw_dataset_fingerprint
@@ -1200,38 +1218,67 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             feature_selection=feature_selection,
             dataset_fingerprint=dataset_fingerprint,
             normalization_method=normalization_method,
-            size_factor=(
-                float(cast(int | float, raw_size_factor))
-                if raw_size_factor is not None
-                else None
-            ),
+            size_factor=size_factor,
             log_transform=log_transform,
             renormalize_subset=renormalize_subset,
             invalidate_cache=invalidate_cache,
         )
+
+        def valid_shape(_ref: ArtifactRef, group: zarr.Group) -> bool:
+            data = as_zarr_array(group["data"], name="data")
+            return min(data.shape) > 0 and all(
+                as_zarr_array(group[name], name=name).shape == (data.shape[1],)
+                for name in ("feature_sum", "feature_squared_sum")
+            )
+
         planned = self._plan_assay_artifact(
             assay_name,
             arguments,
             required_arrays=(
                 ArrayRequirement(
                     "data",
-                    shape=(n_cells, n_features),
+                    shape=(None, None),
                     dtype=np.float32,
                 ),
                 ArrayRequirement(
                     "feature_sum",
-                    shape=(n_features,),
+                    shape=(None,),
                     dtype=np.float64,
                 ),
                 ArrayRequirement(
                     "feature_squared_sum",
-                    shape=(n_features,),
+                    shape=(None,),
                     dtype=np.float64,
                 ),
             ),
             invalidate_cache=invalidate_cache,
+            reuse_validator=valid_shape,
         )
-        if not planned.reused:
+        if planned.reused:
+            data = as_zarr_array(
+                artifact_group(self.zw, planned.ref)["data"], name="data"
+            )
+            n_cells, n_features = map(int, data.shape)
+        else:
+            feature_selection = self.resolve_features(assay_name, features)
+            validated_cells = validate_stored_selection_integrity(
+                self.zw,
+                cell_selection,
+                kind="cell_selection",
+                scope="datastore",
+                assay=None,
+                table_path="cellData",
+            )
+            cell_values = np.asarray(validated_cells.values[:], dtype=bool)
+            feature_group = artifact_group(self.zw, feature_selection)
+            feature_values = np.asarray(
+                as_zarr_array(feature_group["values"], name="values")[:],
+                dtype=bool,
+            )
+            n_cells = validated_cells.selected_count
+            n_features = int(feature_values.sum())
+            if n_cells < 1 or n_features < 1:
+                raise ValueError("Normalization requires selected cells and features")
             group = start_artifact(self.zw, planned)
             relative_path = artifact_path(planned.ref).removeprefix(f"{assay_name}/")
             assay._write_normalized_payload(
@@ -1297,27 +1344,23 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 )
                 effective_batch_size = memory_limited_rows
         with self._artifact_execution_context({"local_cache": local_cache}):
-            with self._cache_normalized_artifact(
-                normalized_ref,
-                local_cache,
-                effective_batch_size,
-            ):
-                return self._run_reduction_artifact_impl(
-                    method=method,
-                    normalized=normalized_ref,
-                    dims=requested_dims,
-                    pca_cell_selection=pca_cell_selection,
-                    feat_scaling=feat_scaling,
-                    lsi_skip_first=lsi_skip_first,
-                    custom_loadings=custom_loadings,
-                    rand_state=rand_state,
-                    batch_size=effective_batch_size,
-                    show_elbow_plot=show_elbow_plot,
-                    invalidate_cache=invalidate_cache,
-                    lsi_solver=lsi_solver,
-                    lsi_n_iter=lsi_n_iter,
-                    lsi_n_oversamples=lsi_n_oversamples,
-                )
+            return self._run_reduction_artifact_impl(
+                method=method,
+                normalized=normalized_ref,
+                dims=requested_dims,
+                pca_cell_selection=pca_cell_selection,
+                feat_scaling=feat_scaling,
+                lsi_skip_first=lsi_skip_first,
+                custom_loadings=custom_loadings,
+                rand_state=rand_state,
+                batch_size=effective_batch_size,
+                show_elbow_plot=show_elbow_plot,
+                invalidate_cache=invalidate_cache,
+                local_cache=local_cache,
+                lsi_solver=lsi_solver,
+                lsi_n_iter=lsi_n_iter,
+                lsi_n_oversamples=lsi_n_oversamples,
+            )
 
     def _run_reduction_artifact_impl(
         self,
@@ -1333,6 +1376,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         batch_size: int | None,
         show_elbow_plot: bool,
         invalidate_cache: bool,
+        local_cache: bool | str = "auto",
         lsi_solver: Literal["streaming", "materialized"] = "streaming",
         lsi_n_iter: int = 5,
         lsi_n_oversamples: int = 10,
@@ -1355,44 +1399,12 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             "feature_selection",
             "feature_selection",
         )
-        normalized_feature_selection = self.resolve_features(
-            assay_name,
-            normalized_feature_selection,
-        )
-        validated_normalized_cells = validate_stored_selection_integrity(
-            self.zw,
-            normalized_cell_selection,
-            kind="cell_selection",
-            scope="datastore",
-            assay=None,
-            table_path="cellData",
-        )
         data_group = as_zarr_group(
             self.zw[normalized_status.path],
             name=normalized_status.path,
         )
         data_array = as_zarr_array(data_group["data"], name="data")
         n_cells, n_features = map(int, data_array.shape)
-        feature_group = artifact_group(self.zw, normalized_feature_selection)
-        selected_features = int(
-            np.count_nonzero(
-                np.asarray(
-                    as_zarr_array(feature_group["values"], name="values")[:],
-                    dtype=bool,
-                )
-            )
-        )
-        if selected_features != n_features:
-            raise ArtifactResolutionError(
-                "Normalized columns do not match its feature selection",
-                code="column_mismatch",
-                context={
-                    "assay": assay_name,
-                    "artifact_id": normalized_ref.artifact_id,
-                    "normalized_columns": n_features,
-                    "selected_count": selected_features,
-                },
-            )
         effective_batch_size = min(
             _positive_integer(batch_size, "batch_size"),
             n_cells,
@@ -1406,64 +1418,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             effective_dims = int(custom_loadings.shape[1])
             if effective_dims < 1:
                 raise ValueError("Custom loadings must contain at least one dimension")
-        if validated_normalized_cells.selected_count != n_cells:
-            raise ArtifactResolutionError(
-                "Normalized rows do not match its cell selection",
-                code="row_mismatch",
-                context={
-                    "assay": assay_name,
-                    "artifact_id": normalized_ref.artifact_id,
-                    "normalized_rows": n_cells,
-                    "selected_count": validated_normalized_cells.selected_count,
-                },
-            )
         pca_selection = pca_cell_selection or normalized_cell_selection
-        pca_use_values: np.ndarray | None = None
-        if method == "pca":
-            normalized_mask = read_stored_selection_mask(
-                self.zw,
-                normalized_cell_selection,
-                kind="cell_selection",
-                scope="datastore",
-                assay=None,
-                table_path="cellData",
-            )
-            pca_mask = (
-                normalized_mask
-                if pca_cell_selection is None
-                else read_stored_selection_mask(
-                    self.zw,
-                    pca_cell_selection,
-                    kind="cell_selection",
-                    scope="datastore",
-                    assay=None,
-                    table_path="cellData",
-                )
-            )
-            if np.any(pca_mask & ~normalized_mask):
-                raise ArtifactResolutionError(
-                    "PCA cell selection must be a subset of normalized cells",
-                    code="row_mismatch",
-                    context={
-                        "assay": assay_name,
-                        "artifact_id": pca_selection.artifact_id,
-                    },
-                )
-            pca_use_values = pca_mask[normalized_mask]
-            selected_pca_cells = int(pca_use_values.sum())
-            if selected_pca_cells < effective_dims + 1:
-                raise ValueError("PCA requires at least dims + 1 selected cells")
-            if n_features < effective_dims + 1:
-                raise ValueError("PCA requires at least dims + 1 selected features")
-            if effective_batch_size < effective_dims + 1:
-                raise ValueError("PCA batch_size must be at least dims + 1")
-        elif method == "lsi":
-            required_rank = effective_dims + int(lsi_skip_first)
-            if required_rank > min(n_cells, n_features):
-                raise ValueError(
-                    "LSI dimensions, including the skipped component, exceed "
-                    "the normalized matrix rank"
-                )
         enabled_scaling = method == "pca" and feat_scaling
         scaling_arguments = FeatureScalingArguments(
             normalized=normalized_ref,
@@ -1489,65 +1444,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             ),
             invalidate_cache=invalidate_cache,
         )
-        normalized_data = self._load_normalized_artifact(
-            normalized_ref,
-            batch_size=effective_batch_size,
-        )
-        if scaling_plan.reused:
-            scaling_group = reused_artifact_group(
-                self.zw,
-                scaling_plan,
-            )
-            mu = np.asarray(as_zarr_array(scaling_group["mean"], name="mean")[:])
-            sigma = np.asarray(as_zarr_array(scaling_group["scale"], name="scale")[:])
-        else:
-            if enabled_scaling:
-                if "feature_sum" in data_group and "feature_squared_sum" in data_group:
-                    total = np.asarray(
-                        as_zarr_array(
-                            data_group["feature_sum"],
-                            name="feature_sum",
-                        )[:],
-                        dtype=np.float64,
-                    )
-                    squared_total = np.asarray(
-                        as_zarr_array(
-                            data_group["feature_squared_sum"],
-                            name="feature_squared_sum",
-                        )[:],
-                        dtype=np.float64,
-                    )
-                    mu_raw = total / n_cells
-                    variance = squared_total / n_cells - np.square(mu_raw)
-                    sigma_raw = np.sqrt(np.clip(variance, 0, None))
-                else:
-                    mu_raw, sigma_raw = normalized_data.mean_and_std(
-                        nthreads=self.nthreads,
-                        msg="Calculating normalization statistics",
-                    )
-                mu = clean_array(mu_raw)
-                sigma = clean_array(sigma_raw, 1)
-            else:
-                mu = np.array([], dtype=np.float64)
-                sigma = np.array([], dtype=np.float64)
-            scaling_group = start_artifact(self.zw, scaling_plan)
-            mean_array = create_zarr_dataset(
-                scaling_group,
-                "mean",
-                (100000,),
-                "f8",
-                mu.shape,
-            )
-            mean_array[:] = mu
-            scale_array = create_zarr_dataset(
-                scaling_group,
-                "scale",
-                (100000,),
-                "f8",
-                sigma.shape,
-            )
-            scale_array[:] = sigma
-            finish_artifact(scaling_group, scaling_plan)
         if method == "pca":
             assert pca_selection is not None
             arguments: Any = PcaArguments(
@@ -1606,8 +1502,171 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             required_arrays=required_arrays,
             invalidate_cache=invalidate_cache,
         )
-        transform = None
-        if not planned.reused:
+        if planned.reused:
+            if show_elbow_plot and method == "pca":
+                logger.warning("PCA was not fitted so no elbow plot is available")
+            logger.info(
+                f"Reused {method.upper()} reduction for {n_cells} cells "
+                f"with {effective_dims} dimensions"
+            )
+            return planned.ref
+
+        normalized_feature_selection = self.resolve_features(
+            assay_name,
+            normalized_feature_selection,
+        )
+        validated_normalized_cells = validate_stored_selection_integrity(
+            self.zw,
+            normalized_cell_selection,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
+        )
+        feature_group = artifact_group(self.zw, normalized_feature_selection)
+        selected_features = int(
+            np.count_nonzero(
+                np.asarray(
+                    as_zarr_array(feature_group["values"], name="values")[:],
+                    dtype=bool,
+                )
+            )
+        )
+        if selected_features != n_features:
+            raise ArtifactResolutionError(
+                "Normalized columns do not match its feature selection",
+                code="column_mismatch",
+                context={
+                    "assay": assay_name,
+                    "artifact_id": normalized_ref.artifact_id,
+                    "normalized_columns": n_features,
+                    "selected_count": selected_features,
+                },
+            )
+        if validated_normalized_cells.selected_count != n_cells:
+            raise ArtifactResolutionError(
+                "Normalized rows do not match its cell selection",
+                code="row_mismatch",
+                context={
+                    "assay": assay_name,
+                    "artifact_id": normalized_ref.artifact_id,
+                    "normalized_rows": n_cells,
+                    "selected_count": validated_normalized_cells.selected_count,
+                },
+            )
+        pca_use_values: np.ndarray | None = None
+        if method == "pca":
+            normalized_mask = read_stored_selection_mask(
+                self.zw,
+                normalized_cell_selection,
+                kind="cell_selection",
+                scope="datastore",
+                assay=None,
+                table_path="cellData",
+            )
+            pca_mask = (
+                normalized_mask
+                if pca_cell_selection is None
+                else read_stored_selection_mask(
+                    self.zw,
+                    pca_cell_selection,
+                    kind="cell_selection",
+                    scope="datastore",
+                    assay=None,
+                    table_path="cellData",
+                )
+            )
+            if np.any(pca_mask & ~normalized_mask):
+                raise ArtifactResolutionError(
+                    "PCA cell selection must be a subset of normalized cells",
+                    code="row_mismatch",
+                    context={
+                        "assay": assay_name,
+                        "artifact_id": pca_selection.artifact_id,
+                    },
+                )
+            pca_use_values = pca_mask[normalized_mask]
+            selected_pca_cells = int(pca_use_values.sum())
+            if selected_pca_cells < effective_dims + 1:
+                raise ValueError("PCA requires at least dims + 1 selected cells")
+            if n_features < effective_dims + 1:
+                raise ValueError("PCA requires at least dims + 1 selected features")
+            if effective_batch_size < effective_dims + 1:
+                raise ValueError("PCA batch_size must be at least dims + 1")
+        elif method == "lsi":
+            required_rank = effective_dims + int(lsi_skip_first)
+            if required_rank > min(n_cells, n_features):
+                raise ValueError(
+                    "LSI dimensions, including the skipped component, exceed "
+                    "the normalized matrix rank"
+                )
+        with self._cache_normalized_artifact(
+            normalized_ref, local_cache, effective_batch_size
+        ):
+            normalized_data = self._load_normalized_artifact(
+                normalized_ref,
+                batch_size=effective_batch_size,
+            )
+            if scaling_plan.reused:
+                scaling_group = reused_artifact_group(
+                    self.zw,
+                    scaling_plan,
+                )
+                mu = np.asarray(as_zarr_array(scaling_group["mean"], name="mean")[:])
+                sigma = np.asarray(
+                    as_zarr_array(scaling_group["scale"], name="scale")[:]
+                )
+            else:
+                if enabled_scaling:
+                    if (
+                        "feature_sum" in data_group
+                        and "feature_squared_sum" in data_group
+                    ):
+                        total = np.asarray(
+                            as_zarr_array(
+                                data_group["feature_sum"],
+                                name="feature_sum",
+                            )[:],
+                            dtype=np.float64,
+                        )
+                        squared_total = np.asarray(
+                            as_zarr_array(
+                                data_group["feature_squared_sum"],
+                                name="feature_squared_sum",
+                            )[:],
+                            dtype=np.float64,
+                        )
+                        mu_raw = total / n_cells
+                        variance = squared_total / n_cells - np.square(mu_raw)
+                        sigma_raw = np.sqrt(np.clip(variance, 0, None))
+                    else:
+                        mu_raw, sigma_raw = normalized_data.mean_and_std(
+                            nthreads=self.nthreads,
+                            msg="Calculating normalization statistics",
+                        )
+                    mu = clean_array(mu_raw)
+                    sigma = clean_array(sigma_raw, 1)
+                else:
+                    mu = np.array([], dtype=np.float64)
+                    sigma = np.array([], dtype=np.float64)
+                scaling_group = start_artifact(self.zw, scaling_plan)
+                mean_array = create_zarr_dataset(
+                    scaling_group,
+                    "mean",
+                    (100000,),
+                    "f8",
+                    mu.shape,
+                )
+                mean_array[:] = mu
+                scale_array = create_zarr_dataset(
+                    scaling_group,
+                    "scale",
+                    (100000,),
+                    "f8",
+                    sigma.shape,
+                )
+                scale_array[:] = sigma
+                finish_artifact(scaling_group, scaling_plan)
             use_for_pca = (
                 pca_use_values if method == "pca" else np.ones(n_cells, dtype=bool)
             )
@@ -2320,14 +2379,31 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         resolved_batch_size = (
             None if batch_size is None else _positive_integer(batch_size, "batch_size")
         )
-        coordinate_source, n_cells, dims = self._coordinate_source(
-            coordinates,
-            batch_size=resolved_batch_size,
+        if coordinates.kind not in {
+            "reduction",
+            "batch_correction",
+            "imported_coordinates",
+        }:
+            raise ValueError(
+                "Coordinates must reference reduction, batch_correction, or imported_coordinates"
+            )
+        coordinate_status = self._require_complete_artifact(
+            coordinates, coordinates.kind
         )
-        source_data = getattr(coordinate_source, "data", None)
-        source_batch_size = (
-            int(source_data.chunksize[0]) if source_data is not None else n_cells
-        )
+        coordinate_group = group_at(self.zw, coordinate_status.path)
+        coordinate_source = None
+        if "data" in coordinate_group:
+            data = as_zarr_array(coordinate_group["data"], name="data")
+            n_cells, dims = map(int, data.shape)
+            source_batch_size = _row_block(data, resolved_batch_size)
+        else:
+            coordinate_source, n_cells, dims = self._coordinate_source(
+                coordinates, batch_size=resolved_batch_size
+            )
+            source_data = getattr(coordinate_source, "data", None)
+            source_batch_size = (
+                int(source_data.chunksize[0]) if source_data is not None else n_cells
+            )
         requested_batch_size = (
             source_batch_size if resolved_batch_size is None else resolved_batch_size
         )
@@ -2350,12 +2426,15 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             _ref: ArtifactRef,
             group: zarr.Group,
         ) -> bool:
+            from ...storage.ann_index import _validate_ann_index_contract
+
             try:
-                load_ann_index(
+                _validate_ann_index_contract(
                     group,
                     ann_metric,
                     dims,
                     expected_count=n_cells,
+                    require_metadata=False,
                 )
             except (FileNotFoundError, RuntimeError, ValueError):
                 return False
@@ -2369,6 +2448,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             reuse_validator=valid_ann_artifact,
         )
         if not planned.reused:
+            if coordinate_source is None:
+                coordinate_source, n_cells, dims = self._coordinate_source(
+                    coordinates, batch_size=resolved_batch_size
+                )
             ann_idx = AnnIndexStage.fit(
                 coordinates=coordinate_source,
                 metric=ann_metric,

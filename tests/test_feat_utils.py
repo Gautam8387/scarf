@@ -456,6 +456,25 @@ def test_binned_sampling_excludes_query_genes():
     assert all(name in gene_names for name in controls)
 
 
+def test_binned_sampling_advances_between_bins_without_changing_global_rng():
+    values = pd.Series(np.arange(60), index=[f"g{i}" for i in range(60)])
+    targets = ["g0", "g9", "g19", "g29", "g39", "g49", "g59"]
+    before = np.random.get_state()
+    controls = binned_sampling(values, targets, ctrl_size=3, n_bins=7, rand_seed=4466)
+    after = np.random.get_state()
+
+    offsets = [
+        tuple(i for i in range(10) if f"g{start + i}" in controls)
+        for start in (9, 19, 29, 39, 49)
+    ]
+    assert len(set(offsets)) == 5
+    assert controls == binned_sampling(values, targets, 3, 7, 4466)
+    assert set(controls).isdisjoint(targets)
+    assert before[0] == after[0]
+    np.testing.assert_array_equal(before[1], after[1])
+    assert before[2:] == after[2:]
+
+
 def test_hto_negative_binomial_cutoff_is_unshifted(monkeypatch):
     assert _negative_binomial_cutoff(mu=1, alpha=1) == 6
 

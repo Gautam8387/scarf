@@ -33,7 +33,22 @@ def binned_sampling(
     Returns:
         A list of sampled features.
     """
+    if isinstance(ctrl_size, (bool, np.bool_)) or not isinstance(
+        ctrl_size, (int, np.integer)
+    ):
+        raise TypeError("ctrl_size must be a positive integer")
+    if ctrl_size < 1:
+        raise ValueError("ctrl_size must be a positive integer")
+    if isinstance(n_bins, (bool, np.bool_)) or not isinstance(
+        n_bins, (int, np.integer)
+    ):
+        raise TypeError("n_bins must be an integer greater than one")
+    if n_bins < 2:
+        raise ValueError("n_bins must be greater than one")
     n_items = int(np.round(len(values) / (n_bins - 1)))
+    if n_items < 1:
+        raise ValueError("n_bins is too large for the number of available features")
+    rng = np.random.RandomState(rand_seed)
     feature_set = set(feature_list)
     obs_cut: pd.Series = values.fillna(0).rank(method="min").divide(n_items).astype(int)
 
@@ -42,10 +57,10 @@ def binned_sampling(
         sub_obs = obs_cut[obs_cut == cut]
         if len(sub_obs) == 0:
             continue
-        if len(sub_obs) < ctrl_size:
-            sample_size = len(sub_obs)
-        else:
-            sample_size = ctrl_size
-        r_genes = sub_obs.sample(n=sample_size, random_state=rand_seed).index
+        r_genes = (
+            sub_obs.sample(n=ctrl_size, random_state=rng).index
+            if len(sub_obs) > ctrl_size
+            else sub_obs.index
+        )
         control_genes.update(set(r_genes))
-    return list(control_genes - feature_set)
+    return list(values.index[values.index.isin(control_genes - feature_set)])

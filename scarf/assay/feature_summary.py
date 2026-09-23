@@ -1,5 +1,5 @@
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import zarr
@@ -26,6 +26,7 @@ from ..storage.types import as_zarr_array, as_zarr_group
 
 if TYPE_CHECKING:
     from .base import Assay
+    from .rna import RNAassay
 
 
 _RNA_ARRAYS = ("normed_tot", "normed_n", "sigmas")
@@ -101,6 +102,7 @@ def ensure_feature_summary(
     assay: "Assay",
     cell_selection: ArtifactRef,
     *,
+    log_transform: bool = False,
     invalidate_cache: bool = False,
 ) -> ArtifactRef:
     """Plan or compute the sufficient-statistics artifact for an assay.
@@ -109,6 +111,9 @@ def ensure_feature_summary(
     provenance input is the selected-cell artifact. All computations cover the
     complete physical feature axis and never mount arrays on feature metadata.
     """
+    operation = getattr(assay, "_feature_summary_operation", None)
+    if log_transform and operation != "summarize_rna_features":
+        raise TypeError("Log-transformed feature summaries require an RNA assay")
     cell_mask = _selection_mask(root, cell_selection, n_cells=assay.cells.N)
     cell_idx = np.flatnonzero(cell_mask).astype(np.int64, copy=False)
     n_features = int(assay.feats.N)
@@ -118,13 +123,14 @@ def ensure_feature_summary(
         as_zarr_array(feature_data["ids"], name="featureData/ids")
     )
 
-    operation = getattr(assay, "_feature_summary_operation", None)
     if operation == "summarize_rna_features":
         names: tuple[str, ...] = _RNA_ARRAYS
         parameters: dict[str, Any] = {
             "normalization_method": callable_identity(assay.normMethod),
             "size_factor": assay.sf,
         }
+        if log_transform:
+            parameters["log_transform"] = True
     elif operation == "summarize_atac_features":
         names = _ATAC_ARRAYS
         parameters = {
@@ -158,7 +164,12 @@ def ensure_feature_summary(
     if planned.reused:
         return planned.ref
 
-    raw_payload = assay._compute_feature_summary(cell_idx, feature_idx)
+    if log_transform:
+        raw_payload = cast("RNAassay", assay)._compute_feature_summary(
+            cell_idx, feature_idx, log_transform=True
+        )
+    else:
+        raw_payload = assay._compute_feature_summary(cell_idx, feature_idx)
     payload = {name: np.asarray(raw_payload[name], dtype=np.float64) for name in names}
     group = start_artifact(root, planned)
     chunks = (min(max(n_features, 1), 100_000),)

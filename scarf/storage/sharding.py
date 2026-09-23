@@ -1088,6 +1088,29 @@ def is_readable_counts_t_layout(
     )
 
 
+def _counts_t_write_peak(spec: ZarrArraySpec) -> int:
+    shards = spec.shards or spec.chunks
+    itemsize = int(np.dtype(spec.dtype).itemsize)
+    n_chunks = int(np.prod(shards)) // int(np.prod(spec.chunks))
+    return _row_band_task_peak(
+        sourceBytes=0,
+        denseBytes=int(np.prod(shards)) * itemsize,
+        innerChunkBytes=int(np.prod(spec.chunks)) * itemsize,
+        nChunks=n_chunks,
+        innerConcurrency=n_chunks,
+    )
+
+
+def _counts_t_read_peak(spec: ZarrArraySpec) -> int:
+    chunk_bytes = int(np.prod(spec.chunks)) * int(np.dtype(spec.dtype).itemsize)
+    n_chunks = int(np.prod(spec.shards or spec.chunks)) // int(np.prod(spec.chunks))
+    return (
+        2 * chunk_bytes
+        + _encoded_chunk_bound(chunk_bytes)
+        + _shard_index_bound(n_chunks)
+    )
+
+
 def preflight_counts_t_spec(
     counts: ZarrArraySpec,
     *,
@@ -1106,9 +1129,11 @@ def preflight_counts_t_spec(
         policy=policy or DEFAULT_COUNT_MATRIX_POLICY,
         profile=profile,
     )
+    if 0 in counts.shape:
+        return plan.countsT
     needed = (
-        int(plan.destinationBufferBytes)
-        + int(plan.sourceBufferBytes)
+        _counts_t_write_peak(plan.countsT)
+        + _counts_t_read_peak(plan.counts)
         + max(0, int(residentBytes))
     )
     if needed > int(resources.memoryBytes):
@@ -1237,6 +1262,13 @@ def write_counts_t(
             persist_count_matrix_plan(counts, plan)
             persist_count_matrix_plan(existing, plan)
             return existing
+    preflight_counts_t_spec(
+        plan.counts,
+        profile=resolved_profile,
+        resources=resources,
+        residentBytes=max(0, int(residentBytes)),
+        policy=resolved_policy,
+    )
     counts_t = as_zarr_array(
         create_count_matrix_array(group, "countsT", plan.countsT),
         name="countsT",
@@ -1250,13 +1282,6 @@ def write_counts_t(
     if n_cells == 0 or n_feats == 0:
         counts_t.attrs["complete"] = True
         return counts_t
-    preflight_counts_t_spec(
-        plan.counts,
-        profile=resolved_profile,
-        resources=resources,
-        residentBytes=max(0, int(residentBytes)),
-        policy=resolved_policy,
-    )
     owners: set[tuple[int, int]] = set()
     dest_feat_shard = int(plan.countsT.shards[0]) if plan.countsT.shards else n_feats
     dest_cell_band = int(plan.countsT.shards[1]) if plan.countsT.shards else n_cells
@@ -1266,7 +1291,7 @@ def write_counts_t(
     max_group_chunks = max(1, source_feat_shard // source_feat_chunk)
     itemsize = int(np.dtype(counts.dtype).itemsize)
     dest_unit_bytes = max(1, dest_feat_shard * dest_cell_band * itemsize)
-    source_chunk_bytes = max(1, source_cell_chunk * source_feat_chunk * itemsize)
+    source_read_bytes = _counts_t_read_peak(plan.counts)
     resident_bytes = max(0, int(residentBytes))
     available_bytes = max(0, int(resources.memoryBytes) - resident_bytes)
     cell_chunks_per_dest = max(1, -(-dest_cell_band // max(1, source_cell_chunk)))
@@ -1279,6 +1304,7 @@ def write_counts_t(
         -destination_feature_jobs // max_destinations_per_set
     )
     planned_destination_set_bytes = dest_unit_bytes * max_destinations_per_set
+    destination_peak_bytes = _counts_t_write_peak(plan.countsT)
     requested_read_workers = (
         resources.workers
         if resolved_io.readWorkers is None
@@ -1293,9 +1319,9 @@ def write_counts_t(
         resources,
         WorkShape(
             nUnits=n_dest_sets,
-            unitBytes=planned_destination_set_bytes,
+            unitBytes=destination_peak_bytes * max_destinations_per_set,
             residentBytes=resident_bytes,
-            innerReadBytes=max(int(plan.sourceBufferBytes), source_chunk_bytes),
+            innerReadBytes=source_read_bytes,
             writes=True,
             chunksPerShard=max(max_group_chunks, touched_source_chunks),
         ),
@@ -1340,6 +1366,7 @@ def write_counts_t(
         "fusedDestinationStrips": 0,
         "destinationSets": n_dest_sets,
         "plannedDestinationSetBytes": planned_destination_set_bytes,
+        "destinationEncodingBytes": destination_peak_bytes - dest_unit_bytes,
         "kind": "observed",
     }
     seen_source_chunks: set[tuple[int, int]] = set()
@@ -1398,7 +1425,7 @@ def write_counts_t(
         first_chunk = source_feat_start // source_feat_chunk
         last_chunk = (source_feat_end - 1) // source_feat_chunk
         touched_chunks = last_chunk - first_chunk + 1
-        return source_cell_chunk * touched_chunks * source_feat_chunk * itemsize
+        return touched_chunks * source_read_bytes
 
     async def _operation(runner: AsyncStorageRunner) -> None:
         source = counts.async_array
@@ -1413,21 +1440,18 @@ def write_counts_t(
         ) -> None:
             if not destination_ranges:
                 return
-            output_bytes = sum(
-                (feat_end - feat_start) * (cell_end - cell_start) * itemsize
-                for feat_start, feat_end in destination_ranges
-            )
             min_feat = destination_ranges[0][0]
             max_feat = destination_ranges[-1][1]
             source_ranges = _source_feature_ranges(min_feat, max_feat)
             max_read_bytes = max(
                 _source_read_admission_bytes(start, end) for start, end in source_ranges
             )
-            available_for_reads = available_bytes - output_bytes
+            working_bytes = len(destination_ranges) * destination_peak_bytes
+            available_for_reads = available_bytes - working_bytes
             if available_for_reads < max_read_bytes:
                 raise MemoryError(
                     "countsT cannot admit one source read while "
-                    "holding its destination buffer"
+                    "holding its destination buffer and encoding workspace"
                 )
             effective_reads = min(
                 effective_reads_in_flight,
@@ -1446,7 +1470,7 @@ def write_counts_t(
                 int(effective_reads * resolved_read_group_chunks),
             )
 
-            async with runner.reserve_bytes(output_bytes):
+            async with runner.reserve_bytes(working_bytes):
                 buffers = {
                     (feat_start, feat_end): np.empty(
                         (feat_end - feat_start, cell_end - cell_start),

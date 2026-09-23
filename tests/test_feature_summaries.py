@@ -72,6 +72,7 @@ def test_cell_cycle_and_prevalence_records_have_exact_direct_inputs() -> None:
         s_gene_indices=(1, 3),
         g2m_gene_indices=(2,),
         control_size=1,
+        log_transform=True,
         n_bins=10,
         rand_seed=7,
         invalidate_cache=False,
@@ -81,6 +82,7 @@ def test_cell_cycle_and_prevalence_records_have_exact_direct_inputs() -> None:
         "s_gene_indices",
         "g2m_gene_indices",
         "control_size",
+        "log_transform",
         "n_bins",
         "rand_seed",
     }
