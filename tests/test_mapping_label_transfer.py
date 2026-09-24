@@ -1,3 +1,4 @@
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 import shutil
@@ -657,18 +658,17 @@ def test_label_transfer_excludes_blank_byte_reference_labels(
 
 
 def test_vote_entropy_is_conditional_on_available_labels() -> None:
-    _, top_vote, entropy, _, unknown, _ = DataStore._label_vote_decision(
-        np.array(["known", "missing"], dtype=object),
-        np.array([0, 1]),
-        np.array([0.01, 0.99]),
+    from scarf.mapping.confidence import _label_vote_block
+
+    votes = _label_vote_block(
+        np.array([[0, -1]]),
+        np.array([[0.01, 0.99]]),
         0.5,
-        "NA",
-        reference_label_valid=np.array([True, False]),
     )
 
-    assert top_vote == pytest.approx(0.01)
-    assert entropy == pytest.approx(0.0)
-    assert unknown
+    assert votes.vote_fraction[0] == pytest.approx(0.01)
+    assert votes.vote_entropy[0] == pytest.approx(0.0)
+    assert votes.is_unknown[0]
 
 
 def test_label_transfer_calibration_is_deterministic_and_validated() -> None:
@@ -931,3 +931,222 @@ def test_every_mapping_consumer_rejects_old_projection_artifacts(
     for consumer in consumers:
         with pytest.raises(ValueError, match="Re-run run_mapping"):
             consumer()
+
+
+def test_bound_reference_repeats_label_transfer_without_rereading_its_payload(
+    mapping_consumer_context,
+    monkeypatch,
+):
+
+    from scarf.storage.artifacts import artifact_group
+
+    reference_store, reference, query = mapping_consumer_context
+    reference_store.RNA.attrs.pop("dataset_fingerprint", None)
+    _write_reference_labels(reference)
+    result = _write_projection(
+        query,
+        reference,
+        indices=np.array([[0, 1], [1, 0]]),
+        distances=np.array([[1.0, 9.0], [9.0, 1.0]]),
+        uninformative=np.array([False, False]),
+    )
+    first = query.get_target_classes(
+        result,
+        "reference_labels",
+        reference=reference,
+        threshold_fraction=0.5,
+    )
+
+    payload_paths = {
+        artifact_group(reference_store.zw, ref).path
+        for ref in (
+            reference.ref,
+            reference.reduction,
+            reference.ann_index,
+            reference.neighbors,
+        )
+    }
+    reference_backing_store = reference_store.zw.store
+    keys: list[str] = []
+    store_type = type(reference_backing_store)
+    original_get = store_type.get
+
+    async def recording_get(store, key, prototype, byte_range=None):
+        if store is reference_backing_store:
+            keys.append(key)
+        return await original_get(store, key, prototype, byte_range)
+
+    monkeypatch.setattr(store_type, "get", recording_get)
+    second = query.get_target_classes(
+        result,
+        "reference_labels",
+        reference=reference,
+        threshold_fraction=0.5,
+    )
+    pd.testing.assert_series_equal(first, second)
+    chunk_keys = [key for key in keys if not key.endswith("zarr.json")]
+    assert any(key.startswith("cellData/reference_labels/") for key in chunk_keys)
+    payload_keys = [
+        key
+        for key in chunk_keys
+        if any(key.startswith(f"{prefix}/") for prefix in payload_paths)
+    ]
+    assert payload_keys == []
+    cell_id_reads = Counter(
+        key for key in chunk_keys if key.startswith("cellData/ids/")
+    )
+    # Binding and label reads each check twice; the dataset fingerprint adds one.
+    assert cell_id_reads and set(cell_id_reads.values()) == {5}
+    assert not any(key.startswith("cellData/I/") for key in chunk_keys)
+
+
+def test_binding_rejects_a_handle_whose_arrays_were_replaced(mapping_consumer_context):
+    from scarf.mapping.models import ScaledPCAProjectionModel
+
+    _, reference, query = mapping_consumer_context
+    result = _write_projection(
+        query,
+        reference,
+        indices=np.array([[0, 1], [1, 0]]),
+        distances=np.array([[1.0, 9.0], [9.0, 1.0]]),
+        uninformative=np.array([False, False]),
+    )
+    model = reference.model
+    forged = replace(
+        reference,
+        model=ScaledPCAProjectionModel(
+            feature_means=np.asarray(model.feature_means),
+            feature_scales=np.asarray(model.feature_scales),
+            center=np.asarray(model.center),
+            loadings=np.asarray(model.loadings) * 2.0,
+        ),
+    )
+    with pytest.raises(ValueError, match="does not match its stored artifact"):
+        query.get_mapping_result(result, reference=forged)
+    assert query.get_mapping_result(result, reference=reference).n_cells == 2
+
+
+@pytest.mark.parametrize("stored_fingerprint", [False, True])
+@pytest.mark.parametrize(
+    "consumer",
+    [
+        "classes",
+        "evidence",
+        "column",
+        "layout",
+        "result",
+        "result_arrays",
+        "score",
+        "lineage",
+    ],
+)
+def test_reused_reference_rejects_reordered_cells(
+    mapping_consumer_context, stored_fingerprint, consumer
+):
+    reference_store, reference, query = mapping_consumer_context
+    if stored_fingerprint:
+        reference_store.RNA.attrs["dataset_fingerprint"] = reference.dataset_fingerprint
+    else:
+        reference_store.RNA.attrs.pop("dataset_fingerprint", None)
+    _write_reference_labels(reference)
+    selected = _reference_cell_indices(reference)[:2]
+    result = _write_projection(
+        query,
+        reference,
+        indices=np.array([[0, 1], [1, 0]]),
+        distances=np.array([[1.0, 9.0], [9.0, 1.0]]),
+        uninformative=np.array([False, False]),
+    )
+    _, layout = _write_reference_layout(reference, name="reference_layout")
+    consume = {
+        "classes": lambda: query.get_target_classes(
+            result, "reference_labels", reference=reference
+        ),
+        "evidence": lambda: query.get_target_label_evidence(
+            result, "reference_labels", reference=reference
+        ),
+        "column": lambda: reference.fetch_cell_column("reference_labels"),
+        "layout": lambda: reference.fetch_layout(layout),
+        "result": lambda: query.get_mapping_result(result, reference=reference),
+        "result_arrays": lambda: query.get_mapping_result(
+            result, reference=reference, load_arrays=True
+        ),
+        "score": lambda: list(query.get_mapping_score(result, reference=reference)),
+        "lineage": lambda: query.lineage(result, references=reference),
+    }[consumer]
+    consume()
+
+    for column in ("ids", "reference_labels"):
+        array = reference_store.zw[f"cellData/{column}"]
+        values = np.asarray(array[:])
+        values[selected] = values[selected[::-1]]
+        array[:] = values
+
+    with pytest.raises(ValueError, match="dataset fingerprint mismatch|row identity"):
+        consume()
+
+
+@pytest.mark.parametrize("column", ["feature_ids", "cell_counts"])
+def test_reused_reference_recomputes_missing_dataset_fingerprint(
+    mapping_consumer_context, column
+):
+    reference_store, reference, query = mapping_consumer_context
+    reference_store.RNA.attrs.pop("dataset_fingerprint", None)
+    result = _write_projection(
+        query,
+        reference,
+        indices=np.array([[0, 1], [1, 0]]),
+        distances=np.array([[1.0, 9.0], [9.0, 1.0]]),
+        uninformative=np.array([False, False]),
+    )
+    query.get_mapping_result(result, reference=reference)
+
+    if column == "feature_ids":
+        array = reference_store.RNA.feats._get_array("ids")
+        array[:2] = array[:2][::-1]
+    else:
+        array = reference_store.cells._get_array("RNA_nCounts")
+        array[0] = array[0] + 1
+
+    with pytest.raises(ValueError, match="dataset fingerprint mismatch"):
+        query.get_mapping_result(result, reference=reference)
+
+
+@pytest.mark.parametrize("attribute", ["dtype", "shape"])
+def test_reused_reference_rejects_changed_array_metadata(
+    mapping_consumer_context, attribute
+):
+    _, reference, query = mapping_consumer_context
+    _write_reference_labels(reference)
+    result = _write_projection(
+        query,
+        reference,
+        indices=np.array([[0, 1], [1, 0]]),
+        distances=np.array([[1.0, 9.0], [9.0, 1.0]]),
+        uninformative=np.array([False, False]),
+    )
+    query_cells = query.snapshot_cell_selection("I")
+    query.get_mapping_result(result, reference=reference)
+    loadings = reference.model.loadings
+    assert not loadings.flags.writeable
+    original = getattr(loadings, attribute)
+    changed = (
+        np.dtype(f"u{loadings.dtype.itemsize}")
+        if attribute == "dtype"
+        else (loadings.size,)
+    )
+    setattr(loadings, attribute, changed)
+    try:
+        consumers = (
+            lambda: query.get_mapping_result(result, reference=reference),
+            lambda: query.get_target_classes(
+                result, "reference_labels", reference=reference
+            ),
+            lambda: query.run_mapping(reference, query_cells),
+        )
+        for consume in consumers:
+            with pytest.raises(ValueError, match="does not match its stored artifact"):
+                consume()
+    finally:
+        setattr(loadings, attribute, original)
+    assert query.get_mapping_result(result, reference=reference).n_cells == 2

@@ -94,6 +94,7 @@ _CONTRACTS = (
             "lsi_n_oversamples",
             "lsi_solver",
             "lsi_skip_first",
+            "local_cache",
             "method",
             "pca_cell_selection",
             "rand_state",
@@ -169,12 +170,9 @@ _CONTRACTS = (
         aliases={
             "g2m_genes": "g2m_gene_indices",
             "s_genes": "s_gene_indices",
+            "ctrl_size": "control_size",
         },
         model_only=_classified(
-            "derived",
-            "control_size",
-        )
-        | _classified(
             "resolved_input",
             "feature_summary",
         ),
@@ -188,7 +186,10 @@ _CONTRACTS = (
             "graph": "connectivity_map",
         },
         signature_only=_classified("routing", "from_assay"),
-        model_only=_classified("resolved_input", "neighbors"),
+        model_only={
+            **_classified("resolved_input", "neighbors"),
+            **_classified("algorithm_version", "count_arithmetic"),
+        },
     ),
     OperationContract(
         DataStore.run_fate_mapping,
@@ -215,6 +216,7 @@ _CONTRACTS = (
         DataStore.run_leiden_clustering,
         metadata_arguments.LeidenArguments,
         constructor=_ClusteringOperationsMixin._prepare_leiden_clustering,
+        model_only=_classified("algorithm_version", "edge_weighting"),
     ),
     OperationContract(
         DataStore.run_marker_search,

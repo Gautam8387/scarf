@@ -1,6 +1,6 @@
 from collections.abc import Iterable, Mapping, Sequence
 from numbers import Real
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -49,6 +49,7 @@ from ...storage.feature_selection import (
     _feature_selection_plan,
     _ordered_feature_ids_fingerprint,
     _write_feature_selection,
+    read_feature_selection_indices,
     resolve_feature_selection,
 )
 from ...storage.refs import ArtifactRef
@@ -64,7 +65,6 @@ from ...utils.compute import controlled_compute
 from ...utils.logging import logger
 
 if TYPE_CHECKING:
-    from ...storage.profiles import ZarrLocation
     from ..mapping_datastore import MappingDatastore as _QualityControlOperationsBase
 else:
     _QualityControlOperationsBase = object
@@ -90,17 +90,6 @@ def _validated_named_cell_artifacts(
 
 
 class _QualityControlOperationsMixin(_QualityControlOperationsBase):
-    if TYPE_CHECKING:
-
-        def _create_temporary_datastore(
-            self,
-            zarr_loc: ZarrLocation,
-            *,
-            default_assay: str,
-            assay_types: dict[str, str],
-            nthreads: int,
-        ) -> _QualityControlOperationsBase: ...
-
     def _run_cell_cycle_scoring_artifact(
         self,
         *,
@@ -110,6 +99,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         feature_snapshot: ArtifactRef | None = None,
         s_genes: list[str] | None = None,
         g2m_genes: list[str] | None = None,
+        ctrl_size: int | None = None,
+        log_transform: bool = True,
         n_bins: int = 50,
         rand_seed: int = 4466,
         invalidate_cache: bool = False,
@@ -132,7 +123,17 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             from ...quality_control.cell_cycle_genes import g2m_phase_genes
 
             g2m_genes = list(g2m_phase_genes)
-        control_size = min(len(s_genes), len(g2m_genes))
+        control_size = (
+            min(len(s_genes), len(g2m_genes)) if ctrl_size is None else ctrl_size
+        )
+        if isinstance(control_size, (bool, np.bool_)) or not isinstance(
+            control_size, (int, np.integer)
+        ):
+            raise TypeError("ctrl_size must be a positive integer")
+        if control_size < 1:
+            raise ValueError("ctrl_size must be a positive integer")
+        if not isinstance(log_transform, bool):
+            raise TypeError("log_transform must be a bool")
         if feature_names is None:
             s_gene_indices = assay.feats.get_index_by(
                 s_genes,
@@ -167,6 +168,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             self.zw,
             assay,
             cell_selection,
+            log_transform=log_transform,
             invalidate_cache=invalidate_cache,
         )
         n_cells = feature_summary_selected_count(
@@ -180,6 +182,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             s_gene_indices=tuple(s_gene_indices),
             g2m_gene_indices=tuple(g2m_gene_indices),
             control_size=control_size,
+            log_transform=log_transform,
             n_bins=n_bins,
             rand_seed=rand_seed,
             invalidate_cache=invalidate_cache,
@@ -228,6 +231,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             ctrl_size=control_size,
             n_bins=n_bins,
             rand_seed=rand_seed,
+            log_transform=log_transform,
         )
         g2m_score = assay._score_feature_indices(
             np.asarray(g2m_gene_indices, dtype=np.int64),
@@ -236,6 +240,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             ctrl_size=control_size,
             n_bins=n_bins,
             rand_seed=rand_seed,
+            log_transform=log_transform,
         )
         phase = np.asarray(assign_cell_cycle_phase(s_score, g2m_score))
         write_cell_data_artifact(
@@ -620,6 +625,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         cell_selection: ArtifactRef | None = None,
         artifact_metrics: Iterable[NamedCellArtifact] | None = None,
         invalidate_cache: bool = False,
+        method: Literal["mad", "gaussian"] = "mad",
         sample_column: str | None = None,
         sample_artifact: NamedCellArtifact | None = None,
         n_mads: float = 3.0,
@@ -627,21 +633,17 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
     ) -> ArtifactRef:
         """Create an immutable automatically filtered cell selection.
 
-        By default this is a wrapper around ``filter_cells`` that determines the
-        thresholds for each column. It models a normal distribution centered on
-        the column median and using the column standard deviation, then
-        evaluates its quantiles at ``min_p`` and ``max_p``.
+        Defaults to median absolute deviation (MAD) bounds. Counts and feature
+        counts use log1p and two-sided bounds; mitochondrial and ribosomal
+        percentages use upper bounds. Other metrics use two-sided raw bounds.
 
         Requested columns are read from current cell metadata when this method
         is called. Exact quality-metric artifacts can be supplied alongside
         metadata metrics. Metadata values are fingerprinted and artifact
         references are stored in provenance.
 
-        When ``sample_column`` or ``sample_artifact`` is supplied, thresholds
-        are instead calculated independently within each sample using median
-        absolute deviation (MAD). ``n_mads`` controls that path. ``min_p`` and
-        ``max_p`` remain global-Gaussian parameters and must stay at their
-        defaults for sample-aware filtering.
+        MAD thresholds are pooled unless a sample source is supplied. Use
+        ``method="gaussian"`` for pooled median/std Gaussian quantiles instead.
 
         Args:
             attrs: Column names to be used for filtering.
@@ -649,16 +651,26 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             max_p: Quantile used for the upper threshold (Gaussian path only).
             cell_selection: Optional prior cell-selection artifact.
             artifact_metrics: Named exact ``quality_metric`` artifact vectors.
+            method: MAD bounds by default, or explicit pooled Gaussian bounds.
             sample_column: Optional cell-metadata column with sample labels.
                 When set, MAD bounds are calculated within each sample.
             sample_artifact: Optional named exact ``hto_identity`` sample vector.
-            n_mads: Number of scaled MADs used for per-sample bounds.
-            min_cells_per_sample: Samples with fewer active cells than this are
+            n_mads: Number of scaled MADs used for bounds.
+            min_cells_per_sample: Groups with fewer active cells than this are
                 retained without MAD filtering and emit a warning.
 
         Returns:
             A complete datastore-scoped ``cell_selection`` artifact.
         """
+        if method not in ("mad", "gaussian"):
+            raise ValueError("method must be 'mad' or 'gaussian'")
+        if method == "gaussian":
+            if sample_column is not None or sample_artifact is not None:
+                raise ValueError("Gaussian filtering does not support a sample source")
+            if n_mads != 3.0 or min_cells_per_sample != 20:
+                raise ValueError(
+                    "n_mads and min_cells_per_sample apply only to method='mad'"
+                )
         if attrs is None:
             attrs = []
             for i in ["nCounts", "nFeatures", "percentMito", "percentRibo"]:
@@ -700,8 +712,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         if missing:
             joined = ", ".join(repr(attr) for attr in missing)
             raise KeyError(f"Cell metadata columns not found: {joined}")
-        if sample_column is not None or resolved_sample_artifact is not None:
-            return self._auto_filter_cells_sample_mad(
+        if method == "mad":
+            return self._auto_filter_cells_mad(
                 attrs=attrs_list,
                 artifact_metrics=metric_artifacts,
                 min_p=min_p,
@@ -766,7 +778,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                     f"QC metric {name!r} produced non-finite Gaussian bounds"
                 )
             resolved_bounds[name] = {"low": float(low), "high": float(high)}
-            compact_keep &= _apply_bounds(values, low, high)
+            compact_keep &= _apply_bounds(values, low, high, keep_bounds=low == high)
         keep = np.zeros(self.cells.N, dtype=bool)
         keep[active_idx] = compact_keep
 
@@ -786,6 +798,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             row_ids=np.asarray(self.cells.fetch_all("ids")),
             operation="auto_filter_cells",
             parameters={
+                "method": "gaussian",
                 "attrs": metric_names,
                 "metric_sources": metric_sources,
                 "min_p": min_p,
@@ -805,7 +818,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         logger.info(f"Cell filtering retained {int(stored.sum())}/{self.cells.N} cells")
         return ref
 
-    def _auto_filter_cells_sample_mad(
+    def _auto_filter_cells_mad(
         self,
         *,
         attrs: list[str],
@@ -821,9 +834,9 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
     ) -> ArtifactRef:
         if min_p != 0.01 or max_p != 0.99:
             raise ValueError(
-                "min_p and max_p apply only to the global Gaussian path. "
-                "Leave them at their defaults (0.01 and 0.99) when "
-                "a sample source is set, and use n_mads to control MAD bounds"
+                "min_p and max_p apply only to method='gaussian'. "
+                "Leave them at their defaults (0.01 and 0.99) and use n_mads "
+                "to control MAD bounds"
             )
         if isinstance(n_mads, bool) or not isinstance(n_mads, Real):
             raise TypeError("n_mads must be a positive number")
@@ -840,9 +853,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             raise ValueError(
                 f"sample_column '{sample_column}' not found in cell metadata"
             )
-        if sample_column is None and sample_artifact is None:
-            raise ValueError("Sample-aware filtering requires an exact sample source")
-
         prior_selection = self._filter_input_selection(cell_selection)
         active = read_stored_selection_mask(
             self.zw,
@@ -854,6 +864,9 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         )
         active_idx = np.flatnonzero(active).astype(np.int64, copy=False)
         compact_active = np.ones(len(active_idx), dtype=bool)
+        if len(active_idx) == 0:
+            raise ValueError("Cell selection contains no active cells")
+        sample_labels: np.ndarray | None = None
         if sample_column is not None:
             sample_labels = np.asarray(
                 read_metadata_rows_chunkwise(
@@ -863,8 +876,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 )
             )
             sample_label_name = f"sample_column '{sample_column}'"
-        else:
-            assert sample_artifact is not None
+        elif sample_artifact is not None:
             resolved_sample = resolve_cell_aligned_artifact(
                 self.zw,
                 sample_artifact.artifact,
@@ -873,13 +885,12 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             )
             sample_labels = np.asarray(resolved_sample.values)
             sample_label_name = f"sample_artifact '{sample_artifact.name}'"
-        sample_labels = _validated_sample_labels(
-            sample_labels,
-            compact_active,
-            label_name=sample_label_name,
-        )
-        if sample_labels.size == 0:
-            raise ValueError("No active cells are available for sample-aware filtering")
+        if sample_labels is not None:
+            sample_labels = _validated_sample_labels(
+                sample_labels,
+                compact_active,
+                label_name=sample_label_name,
+            )
 
         metric_names: list[str] = []
         values_by_attr: dict[str, np.ndarray] = {}
@@ -912,6 +923,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             values_by_attr[source.name] = values
 
         parameters: dict[str, Any] = {
+            "method": "mad",
             "attrs": metric_names,
             "metric_sources": [
                 *(
@@ -934,12 +946,13 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 "source": "metadataColumn",
                 "column": sample_column,
             }
-        else:
-            assert sample_artifact is not None
+        elif sample_artifact is not None:
             parameters["sample_source"] = {
                 "name": sample_artifact.name,
                 "source": "artifact",
             }
+        else:
+            parameters["sample_source"] = {"source": "pooled"}
 
         mad_provenance = None
         if metric_names:
@@ -969,11 +982,11 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             },
         }
         if sample_column is not None:
+            assert sample_labels is not None
             fingerprint_inputs["sample_assignments_fingerprint"] = fingerprint_strings(
                 sample_labels
             )
-        else:
-            assert sample_artifact is not None
+        elif sample_artifact is not None:
             fingerprint_inputs["sample_artifact"] = sample_artifact.artifact
         canonical_bytes(
             {
@@ -1210,16 +1223,11 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
         """Create doublet scores without creating metadata columns."""
-        import shutil
-        import tempfile
-
-        from scipy.sparse import csr_matrix
-
         from ...quality_control.doublets import (
-            sample_cluster_pool,
-            simulate_doublet_pairs,
-            write_doublet_target_zarr,
+            score_synthetic_doublets,
+            smooth_doublet_scores,
         )
+        from ...storage.budget import admit_stream
 
         assay_name = source_assay.name
         if feature_names is not None and np.asarray(feature_names).shape != (
@@ -1279,6 +1287,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             save_k=save_k,
             smoothing_t=smoothing_t,
             normalize_scores=normalize_scores,
+            count_arithmetic="checked_integer_sum",
             random_seed=random_seed,
             invalidate_cache=invalidate_cache,
         )
@@ -1321,99 +1330,83 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 "The mapping reference does not match the uncorrected RNA graph"
             )
 
-        rng = np.random.default_rng(random_seed)
-        pool_positions = sample_cluster_pool(
-            labels,
-            cluster_sample_fraction,
-            max_cells_per_cluster,
-            rng,
+        feature_indices = read_feature_selection_indices(
+            self.zw,
+            assay_name,
+            feature_selection,
         )
-        pool_clusters = labels[pool_positions]
-        pool_raw_rows = active_idx[pool_positions]
-        logger.debug(
-            f"Sampled {len(pool_positions)} cells across "
-            f"{len(np.unique(pool_clusters))} clusters to seed doublet simulation"
+        feature_ids = read_metadata_rows_chunkwise(
+            source_assay.feats,
+            "ids",
+            feature_indices,
         )
-        pool_counts = controlled_compute(
-            source_assay.rawData[pool_raw_rows, :],
-            self.nthreads,
-        )
-        pool_csr = csr_matrix(pool_counts)
-        n_sim = max(1, int(round(simulation_ratio * n_active)))
-        left, right = simulate_doublet_pairs(
-            pool_clusters,
-            n_sim,
-            heterotypic_fraction,
-            rng,
-        )
-        sim_counts = (pool_csr[left] + pool_csr[right]).tocsr()
-        logger.debug(f"Simulated {n_sim} synthetic doublets")
+        if not np.array_equal(
+            np.asarray(feature_ids).astype(str), reference.feature_ids
+        ):
+            raise ValueError(
+                "Doublet features do not match the mapping reference order"
+            )
 
-        temp_dir = tempfile.mkdtemp(prefix="scarf_doublet_")
-        try:
-            write_doublet_target_zarr(
-                zarr_loc=temp_dir,
-                assay_name=assay_name,
-                sim_counts=sim_counts,
-                feat_ids=source_assay.feats.fetch_all("ids"),
-                feat_names=(
-                    source_assay.feats.fetch_all("names")
-                    if feature_names is None
-                    else np.asarray(feature_names)
-                ),
-                dtype=str(source_assay.rawData.dtype),
-                mem_budget=self.memoryBytes,
-                nthreads=self.nthreads,
-                profile="fast_local",
-            )
-            target_ds = self._create_temporary_datastore(
-                temp_dir,
-                default_assay=assay_name,
-                assay_types={assay_name: "RNA"},
-                nthreads=self.nthreads,
-            )
-            target_selection = target_ds.snapshot_cell_selection("I")
-            result = target_ds.run_mapping(
-                reference,
-                target_selection,
-                query_assay=assay_name,
-                save_k=save_k,
-            )
-            try:
-                _, raw_scores = next(
-                    target_ds.get_mapping_score(
-                        result,
-                        reference=reference,
-                        log_transform=True,
-                    )
+        cached_bytes = 0
+        cache = getattr(self, "_graphMemoryCache", None)
+        if cache is not None:
+            with self._graphMemoryCacheLock:
+                matrices = {id(value): value for value in cache.values()}
+                cached_bytes = sum(
+                    matrix.data.nbytes + matrix.indices.nbytes + matrix.indptr.nbytes
+                    for matrix in matrices.values()
                 )
-            except StopIteration:
-                raise RuntimeError(
-                    "Mapping scores could not be computed for simulated doublets"
-                ) from None
-            raw_scores = np.asarray(raw_scores)
-            if raw_scores.shape != (n_active,):
-                raise RuntimeError(
-                    "Doublet mapping scores do not match the selected cells"
-                )
-            diffusion_ref = self.run_diffusion_operator(
-                connectivity,
-                t=smoothing_t,
-                invalidate_cache=invalidate_cache,
-            )
-            diffusion = self.load_diffusion_operator(diffusion_ref)
-            scores = np.asarray(diffusion.dot(raw_scores), dtype=float)
-            if normalize_scores:
-                lo, hi = scores.min(), scores.max()
-                scores = (scores - lo) / (hi - lo) if hi > lo else np.zeros_like(scores)
-            write_cell_data_artifact(
-                self.zw,
-                planned,
-                {"values": scores},
-            )
-            logger.info(f"Stored doublet scores using {n_sim} synthetic doublets")
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+        raw_scores = score_synthetic_doublets(
+            source_assay,
+            reference,
+            active_idx,
+            labels,
+            feature_indices,
+            cluster_sample_fraction=cluster_sample_fraction,
+            max_cells_per_cluster=max_cells_per_cluster,
+            simulation_ratio=simulation_ratio,
+            heterotypic_fraction=heterotypic_fraction,
+            save_k=save_k,
+            random_seed=random_seed,
+            resources=self.resources,
+            reserved_resident_bytes=cached_bytes,
+        )
+        del reference
+        if raw_scores.shape != (n_active,):
+            raise RuntimeError("Doublet mapping scores do not match the selected cells")
+        graph_group = artifact_group(self.zw, connectivity)
+        edges = as_zarr_array(graph_group["edges"], name="edges")
+        weights = as_zarr_array(graph_group["weights"], name="weights")
+        # Loading, symmetrizing and row-normalizing may hold several sparse copies.
+        graph_bytes = (
+            int(edges.nbytes)
+            + int(weights.nbytes)
+            + 8 * int(weights.shape[0]) * (weights.dtype.itemsize + 8)
+            + 128 * (n_active + 1)
+        )
+        admit_stream(
+            self.resources,
+            nBlocks=1,
+            blockBytes=graph_bytes,
+            residentBytes=cached_bytes
+            + active_idx.nbytes
+            + labels.nbytes
+            + raw_scores.nbytes
+            + feature_ids.nbytes
+            + feature_indices.nbytes,
+            requested=1,
+        )
+        graph = self.load_graph(connectivity, symmetric=True, upper_only=False)
+        if graph.shape != (n_active, n_active):
+            raise ValueError("Doublet graph does not match the selected cells")
+        scores = smooth_doublet_scores(
+            graph,
+            raw_scores,
+            power=smoothing_t,
+            normalize=normalize_scores,
+        )
+        write_cell_data_artifact(self.zw, planned, {"values": scores})
+        logger.info("Stored doublet scores")
         return planned.ref
 
     def run_doublet_detection(
@@ -1587,6 +1580,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         from_assay: str | None = None,
         s_genes: list[str] | None = None,
         g2m_genes: list[str] | None = None,
+        ctrl_size: int | None = None,
+        log_transform: bool = True,
         n_bins: int = 50,
         rand_seed: int = 4466,
         invalidate_cache: bool = False,
@@ -1595,8 +1590,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         expression of S and G2M phase genes respectively. Following steps are
         taken for each phase:
 
-        - Average expression of all the genes in across `cell_key` cells is calculated
-        - The log average expression is divided in `n_bins` bins
+        - Normalized expression is log1p transformed when `log_transform` is True.
+        - Genes are ranked into `n_bins` bins by mean expression across selected cells.
         - A control set of genes is identified by sampling genes from same expression bins where phase's genes are present.
         - The average expression of phase genes (Ep) and control genes (Ec) is calculated per cell.
         - A phase score is calculated as ``Ep - Ec``.
@@ -1611,6 +1606,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                      `scarf.quality_control.s_phase_genes`
             g2m_genes: A list of G2M phase genes. If not provided then Scarf loads pre-saved genes accessible at
                      `scarf.quality_control.g2m_phase_genes`
+            ctrl_size: Controls sampled per bin. None uses the shorter input gene list.
+            log_transform: Apply log1p before binning and scoring. Defaults to True.
             n_bins: Number of bins into which average expression of genes is divided.
             rand_seed: A random values to set seed while sampling cells from a cluster randomly. (Default value: 4466)
         Returns:
@@ -1635,6 +1632,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             cell_selection=cell_selection,
             s_genes=s_genes,
             g2m_genes=g2m_genes,
+            ctrl_size=ctrl_size,
+            log_transform=log_transform,
             n_bins=n_bins,
             rand_seed=rand_seed,
             invalidate_cache=invalidate_cache,

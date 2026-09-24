@@ -5,6 +5,7 @@ from typing import get_type_hints
 import numpy as np
 import pytest
 import zarr
+from scipy.sparse import csr_matrix
 from zarr.storage import MemoryStore
 
 import scarf.assay as assay_module
@@ -20,6 +21,9 @@ from scarf.assay import (
     norm_tf_idf,
 )
 from scarf.storage.artifacts import ArtifactRef, artifact_group
+from scarf.matrix import ChunkedArray
+from scarf.datastore.datastore import DataStore
+from scarf.writers import SparseToZarr
 from tests.signature_contracts import signature_digest
 
 
@@ -50,7 +54,7 @@ _PUBLIC_CLASS_METHODS = {
     ),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
-    Assay: "6c6391ad566523451251008ceaf57ed7051262ab86104197d1daa868b50ee92e",
+    Assay: "6920d1d6370b3265a68a6c5d9a866118711e3dc3310a1cb0bf800e312a2cef6b",
     RNAassay: "65d2d9b4f58fd79139db2deebc35b4629b1177781e47fb08abd71b7bb5e699a1",
     ATACassay: "1732f9ac8b4f368185e0965becb94b9472186db4ee53d372a8a2852d30dd42a4",
     ADTassay: "1732f9ac8b4f368185e0965becb94b9472186db4ee53d372a8a2852d30dd42a4",
@@ -156,7 +160,8 @@ def test_assay_subclass_and_static_method_contracts_are_stable():
 
 def test_default_normalizer_identity_is_stable(monkeypatch):
     def initialize_base(self, *args, **kwargs):
-        self.attrs = {}
+        self.z = zarr.open_group(store=MemoryStore(), mode="w")
+        self.attrs = self.z.attrs
 
     monkeypatch.setattr(Assay, "__init__", initialize_base)
     rna = RNAassay(None, "RNA", None)
@@ -197,6 +202,49 @@ def test_normalization_numerical_contracts_are_stable():
         norm_lib_size(rna, counts),
         1000.0 * counts / rna.scalar.reshape(-1, 1),
     )
+
+
+def test_clr_normalizes_features_when_chunked_selection_is_square():
+    values = np.array([[1.0, 4.0, 9.0], [2.0, 20.0, 3.0], [12.0, 2.0, 2.0]])
+    counts = ChunkedArray.from_numpy(values, block_size=2)
+    expected_scale = np.exp(np.log1p(values).sum(axis=0) / len(values))
+
+    actual = norm_clr(None, counts).compute()
+
+    np.testing.assert_allclose(actual, np.log1p(values / expected_scale[None, :]))
+
+
+def test_clr_does_not_reuse_artifacts_with_ambiguous_axis(monkeypatch):
+    values = np.array([[1.0, 4.0, 9.0], [2.0, 20.0, 3.0], [12.0, 2.0, 2.0]])
+    store = MemoryStore()
+    SparseToZarr(
+        csr_matrix(values),
+        store,
+        ["a", "b", "c"],
+        ["x", "y", "z"],
+        assay_name="ADT",
+        nthreads=1,
+    ).dump()
+    datastore = DataStore(store, default_assay="ADT", nthreads=1)
+    cells = datastore.snapshot_cell_selection()
+    features = datastore.select_all_features(from_assay="ADT")
+    scale = np.exp(np.log1p(values).sum(axis=0) / len(values))
+    with monkeypatch.context() as previous_identity:
+        previous_identity.delattr(norm_clr, "artifact_identity")
+        previous = datastore.run_normalization(cells, features)
+    artifact_group(datastore.zw, previous)["data"][:] = np.log1p(
+        values / scale[:, None]
+    )
+
+    actual = datastore.run_normalization(cells, features)
+
+    assert actual != previous
+    np.testing.assert_allclose(
+        artifact_group(datastore.zw, actual)["data"][:],
+        np.log1p(values / scale[None, :]),
+        rtol=1e-6,
+    )
+    assert datastore.run_normalization(cells, features) == actual
 
 
 def test_assay_read_block_facade_remains_patchable(monkeypatch):
@@ -290,15 +338,6 @@ def test_base_assay_sparse_export_combines_streamed_blocks():
     np.testing.assert_array_equal(
         observed.toarray(),
         np.array([[1, 0], [0, 2], [3, 4]]),
-    )
-
-
-def test_base_assay_ingestion_percent_feature_writer_keeps_zero_path():
-    zero_assay = SimpleNamespace(cells=None)
-    Assay._write_percent_feature(
-        zero_assay,
-        "percent_zero",
-        np.zeros(2),
     )
 
 
@@ -466,6 +505,46 @@ def test_rna_gene_major_kernel_accumulates_selected_cells():
     np.testing.assert_allclose(squares, np.array([2.0, 9.0]))
 
 
+def test_rna_gene_major_kernel_log_transform_matches_log1p():
+    from scarf.assay.rna import _hvg_stats_gene_major_kernel
+
+    values = np.array(
+        [
+            [1, 0, 2],
+            [0, 5, 0],
+            [3, 4, 0],
+        ],
+        dtype=np.uint32,
+    )
+    destinations = np.array([0, -1, 1], dtype=np.int64)
+    selected = np.array([0, 2], dtype=np.int64)
+    inverse_scalars = np.array([0.5, 0.25])
+    logged = np.log1p(2.0 * values[[0, 2]][:, selected] * inverse_scalars)
+
+    for kernel in (
+        _hvg_stats_gene_major_kernel.py_func,
+        _hvg_stats_gene_major_kernel,
+    ):
+        nonzero = np.zeros(2)
+        totals = np.zeros(2)
+        squares = np.zeros(2)
+        kernel(
+            values,
+            inverse_scalars,
+            2.0,
+            destinations,
+            selected,
+            nonzero,
+            totals,
+            squares,
+            True,
+        )
+
+        np.testing.assert_array_equal(nonzero, np.array([2.0, 1.0]))
+        np.testing.assert_allclose(totals, logged.sum(axis=1))
+        np.testing.assert_allclose(squares, np.square(logged).sum(axis=1))
+
+
 @pytest.mark.parametrize(
     ("values", "error_type", "match"),
     [
@@ -631,6 +710,8 @@ def test_rna_raw_feature_columns_log_and_normalize_batches():
 
 
 def test_rna_streaming_stats_and_group_means_handle_missing_inputs():
+    from scarf.metadata import MetaData
+
     root = zarr.open_group(store=MemoryStore(), mode="w")
     counts = root.create_array(
         "counts",
@@ -640,7 +721,9 @@ def test_rna_streaming_stats_and_group_means_handle_missing_inputs():
     rna.name = "RNA"
     rna.normMethod = norm_lib_size
     rna.sf = None
-    rna.cells = SimpleNamespace(fetch_all=lambda _key: np.array([2.0, 3.0]))
+    cell_data = root.create_group("cellData")
+    cell_data.create_array("RNA_nCounts", data=np.array([2.0, 3.0]))
+    rna.cells = MetaData(cell_data)
     rna.rawData = SimpleNamespace(_backing=counts)
     rna.rawDataT = None
 

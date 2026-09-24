@@ -443,6 +443,7 @@ def test_extracted_domains_have_only_narrow_storage_dependencies():
     forbidden = {"datastore", "plotting", "readers", "writers"}
     storage_exceptions = {
         "features": {
+            "aggregation.py",
             "enrichment/results.py",
             "genomic/melding.py",
             "markers/batching.py",
@@ -556,6 +557,146 @@ def test_internal_modules_use_canonical_storage_and_utility_paths():
 
 def test_internal_modules_do_not_use_moved_symbols_from_hybrid_facades():
     assert _moved_symbol_imports() == set()
+
+
+def test_agent_implementations_live_in_owner_packages():
+    agent_root = _SCARF_ROOT / "agent"
+    retired = {
+        "biological_interpretation.py",
+        "characterize_covariates.py",
+        "characterize_features.py",
+        "data_enrichment.py",
+        "decide.py",
+        "decision_kernel.py",
+        "decision_persistence.py",
+        "experimental_context.py",
+        "hvg_diagnostics.py",
+        "hypothesis_testing.py",
+        "parameter_tuning.py",
+        "persistence.py",
+        "qc_execution.py",
+        "qc_profiles.py",
+        "report.py",
+        "rna_decisions.py",
+        "sequential_tuning.py",
+        "study_contract.py",
+        "tuning_diagnostics.py",
+    }
+    required = {
+        "biological_interpretation": {
+            "__init__.py",
+            "agent.py",
+            "contracts.py",
+            "tools.py",
+            "validation.py",
+        },
+        "cell_quality": {"__init__.py", "execution.py", "profiles.py"},
+        "data_enrichment": {
+            "__init__.py",
+            "agent.py",
+            "characterization.py",
+            "contracts.py",
+            "tools.py",
+            "validation.py",
+        },
+        "decisions": {"__init__.py", "kernel.py", "rna.py", "selection.py"},
+        "experimental_context": {
+            "__init__.py",
+            "agent.py",
+            "characterization.py",
+            "contracts.py",
+            "qc_evidence.py",
+            "study.py",
+            "tools.py",
+            "validation.py",
+        },
+        "parameter_tuning": {
+            "__init__.py",
+            "agent.py",
+            "contracts.py",
+            "diagnostics.py",
+            "execution.py",
+            "hvg.py",
+            "prompts.py",
+            "selection.py",
+        },
+        "report": {
+            "__init__.py",
+            "artifacts.py",
+            "contracts.py",
+            "generator.py",
+            "plots.py",
+            "rendering.py",
+        },
+    }
+
+    assert retired.isdisjoint(path.name for path in agent_root.glob("*.py"))
+    assert not list((agent_root / "persistence").glob("*.py"))
+    assert not list((agent_root / "hypotheses").glob("*.py"))
+    assert not (agent_root / "parameter_tuning/sequential.py").exists()
+    assert not (agent_root / "report/decision_tree.py").exists()
+    for package, names in required.items():
+        package_root = agent_root / package
+        assert package_root.is_dir()
+        assert names <= {path.name for path in package_root.glob("*.py")}
+
+
+def test_agent_contracts_do_not_import_orchestration_or_reporting():
+    contracts = sorted((_SCARF_ROOT / "agent").glob("*/contracts.py"))
+    forbidden = ("agent.orchestrator", "agent.report")
+    for path in contracts:
+        imports = _runtime_import_modules(path, include_function_local=False)
+        assert not {
+            module
+            for module in imports
+            if module.startswith(tuple(f"{root}." for root in forbidden))
+            or module in forbidden
+        }
+
+    shared_tools = _SCARF_ROOT / "agent" / "tools" / "__init__.py"
+    shared_imports = _runtime_import_modules(
+        shared_tools,
+        include_function_local=False,
+    )
+    assert not {
+        module
+        for module in shared_imports
+        if module.startswith(
+            (
+                "agent.biological_interpretation",
+                "agent.data_enrichment",
+                "agent.experimental_context",
+                "agent.orchestrator",
+                "agent.parameter_tuning",
+                "agent.persistence",
+                "agent.report",
+            )
+        )
+    }
+
+
+def test_agent_internal_modules_import_concrete_owners():
+    facades = {
+        "agent.biological_interpretation",
+        "agent.cell_quality",
+        "agent.data_enrichment",
+        "agent.decisions",
+        "agent.experimental_context",
+        "agent.hypotheses",
+        "agent.parameter_tuning",
+        "agent.persistence",
+        "agent.report",
+    }
+    violations: set[tuple[str, str]] = set()
+    agent_root = _SCARF_ROOT / "agent"
+    for path in agent_root.rglob("*.py"):
+        if path == agent_root / "__init__.py" or path.name == "__init__.py":
+            continue
+        for module in _runtime_import_modules(path):
+            if module in facades:
+                violations.add((path.relative_to(agent_root).as_posix(), module))
+
+    assert violations == set()
 
 
 def test_compatibility_only_modules_are_removed():
@@ -802,6 +943,7 @@ def test_reader_implementations_are_runtime_isolated():
     required_files = {
         "__init__.py",
         "_text.py",
+        "_sparse.py",
         "cellranger.py",
         "csv.py",
         "h5ad.py",
@@ -827,7 +969,11 @@ def test_reader_implementations_are_runtime_isolated():
     reader_edges = {
         "readers.cellranger": {"readers.mtx"},
         "readers.mtx": {"readers.cellranger"},
-        "readers.seurat": {"readers._rds", "readers._seurat"},
+        "readers.seurat": {
+            "readers._rds",
+            "readers._seurat",
+            "readers._seurat.sources",
+        },
     }
     format_names = {name.rsplit(".", 1)[-1] for name in format_modules}
     implementation_paths = [
@@ -869,7 +1015,7 @@ def test_reader_implementations_are_runtime_isolated():
             allowed_reader_imports.update({"readers._assay_names", "readers.read_file"})
         elif path.name == "h5ad.py":
             allowed_reader_imports.update(
-                {"readers._assay_names", "readers._h5ad_inspect"}
+                {"readers._assay_names", "readers._h5ad_inspect", "readers._sparse"}
             )
         assert not {
             module_name

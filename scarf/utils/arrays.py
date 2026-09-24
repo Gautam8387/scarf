@@ -1,8 +1,19 @@
 import hashlib
+import re
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
+
+
+def regex_match_mask(values: Sequence[str] | np.ndarray, pattern: str) -> np.ndarray:
+    expression = re.compile(pattern, re.IGNORECASE)
+    return np.fromiter(
+        (expression.match(str(value)) is not None for value in values),
+        dtype=bool,
+        count=len(values),
+    )
 
 
 def checked_sparse_cast(values: np.ndarray, dtype: Any) -> np.ndarray:
@@ -121,10 +132,23 @@ def clean_array(
 ) -> NDArray[Any]:
     """Replace non-finite and zero values in a numeric array."""
     array = np.asarray(x, dtype=np.float64)
-    array = np.nan_to_num(array, copy=True)
-    array[(array == np.inf) | (array == -np.inf)] = 0
+    array = np.nan_to_num(
+        array, copy=True, nan=fill_val, posinf=fill_val, neginf=fill_val
+    )
     array[array == 0] = fill_val
     return array
+
+
+def sum_and_squared_sum(
+    array: np.ndarray, axis: int | None = 0
+) -> tuple[np.ndarray, np.ndarray]:
+    expressions = {None: "ij,ij->", 0: "ij,ij->j", 1: "ij,ij->i"}
+    return (
+        np.asarray(array.sum(axis=axis, dtype=np.float64)),
+        np.asarray(
+            np.einsum(expressions[axis], array, array, dtype=np.float64, optimize=False)
+        ),
+    )
 
 
 def array_digest(values: np.ndarray) -> str:

@@ -284,14 +284,27 @@ def test_plain_mapping_is_query_owned_and_reuses_exact_projection(
     assert _snapshot_store(query.zarr_loc) == reuse_before
 
 
+@pytest.mark.parametrize("method", ["pca", "symphony"])
 def test_mapping_failure_leaves_projection_incomplete(
     analyzed_datastore_ephemeral,
     tmp_path,
     monkeypatch,
+    method,
 ):
     reference_store = analyzed_datastore_ephemeral
-    reference = _plain_reference(reference_store)
+    reference = (_plain_reference if method == "pca" else _symphony_reference)(
+        reference_store
+    )
     query = _copied_query(reference_store, tmp_path / "query.zarr")
+    files = []
+    original_temporary_file = mapping_operations.TemporaryFile
+
+    def observe_file():
+        file = original_temporary_file()
+        files.append(file)
+        return file
+
+    monkeypatch.setattr(mapping_operations, "TemporaryFile", observe_file)
     before = set(
         list_artifacts(
             query.zw,
@@ -313,6 +326,8 @@ def test_mapping_failure_leaves_projection_incomplete(
     )
     with pytest.raises(RuntimeError, match="injected ANN failure"):
         query.run_mapping(reference, reference.cell_selection)
+    assert len(files) == (1 if method == "symphony" else 0)
+    assert all(file.closed for file in files)
 
     created = (
         set(
@@ -331,13 +346,17 @@ def test_mapping_failure_leaves_projection_incomplete(
     assert not failed.complete
 
 
+@pytest.mark.parametrize("method", ["pca", "symphony"])
 def test_mapping_rejects_expression_changes_before_projection_finish(
     analyzed_datastore_ephemeral,
     tmp_path,
     monkeypatch,
+    method,
 ):
     reference_store = analyzed_datastore_ephemeral
-    reference = _plain_reference(reference_store)
+    reference = (_plain_reference if method == "pca" else _symphony_reference)(
+        reference_store
+    )
     query = _copied_query(reference_store, tmp_path / "query-expression-change.zarr")
     before = set(
         query.list_artifacts(
@@ -345,14 +364,33 @@ def test_mapping_rejects_expression_changes_before_projection_finish(
             from_assay="RNA",
         )
     )
+    selected_row = int(
+        read_stored_selection_indices(
+            query.zw,
+            reference.cell_selection,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
+        )[0]
+    )
+    backing = query.RNA.rawData._backing
+    original_count = int(backing[selected_row, 0])
+    fingerprint_expression = AlignedFeatureStream.fingerprint_live_raw_expression
+
+    def mutate_then_fingerprint(stream):
+        backing[selected_row, 0] = original_count + 1
+        return fingerprint_expression(stream)
+
     monkeypatch.setattr(
         AlignedFeatureStream,
         "fingerprint_live_raw_expression",
-        lambda _stream: "changed-during-mapping",
+        mutate_then_fingerprint,
     )
 
     with pytest.raises(ValueError, match="expression changed during mapping"):
         query.run_mapping(reference, reference.cell_selection)
+    assert backing[selected_row, 0] == original_count + 1
 
     created = (
         set(
@@ -639,6 +677,84 @@ def test_query_projection_reproduces_stored_reference_coordinates(
     )
 
 
+@pytest.mark.parametrize("method", ["pca", "symphony"])
+def test_subset_fitted_pca_center_survives_mapping_reference_reload(tmp_path, method):
+    from scipy.sparse import csr_matrix
+
+    from scarf.writers import SparseToZarr
+
+    rng = np.random.default_rng(42)
+    counts = rng.integers(10, 80, size=(30, 6), dtype=np.uint16)
+    counts[:15, :3] += 300
+    path = str(tmp_path / "reference.zarr")
+    SparseToZarr(
+        csr_matrix(counts),
+        path,
+        cell_ids=[f"c{i}" for i in range(len(counts))],
+        feature_ids=[f"g{i}" for i in range(counts.shape[1])],
+        nthreads=1,
+    ).dump()
+    datastore = DataStore(
+        path, default_assay="RNA", min_features_per_cell=0, nthreads=1
+    )
+    cells = datastore.snapshot_cell_selection("I")
+    datastore.cells.insert("pca_fit", np.arange(len(counts)) < 15)
+    fit_cells = datastore.snapshot_cell_selection("pca_fit")
+    features = datastore.select_all_features(from_assay="RNA")
+    normalized = datastore.run_normalization(cells, features)
+    reduction = datastore.run_pca(
+        normalized, dims=3, pca_cell_selection=fit_cells, local_cache=False
+    )
+    reduction_group = artifact_group(datastore.zw, reduction)
+    expected = np.asarray(reduction_group["data"][:])
+    center = np.asarray(reduction_group["center"][:])
+    assert np.linalg.norm(center) > 0.5
+    coordinates = reduction
+    if method == "symphony":
+        datastore.cells.insert("batch", np.where(np.arange(len(counts)) % 2, "a", "b"))
+        coordinates = datastore.run_harmony(
+            reduction, ["batch"], harmony_params={"nclust": 2}
+        )
+    ann_index = datastore.build_ann_index(coordinates)
+    neighbors = datastore.query_neighbors(ann_index, coordinates=coordinates, k=3)
+    reference_ref = datastore.build_mapping_reference(neighbors)
+
+    for reference_store in (
+        datastore,
+        DataStore(path, default_assay="RNA", nthreads=1, zarr_mode="r"),
+    ):
+        reference = reference_store.get_mapping_reference(reference_ref)
+        np.testing.assert_array_equal(reference.model.center, center)
+        stream = AlignedFeatureStream(
+            query_assay=reference_store.RNA,
+            query_cell_indices=np.arange(len(counts)),
+            reference_feature_ids=reference.feature_ids,
+            reference_normalized_means=reference.model.feature_means,
+            reference_normalization_parameters=reference.normalization_parameters,
+            missing_feature_policy="error",
+            resources=reference_store.resources,
+        )
+        projected = np.vstack(
+            [
+                mapping_operations.project_pca(block.values, reference.model)
+                for block in stream
+            ]
+        )
+        np.testing.assert_allclose(projected, expected, rtol=1e-6, atol=1e-6)
+
+    if method == "pca":
+        query = mount_datastore(
+            path, at=str(tmp_path / "query.zarr"), default_assay="RNA", nthreads=1
+        )
+        query_selection = _query_selection_matching_reference(query, reference)
+        result_ref = query.run_mapping(reference, query_selection, save_k=1)
+        result = query.get_mapping_result(
+            result_ref, reference=reference, load_arrays=True
+        )
+        np.testing.assert_array_equal(result.indices[:, 0], np.arange(len(counts)))
+        np.testing.assert_allclose(result.distances[:, 0], 0, atol=1e-5)
+
+
 def test_self_mapping_recovers_the_reference_graph_and_labels(
     analyzed_datastore_ephemeral,
     tmp_path,
@@ -758,6 +874,23 @@ def test_symphony_mapping_validates_batches_and_persists_diagnostics(
     )
     accumulated_rows = 0
     original_accumulate = mapping_operations.accumulate_sufficient_statistics
+    projected_rows = 0
+    files = []
+    original_project = mapping_operations.project_pca
+    original_temporary_file = mapping_operations.TemporaryFile
+
+    def observe_projection(values, model):
+        nonlocal projected_rows
+        projected_rows += len(values)
+        return original_project(values, model)
+
+    def observe_file():
+        file = original_temporary_file()
+        files.append(file)
+        return file
+
+    monkeypatch.setattr(mapping_operations, "project_pca", observe_projection)
+    monkeypatch.setattr(mapping_operations, "TemporaryFile", observe_file)
 
     def observe_accumulation(
         counts,
@@ -793,6 +926,9 @@ def test_symphony_mapping_validates_batches_and_persists_diagnostics(
     assert _snapshot_store(reference_store.zarr_loc) == reference_before
     assert result.reference is reference
     assert result.correction_method == "symphony"
+    assert (
+        query.inspect_artifact(result_ref).parameters["query_batch_model"] == "additive"
+    )
     assert result.diagnostics == {
         "featureCoverage": 1.0,
         "queryBatchCount": 6,
@@ -801,6 +937,8 @@ def test_symphony_mapping_validates_batches_and_persists_diagnostics(
         "queryScaledDispersion": result.diagnostics["queryScaledDispersion"],
     }
     assert accumulated_rows == n_cells - result.diagnostics["zeroNormCellCount"]
+    assert projected_rows == n_cells
+    assert len(files) == 1 and files[0].closed
     loaded = load_projection(query.zw, result_ref, reference=reference)
     assert loaded.diagnostics == result.diagnostics
     reused = query.run_mapping(
@@ -809,10 +947,13 @@ def test_symphony_mapping_validates_batches_and_persists_diagnostics(
         query_batches=batches.copy(),
     )
     assert reused == result_ref
+    assert projected_rows == n_cells
+    assert len(files) == 1
 
     omitted_ref = query.run_mapping(reference, reference.cell_selection)
     omitted = query.get_mapping_result(omitted_ref, reference=reference)
     assert omitted.diagnostics["queryBatchCount"] == 1
+    assert len(files) == 2 and all(file.closed for file in files)
 
 
 def test_projection_cache_tracks_counts_and_exact_references(

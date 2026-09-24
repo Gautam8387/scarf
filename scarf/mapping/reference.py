@@ -8,7 +8,12 @@ from typing import Any, cast
 
 import numpy as np
 
-from ..storage.artifacts import artifact_group, inspect_artifact
+from ..storage.artifacts import (
+    ValueFingerprintBuilder,
+    artifact_group,
+    canonical_bytes,
+    inspect_artifact,
+)
 from ..storage.feature_selection import resolve_feature_selection
 from ..storage.refs import ArtifactRef, ExternalArtifactRef
 from ..storage.selections import (
@@ -64,9 +69,57 @@ def _thaw_metadata(value: Any) -> Any:
     return copy.deepcopy(value)
 
 
+def mapping_reference_model_digest(
+    *,
+    model: ScaledPCAProjectionModel,
+    symphony_state: SymphonyCorrectionModel | None,
+    feature_ids: np.ndarray,
+    metadata: Mapping[str, Any],
+    reference_distance_quantiles: np.ndarray,
+    reference_distance_values: np.ndarray,
+) -> str:
+    """Digest the arrays and metadata a mapping reference holds in memory.
+
+    The loader records this digest on the handle it builds, and the binding
+    check recomputes it from the handle, so a handle whose arrays were
+    replaced is rejected without reading the stored payload.
+    """
+    builder = ValueFingerprintBuilder()
+    builder.update_array("feature_ids", np.asarray(feature_ids).astype(str))
+    for name in ("feature_means", "feature_scales", "center", "loadings"):
+        builder.update_array(name, np.asarray(getattr(model, name)))
+    builder.update_array(
+        "reference_distance_quantiles",
+        np.asarray(reference_distance_quantiles),
+    )
+    builder.update_array(
+        "reference_distance_values",
+        np.asarray(reference_distance_values),
+    )
+    if symphony_state is not None:
+        for name in (
+            "centroids",
+            "raw_centroids",
+            "corrected_centroids",
+            "cluster_mass",
+            "sigma",
+        ):
+            builder.update_array(name, np.asarray(getattr(symphony_state, name)))
+    builder.update_bytes(
+        "reference_metadata", canonical_bytes(_thaw_metadata(metadata))
+    )
+    return builder.hexdigest()
+
+
 @dataclass(frozen=True)
 class MappingReference:
-    """An immutable scaled-PCA reference loaded from a Scarf Zarr store."""
+    """An immutable scaled-PCA reference loaded from a Scarf Zarr store.
+
+    ``payload_fingerprint`` is the stored payload fingerprint the handle was
+    loaded against and ``model_digest`` the digest of the arrays it was given;
+    ``validate_mapping_reference_binding`` compares both with the store and
+    with the handle instead of re-reading the payload.
+    """
 
     datastore: Any
     ref: ArtifactRef
@@ -85,8 +138,14 @@ class MappingReference:
     metadata: Mapping[str, Any]
     reference_distance_quantiles: np.ndarray
     reference_distance_values: np.ndarray
+    payload_fingerprint: str
+    model_digest: str
 
     def __post_init__(self) -> None:
+        for name in ("payload_fingerprint", "model_digest"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise TypeError(f"Mapping reference {name} must be a non-empty string")
         feature_ids = np.asarray(self.feature_ids)
         if feature_ids.ndim != 1 or feature_ids.dtype.kind not in {"O", "S", "U"}:
             raise TypeError("Mapping reference feature IDs must contain strings")
@@ -102,6 +161,17 @@ class MappingReference:
             self,
             "reference_distance_values",
             _immutable_array(np.asarray(self.reference_distance_values)),
+        )
+
+    def current_model_digest(self) -> str:
+        """Recompute the digest of the arrays this handle holds."""
+        return mapping_reference_model_digest(
+            model=self.model,
+            symphony_state=self.symphony_state,
+            feature_ids=self.feature_ids,
+            metadata=self.metadata,
+            reference_distance_quantiles=self.reference_distance_quantiles,
+            reference_distance_values=self.reference_distance_values,
         )
 
     @property
@@ -131,6 +201,7 @@ class MappingReference:
         )
 
     def validate_dataset_fingerprint(self) -> None:
+        """Check the reference assay against the fingerprint the handle carries."""
         assay = self.datastore._get_assay(self.assay_name)
         stored = assay.attrs.get("dataset_fingerprint")
         live = (
@@ -145,8 +216,7 @@ class MappingReference:
                 "Rebuild it with build_mapping_reference(neighbors)."
             )
 
-    def validate_frozen_axes(self) -> None:
-        """Validate the exact stored cell and feature axes used by the reference."""
+    def _validate_cell_selection(self) -> None:
         selection = validate_stored_selection_integrity(
             self.datastore.zw,
             self.cell_selection,
@@ -160,6 +230,10 @@ class MappingReference:
                 "The selected reference cell count has changed. Rebuild the "
                 "mapping reference with build_mapping_reference(neighbors)."
             )
+
+    def validate_frozen_axes(self) -> None:
+        """Validate the exact stored cell and feature axes used by the reference."""
+        self._validate_cell_selection()
         resolve_feature_selection(
             self.datastore.zw,
             self.assay_name,
@@ -176,15 +250,7 @@ class MappingReference:
             from .artifact import validate_mapping_reference_binding
 
             validate_mapping_reference_binding(self)
-        self.validate_dataset_fingerprint()
-        validate_stored_selection_integrity(
-            self.datastore.zw,
-            self.cell_selection,
-            kind="cell_selection",
-            scope="datastore",
-            assay=None,
-            table_path="cellData",
-        )
+            self.validate_dataset_fingerprint()
         indices = read_stored_selection_indices(
             self.datastore.zw,
             self.cell_selection,
@@ -193,6 +259,11 @@ class MappingReference:
             assay=None,
             table_path="cellData",
         )
+        if indices.shape != (self.selected_cell_count,):
+            raise ValueError(
+                "The selected reference cell count has changed. Rebuild the "
+                "mapping reference with build_mapping_reference(neighbors)."
+            )
         values = np.asarray(
             read_metadata_rows_chunkwise(self.datastore.cells, column, indices)
         )
@@ -223,6 +294,9 @@ class MappingReference:
 
         validate_mapping_reference_binding(self)
         self.validate_dataset_fingerprint()
+        return self._fetch_layout(layout)
+
+    def _fetch_layout(self, layout: ArtifactRef) -> np.ndarray:
         self.validate_frozen_axes()
         if not isinstance(layout, ArtifactRef):
             raise TypeError("layout must be an ArtifactRef")

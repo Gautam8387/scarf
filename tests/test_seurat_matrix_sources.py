@@ -2328,6 +2328,373 @@ def test_bp128_reference_decode_crosses_blocks_and_supports_windows() -> None:
     )
 
 
+@pytest.mark.parametrize("bits", range(33))
+def test_bp128_unpack_all_bit_widths(bits: int) -> None:
+    from scarf.readers._seurat.bpcells import _unpack_bp128_block
+
+    rng = np.random.default_rng(bits)
+    values = rng.integers(0, 1 << bits, size=128, dtype=np.uint32)
+    values[-1] = 0 if bits == 0 else (1 << bits) - 1
+    np.testing.assert_array_equal(
+        _unpack_bp128_block(_pack_bp128_block(values), bits), values
+    )
+
+
+@pytest.mark.parametrize("transform", ["plain", "m1", "d1", "d1z"])
+def test_stored_bp128_batches_real_hdf5_reads(tmp_path, monkeypatch, transform):
+    from scarf.readers._seurat.bpcells import _HDF5ArrayStore, _StoredBP128Array
+
+    values = np.arange(128 * 40 + 17, dtype=np.uint32) + 1
+    if transform == "d1z":
+        values = values % 31 + 1
+    data, indexes, offsets, starts = _encode_bp128(values, transform)
+    path = tmp_path / "packed.h5"
+    with h5py.File(path, "w") as handle:
+        group = handle.create_group("matrix")
+        group.attrs["version"] = "packed-uint-matrix-v2"
+        for name, array in (
+            ("data", data),
+            ("idx", indexes),
+            ("idx_offsets", offsets),
+            ("starts", starts),
+        ):
+            group.create_dataset(f"value_{name}", data=array)
+    limits = SourceLimits(compressedChunkNnz=128 * 16)
+    store = _HDF5ArrayStore(path, "matrix", limits)
+    reader = _StoredBP128Array(
+        store, "value", values.size, transform, require_offsets=True, limits=limits
+    )
+    opened = []
+    original = h5py.File
+
+    def track_open(*args, **kwargs):
+        opened.append(args[0])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(h5py, "File", track_open)
+    np.testing.assert_array_equal(reader.read(7, values.size - 3), values[7:-3])
+    assert len(opened) <= 18
+    for offset, message in (
+        (int(indexes[2]) + 4, "idx decreases"),
+        (1, "invalid word count"),
+    ):
+        with h5py.File(path, "r+") as handle:
+            handle["matrix/value_idx"][1] = offset
+        with pytest.raises(MatrixSourceError, match=message):
+            reader.read(0, 256)
+
+
+def test_fragment_conversion_does_not_rescan_for_each_window(tmp_path, monkeypatch):
+    source = matrix_source_from_slots(
+        _peak_matrix_spec(
+            _fragment_leaf_spec(tmp_path, backend="memory", packed=False, version=2),
+            "overlaps",
+        )
+    )
+    underlying = source
+    while not isinstance(underlying, FragmentDerivedMatrixSource):
+        underlying = underlying.source
+    original = underlying._contributions
+    scans = []
+
+    def count_scan(start, stop):
+        scans.append((start, stop))
+        yield from original(start, stop)
+
+    monkeypatch.setattr(underlying, "_contributions", count_scan)
+    source.estimate_read_memory(0, 1)
+    assert scans == []
+    assert underlying._rowStore is None
+    pieces = [source.read_cells(i, i + 1).toarray() for i in range(3)]
+    np.testing.assert_array_equal(np.vstack(pieces), source.read_cells(0, 3).toarray())
+    assert scans == [(0, 3), (0, 3)]
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+@pytest.mark.parametrize("subassignment", [False, True])
+def test_transpose_streams_source_a_constant_number_of_times(sparse, subassignment):
+    from scarf.readers._seurat.sources import release_temporary_storage
+
+    values = (np.arange(12 * 40).reshape(12, 40) % 7).astype(np.uint16)
+    reads = []
+
+    class Dense(DenseMatrixSource):
+        def read_cells(self, start, stop):
+            reads.append((start, stop))
+            return super().read_cells(start, stop)
+
+    class Sparse(CscMatrixSource):
+        def read_cells(self, start, stop):
+            reads.append((start, stop))
+            return super().read_cells(start, stop)
+
+    if sparse:
+        matrix = csc_matrix(values)
+        upstream = Sparse(matrix.data, matrix.indices, matrix.indptr, matrix.shape)
+    else:
+        upstream = Dense(values)
+    source = TransposeMatrixSource(upstream, tile_cells=7)
+    source.estimate_read_memory(0, 1)
+    assert reads == []
+    assert source._rowStore is None
+    assert source._transposeDirectory is None
+    pieces = []
+    for start in range(0, 12, 3):
+        block = source.read_cells(start, start + 3)
+        pieces.append(block.toarray() if sparse else block)
+    np.testing.assert_array_equal(np.vstack(pieces), values)
+    assert len(reads) == (12 if sparse else 6)
+    directory = Path(
+        source._rowStore._directory.name if sparse else source._transposeDirectory.name
+    )
+    assert directory.exists()
+    owner = (
+        DelayedSubassignmentMatrixSource(
+            DenseMatrixSource(np.zeros(source.shape, dtype=source.dtype)),
+            [
+                Subassignment(
+                    np.arange(source.n_features), np.arange(source.n_cells), source
+                )
+            ],
+        )
+        if subassignment
+        else source
+    )
+    release_temporary_storage(owner)
+    assert not directory.exists()
+
+
+@pytest.mark.parametrize("backend", ["hdf5", "bpcells"])
+def test_sparse_memory_estimate_does_not_convert(tmp_path, backend):
+    from scarf.readers._seurat.sources import release_temporary_storage
+
+    values = np.arange(12 * 40, dtype=np.uint32).reshape(12, 40) % 7
+    path = tmp_path / "counts.h5"
+    if backend == "hdf5":
+        with h5py.File(path, "w") as handle:
+            _write_h5_sparse_group(handle, "X", values, "csr")
+        source = HDF5CompressedMatrixSource(
+            path,
+            "X",
+            physical_shape=values.shape,
+            physical_layout="csr",
+            physical_order="feature_by_cell",
+        )
+    else:
+        payload = _bpcells_payload(values, packed=True, version=2, storage_order="row")
+        _write_bpcells_hdf5(path, payload, version=2)
+        source = BPCellsHDF5MatrixSource(path, group="matrix")
+    estimate = source.estimate_read_memory(0, 1)
+    assert source._rowStore is None
+    np.testing.assert_array_equal(source.read_cells(0, 1).toarray(), values[:, :1].T)
+    assert source.estimate_read_memory(0, 1).peakBytes < estimate.peakBytes
+    release_temporary_storage(source)
+
+
+def test_dense_transpose_estimate_covers_preparation(tmp_path):
+    import tracemalloc
+
+    from scarf.readers._seurat.sources import (
+        prepare_matrix_sources,
+        release_temporary_storage,
+    )
+
+    path = tmp_path / "counts.h5"
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset(
+            "X", shape=(2048, 2048), dtype="float32", chunks=(256, 256), fillvalue=1
+        )
+    source = TransposeMatrixSource(HDF5ArrayMatrixSource(path, "X"))
+    source._tempDir = tmp_path
+    estimate = source.estimate_read_memory(0, 1)
+    assert source._transposeDirectory is None
+    with pytest.raises(MemoryError, match="preparation exceeds mem_budget"):
+        prepare_matrix_sources(source, max_bytes=4096)
+    assert source._transposeDirectory is None
+    tracemalloc.start()
+    try:
+        result = source.read_cells(0, 1)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    np.testing.assert_array_equal(result, np.ones((1, 2048), dtype=np.float32))
+    assert estimate.peakBytes >= peak
+    assert source.estimate_read_memory(0, 1).peakBytes < estimate.peakBytes
+    directory = Path(source._transposeDirectory.name)
+    assert directory.is_relative_to(tmp_path)
+    release_temporary_storage(source)
+    assert not directory.exists()
+
+
+def test_dense_transpose_does_not_reserve_sparse_row_pointers(tmp_path):
+    from scarf.readers._seurat.sources import release_temporary_storage
+
+    path = tmp_path / "counts.h5"
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("X", shape=(1, 40), dtype="float32", fillvalue=1)
+    source = TransposeMatrixSource(
+        HDF5ArrayMatrixSource(path, "X"), limits=SourceLimits(maxBlockBytes=1024)
+    )
+    try:
+        assert source.estimate_read_memory(0, 1).peakBytes <= 1024
+        np.testing.assert_array_equal(source.read_cells(0, 1), [[1]])
+    finally:
+        release_temporary_storage(source)
+
+
+def test_dense_transpose_cleans_up_after_insufficient_disk_space(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    path = tmp_path / "counts.h5"
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("X", data=np.arange(12).reshape(3, 4))
+    source = TransposeMatrixSource(HDF5ArrayMatrixSource(path, "X"))
+    source._tempDir = tmp_path
+    monkeypatch.setattr("shutil.disk_usage", lambda _: SimpleNamespace(free=0))
+    with pytest.raises(OSError, match="Dense transpose needs"):
+        source.read_cells(0, 1)
+    assert source._transposeDirectory is None
+    assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.mark.parametrize(
+    ("limits", "message"),
+    [
+        (SourceLimits(maxMetadataBytes=16), "row pointers exceed maxMetadataBytes"),
+        (SourceLimits(maxNnz=1), "exceeds maxNnz"),
+    ],
+)
+def test_sparse_transpose_enforces_conversion_limits_and_cleans_up(
+    tmp_path, limits, message
+):
+    matrix = csc_matrix(np.ones((2, 3), dtype=np.uint16))
+    source = TransposeMatrixSource(
+        CscMatrixSource(matrix.data, matrix.indices, matrix.indptr, matrix.shape),
+        limits=limits,
+    )
+    source._tempDir = tmp_path
+    with pytest.raises(ResourceLimitError, match=message):
+        source.read_cells(0, 1)
+    assert source._rowStore is None
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("shape", [(0, 3), (3, 0)])
+def test_dense_transpose_with_empty_axes_does_not_create_temporary_storage(
+    tmp_path, shape
+):
+    from scarf.readers._seurat.sources import prepare_matrix_sources
+
+    values = np.empty(shape, dtype=np.float32)
+    source = TransposeMatrixSource(DenseMatrixSource(values))
+    source._tempDir = tmp_path
+    prepare_matrix_sources(source)
+    np.testing.assert_array_equal(source.read_cells(0, source.n_cells), values)
+    assert source._transposeDirectory is None
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_source_preparation_restores_limits_when_resident_data_exhausts_budget():
+    from scarf.readers._seurat.sources import prepare_matrix_sources
+
+    source = DenseMatrixSource(np.ones((3, 4), dtype=np.float64))
+    limits = source._limits
+    with pytest.raises(MemoryError, match="preparation exceeds mem_budget"):
+        prepare_matrix_sources(source, max_bytes=source.resident_bytes)
+    assert source._limits is limits
+    np.testing.assert_array_equal(source.read_cells(0, 4), np.ones((4, 3)))
+
+
+def test_shared_sparse_transpose_prepares_and_releases_one_row_store(tmp_path):
+    from scarf.readers._seurat.sources import (
+        prepare_matrix_sources,
+        release_temporary_storage,
+    )
+
+    values = np.arange(12, dtype=np.uint32).reshape(3, 4)
+    matrix = csc_matrix(values)
+    transposed = TransposeMatrixSource(
+        CscMatrixSource(matrix.data, matrix.indices, matrix.indptr, matrix.shape)
+    )
+    transposed._tempDir = tmp_path
+    source = CellBindMatrixSource([transposed, transposed])
+    try:
+        prepare_matrix_sources(source)
+        assert transposed._rowStore is not None
+        assert len(list(tmp_path.iterdir())) == 1
+        np.testing.assert_array_equal(
+            source.read_cells(0, source.n_cells).toarray(), np.vstack((values, values))
+        )
+    finally:
+        release_temporary_storage(source)
+    assert transposed._rowStore is None
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_dense_transpose_preserves_flat_column_major_values():
+    values = np.arange(12, dtype=np.float64).reshape(3, 4)
+    source = TransposeMatrixSource(
+        DenseMatrixSource(values.ravel(order="F"), shape=values.shape)
+    )
+    np.testing.assert_array_equal(source.read_cells(1, 3), values[1:3])
+    assert source._transposeDirectory is None
+
+
+def test_dense_transpose_rejects_budget_smaller_than_one_source_column(tmp_path):
+    path = tmp_path / "counts.h5"
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("X", data=np.ones((3, 4), dtype=np.uint16))
+    source = TransposeMatrixSource(
+        HDF5ArrayMatrixSource(path, "X"), limits=SourceLimits(maxBlockBytes=1)
+    )
+    source._tempDir = tmp_path
+    with pytest.raises(ResourceLimitError, match="Transpose source tile exceeds"):
+        source.read_cells(0, 1)
+    assert source._transposeDirectory is None
+    assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+def test_source_preparation_fits_a_smaller_import_budget(tmp_path, sparse):
+    from scarf.readers._seurat.sources import (
+        prepare_matrix_sources,
+        release_temporary_storage,
+    )
+
+    values = np.arange(512 * 512, dtype=np.float32).reshape(512, 512) % 7 + 1
+    path = tmp_path / "counts.h5"
+    with h5py.File(path, "w") as handle:
+        if sparse:
+            _write_h5_sparse_group(handle, "X", values, "csr")
+        else:
+            handle.create_dataset("X", data=values)
+    source = (
+        HDF5CompressedMatrixSource(
+            path,
+            "X",
+            physical_shape=values.shape,
+            physical_layout="csr",
+            physical_order="feature_by_cell",
+        )
+        if sparse
+        else TransposeMatrixSource(HDF5ArrayMatrixSource(path, "X"))
+    )
+    budget = 2 * 1024 * 1024
+    limits = source._limits
+    assert source.estimate_read_memory(0, 1).peakBytes > budget
+    try:
+        prepare_matrix_sources(source, max_bytes=budget)
+        assert source._limits is limits
+        for start in range(0, source.n_cells, 64):
+            stop = min(source.n_cells, start + 64)
+            block = source.read_cells(start, stop)
+            np.testing.assert_array_equal(
+                block.toarray() if sparse else block, values[:, start:stop].T
+            )
+    finally:
+        release_temporary_storage(source)
+
+
 @pytest.mark.parametrize("backend", ["directory", "hdf5"])
 @pytest.mark.parametrize("version", [1, 2])
 @pytest.mark.parametrize("packed", [False, True])
@@ -4034,3 +4401,47 @@ def test_layer_placements_validate_mappings_and_names() -> None:
             row_names=["f1"],
             column_names=["other"],
         )
+
+
+def test_seurat_import_planning_does_not_read_every_cell_pointer(tmp_path, monkeypatch):
+    import zarr
+    from zarr.storage import MemoryStore
+    from scarf.storage.budget import ResourceBudget
+    from scarf.writers.seurat import SeuratToZarr
+
+    values = np.arange(4000, dtype=np.uint16).reshape(4, 1000) % 7
+    path = tmp_path / "counts.h5"
+    with h5py.File(path, "w") as handle:
+        _write_h5_sparse_group(handle, "X", values, "csc")
+    source = HDF5CompressedMatrixSource(
+        path,
+        "X",
+        physical_shape=values.shape,
+        physical_layout="csc",
+        physical_order="feature_by_cell",
+    )
+    reads = []
+    original = source._direct_bounds
+
+    def bounds(start, stop):
+        reads.append((start, stop))
+        return original(start, stop)
+
+    monkeypatch.setattr(source, "_direct_bounds", bounds)
+    root = zarr.open_group(MemoryStore(), mode="w")
+    destination = root.create_array(
+        "counts",
+        shape=(1000, 4),
+        dtype=values.dtype,
+        chunks=(100, 4),
+        shards=(1000, 4),
+    )
+    writer = object.__new__(SeuratToZarr)
+    writer.resources = ResourceBudget(64 * 1024**2, 1)
+    writer._residentSourceBytes = 0
+    writer._lastImportPlans = {}
+    writer.io = None
+    writer._write_sparse_counts("RNA", source, destination, None)
+    np.testing.assert_array_equal(destination[:], values.T)
+    assert len(reads) < 10
+    assert all(stop - start == 1000 for start, stop in reads)

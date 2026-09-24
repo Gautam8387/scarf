@@ -78,6 +78,8 @@ def run_sgtsne(
         raise ValueError(
             f"ini_embed must have shape ({n_cells}, {tsne_dims}), got {ini_embed.shape}"
         )
+    graph = graph.tocsr(copy=True)
+    graph.eliminate_zeros()
 
     if shutil.which("sgtsne") is not None:
         uid = str(uuid4())

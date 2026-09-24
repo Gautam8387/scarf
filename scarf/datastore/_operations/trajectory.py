@@ -1,4 +1,5 @@
 import operator
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
@@ -7,6 +8,7 @@ from scipy.sparse import coo_matrix
 
 from ...assay import Assay
 from ...assay.normalization import reject_unknown_normalization_params
+from ...features.values import ResolvedFeature, iter_normalized_feature_blocks
 from ...graph.feature_projection import (
     graph_cell_selection,
     resolve_graph_source_assay,
@@ -97,7 +99,6 @@ from ...trajectory.results import (
     PseudotimeScoreResult,
 )
 from ...utils.arrays import array_digest
-from ...utils.compute import controlled_compute
 from ...utils.logging import logger
 
 if TYPE_CHECKING:
@@ -334,6 +335,8 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
     def _load_diffusion_operator_with_lineage(
         self,
         diffusion: ArtifactRef,
+        *,
+        imputed_features: int = 0,
     ) -> tuple[coo_matrix, ArtifactRef, ArtifactRef]:
         if not isinstance(diffusion, ArtifactRef):
             raise TypeError("diffusion must be an ArtifactRef")
@@ -383,8 +386,6 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             )
 
         group = as_zarr_group(self.zw[status.path], name=status.path)
-        if not _diffusion_payload_is_valid(group, n_cells=graph_n_cells):
-            raise ValueError("Diffusion-operator sparse payload is malformed")
         raw_n_cells = group.attrs.get("n_cells")
         if (
             isinstance(raw_n_cells, bool)
@@ -417,6 +418,28 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             or np.dtype(data_array.dtype) != np.dtype(np.float64)
         ):
             raise ValueError("Diffusion-operator sparse payload is malformed")
+        nnz = int(data_array.size)
+        index_bytes = np.dtype(
+            np.int32 if max(graph_n_cells, nnz) <= np.iinfo(np.int32).max else np.int64
+        ).itemsize
+        coo_bytes = nnz * (8 + 2 * index_bytes)
+        load_bytes = nnz * (24 + 2 * index_bytes)
+        if imputed_features:
+            csc_bytes = nnz * (8 + index_bytes) + (graph_n_cells + 1) * index_bytes
+            output_bytes = graph_n_cells * imputed_features * 8
+            load_bytes = max(
+                load_bytes,
+                coo_bytes + 2 * csc_bytes,
+                3 * output_bytes + 2 * csc_bytes,
+            )
+        if load_bytes >= self.memoryBytes:
+            raise MemoryError(
+                "Diffusion operator and imputed output exceed the memory budget "
+                "during loading or sparse conversion; increase the memory budget "
+                "or request fewer features per call."
+            )
+        if not _diffusion_payload_is_valid(group, n_cells=graph_n_cells):
+            raise ValueError("Diffusion-operator sparse payload is malformed")
         rows = np.asarray(row_array[:], dtype=np.uint64)
         cols = np.asarray(col_array[:], dtype=np.uint64)
         data = np.asarray(data_array[:], dtype=np.float64)
@@ -441,7 +464,7 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
 
     def get_imputed(
         self,
-        feature_name: str,
+        feature_name: str | Sequence[str],
         diffusion: ArtifactRef,
         *,
         from_assay: str | None = None,
@@ -450,17 +473,25 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
 
         Args:
             from_assay: Name of assay to be used. If no value is provided then the default assay will be used.
-            feature_name: Name of the feature to be imputed.
+            feature_name: One feature name or a sequence in the desired output order.
             diffusion: Explicit diffusion-operator artifact returned by
                 ``run_diffusion_operator``.
 
         Returns:
-            An array of imputed values for the given feature
+            A vector for one name, or a cells-by-features array for a sequence.
 
         """
-
+        single_feature = isinstance(feature_name, str)
+        if isinstance(feature_name, str):
+            names = [feature_name]
+        elif isinstance(feature_name, Sequence):
+            names = list(feature_name)
+        else:
+            raise TypeError("feature_name must be a string or a sequence of strings")
+        if not names or any(not isinstance(name, str) or not name for name in names):
+            raise ValueError("feature_name must contain non-empty strings")
         diff_op, graph, selection = self._load_diffusion_operator_with_lineage(
-            diffusion
+            diffusion, imputed_features=len(names)
         )
         assay_name = resolve_graph_source_assay(
             self.zw,
@@ -476,29 +507,68 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             assay=None,
             table_path="cellData",
         )
-        if feature_name in self.cells.columns:
-            data = read_metadata_rows_chunkwise(
-                self.cells,
-                feature_name,
-                cell_indices,
-            )
-        else:
+        metadata_columns = set(self.cells.columns)
+        metadata_slots = [i for i, name in enumerate(names) if name in metadata_columns]
+        feature_slots = [
+            i for i, name in enumerate(names) if name not in metadata_columns
+        ]
+        resolved: list[ResolvedFeature] = []
+        if feature_slots:
             assay = self._get_assay(assay_name)
-            feature_indices = assay.feats.get_index_by([feature_name], "names")
-            if len(feature_indices) == 0:
-                raise ValueError(
-                    f"ERROR: {feature_name} not found in {assay_name} assay."
+            feature_names = assay.feats.fetch_all("names")
+            feature_ids = assay.feats.fetch_all("ids")
+            by_name: dict[str, list[int]] = {}
+            for index, name in enumerate(feature_names):
+                by_name.setdefault(name.upper(), []).append(index)
+            for slot in feature_slots:
+                name = names[slot]
+                indices = by_name.get(name.upper(), [])
+                if not indices:
+                    raise ValueError(f"ERROR: {name} not found in {assay_name} assay.")
+                if len(indices) > 1:
+                    logger.warning(
+                        f"Imputing the mean of {len(indices)} features because "
+                        f"{name} is not unique."
+                    )
+                resolved.append(
+                    ResolvedFeature(
+                        assay=assay_name,
+                        by="name",
+                        indices=tuple(indices),
+                        ids=tuple(str(feature_ids[i]) for i in indices),
+                        names=tuple(str(feature_names[i]) for i in indices),
+                        label=name,
+                        reduction="mean" if len(indices) > 1 else None,
+                        raw=name,
+                    )
                 )
-            if len(feature_indices) > 1:
-                logger.warning(
-                    f"Imputing the mean of {len(feature_indices)} features because "
-                    f"{feature_name} is not unique."
-                )
-            data = controlled_compute(
-                assay.normed(cell_indices, feature_indices).mean(axis=1),
-                self.nthreads,
-            ).astype(np.float64)
-        return cast(np.ndarray, diff_op.dot(data))
+
+        sparse = diff_op.tocsc()
+        del diff_op
+        output_bytes = len(cell_indices) * len(names) * np.dtype(np.float64).itemsize
+        # Reserve the sparse column slice and dense streaming temporaries.
+        resident_bytes = 3 * output_bytes + 2 * sum(
+            array.nbytes for array in (sparse.data, sparse.indices, sparse.indptr)
+        )
+        if resident_bytes >= self.memoryBytes:
+            raise MemoryError(
+                "Imputed output and diffusion operator exceed the memory budget; "
+                "increase the memory budget or request fewer features per call."
+            )
+        result = np.zeros((len(cell_indices), len(names)), dtype=np.float64)
+        for slot in metadata_slots:
+            values = np.asarray(
+                read_metadata_rows_chunkwise(self.cells, names[slot], cell_indices),
+                dtype=np.float64,
+            )
+            result[:, slot] = sparse.dot(values)
+        for slots, start, values in iter_normalized_feature_blocks(
+            self, resolved, cell_indices, resident_bytes=resident_bytes
+        ):
+            imputed = sparse[:, start : start + len(values)].dot(values)
+            for column, slot in enumerate(slots):
+                result[:, feature_slots[slot]] += imputed[:, column]
+        return result[:, 0] if single_feature else result
 
     def run_pseudotime_scoring(
         self,
@@ -523,7 +593,7 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
 
         Args:
             graph: Explicit connectivity-map or integrated-graph artifact.
-            n_singular_vals: Number of the smallest singular values to save.
+            n_singular_vals: Number of smallest singular modes requested, including the null mode.
             source_sink: Explicit axis-aligned label artifact. Required with
                 ``sources`` or ``sinks`` and omitted when ``ss_vec`` is supplied.
             sources: A list of group/cluster ids from ``source_sink`` to be treated as sources. Sources are
@@ -571,14 +641,6 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
         )
         graph_ref = graph
         stored_selection = graph_cell_selection(self.zw, graph_ref)
-        validate_stored_selection_integrity(
-            self.zw,
-            stored_selection,
-            kind="cell_selection",
-            scope="datastore",
-            assay=None,
-            table_path="cellData",
-        )
 
         logger.info(f"Pseudotime scoring: loading graph {graph_ref.artifact_id}")
         graph_matrix = self.load_graph(
@@ -602,7 +664,11 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             selected_cell_indices,
             component_policy,
         )
-        retained_graph = graph_matrix[retained_mask][:, retained_mask].tocsr()
+        retained_graph = (
+            graph_matrix
+            if retained_mask.all()
+            else graph_matrix[retained_mask][:, retained_mask]
+        ).tocsr()
         if len(component_sizes) > 1:
             logger.warning(
                 f"Selected graph components have sizes {component_sizes}. "
@@ -1046,7 +1112,15 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
         )
         if graph_matrix.shape[0] != len(ptime_valid):
             raise ValueError("Pseudotime does not align with its graph")
-        retained_graph = graph_matrix[ptime_valid][:, ptime_valid].tocsr()
+        retained_graph = (
+            graph_matrix
+            if ptime_valid.all()
+            else graph_matrix[ptime_valid][:, ptime_valid]
+        ).tocsr()
+        retained_graph_is_shared = (
+            retained_graph is graph_matrix
+            and getattr(self, "_graphMemoryCache", None) is not None
+        )
         retained_ptime = ptime[ptime_valid]
         retained_sink_values = sink_values[ptime_valid]
 
@@ -1106,7 +1180,7 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
                 beta=beta,
                 solver_tol=solver_tol,
                 max_iterations=max_iterations,
-                _copy_graph=False,
+                _copy_graph=retained_graph_is_shared,
             )
         )
         if computed_sink_labels != requested_sink_labels:

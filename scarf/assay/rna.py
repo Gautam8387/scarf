@@ -43,6 +43,7 @@ def _hvg_stats_gene_major_kernel(
     out_nz: np.ndarray,
     out_s1: np.ndarray,
     out_s2: np.ndarray,
+    log_transform: bool = False,
 ) -> None:
     """Accumulate lib-size HVG stats over selected cells in a raw block."""
     n_genes = values.shape[0]
@@ -57,6 +58,8 @@ def _hvg_stats_gene_major_kernel(
         for i in range(n_selected):
             cell = selected[i]
             value = sf * np.float64(values[g, cell]) * inv[i]
+            if log_transform:
+                value = np.log1p(value)
             if value > 0.0:
                 c_nz += 1.0
             c_s1 += value
@@ -75,6 +78,7 @@ def _hvg_stats_gene_major(
     out_s1: np.ndarray,
     out_s2: np.ndarray,
     selected: np.ndarray | None = None,
+    log_transform: bool = False,
 ) -> None:
     """Accumulate lib-size HVG stats for a gene-major count block."""
     if selected is None:
@@ -90,6 +94,7 @@ def _hvg_stats_gene_major(
         out_nz,
         out_s1,
         out_s2,
+        log_transform,
     )
 
 
@@ -187,7 +192,8 @@ class RNAassay(Assay):
             self.sf = int(cast(int, self.attrs["size_factor"]))
         else:
             self.sf = 1000
-            self.attrs["size_factor"] = self.sf
+            if not self.z.read_only:
+                self.attrs["size_factor"] = self.sf
         self.scalar: np.ndarray | None = None
         self._require_counts_t()
 
@@ -250,7 +256,7 @@ class RNAassay(Assay):
         sf = self.sf
         if sf is None:
             raise ValueError("RNA library-size normalization requires a size factor")
-        scalar = self.cells.fetch_all(self.name + "_nCounts")[cell_idx]
+        scalar = self._cell_count_totals(cell_idx)
         log_transform = bool(norm_params.get("log_transform", False))
         counts_t = self.rawDataT
         if counts_t is None:
@@ -446,7 +452,7 @@ class RNAassay(Assay):
                 scalar[scalar == 0] = 1
                 self.scalar = scalar
             else:
-                self.scalar = self.cells.fetch_all(self.name + "_nCounts")[cell_idx]
+                self.scalar = self._cell_count_totals(cell_idx)
             return self.normMethod(self, counts)
         finally:
             self.normMethod = norm_method_cache
@@ -697,6 +703,8 @@ class RNAassay(Assay):
         cell_idx: np.ndarray,
         feature_groups: dict[str, np.ndarray],
         block_rows: int | None = None,
+        *,
+        log_transform: bool = False,
     ) -> dict[str, np.ndarray]:
         """Per-cell mean of library-size normalized counts for each feature group.
 
@@ -713,14 +721,12 @@ class RNAassay(Assay):
 
         zarr_arr = cast(zarr.Array, self.rawData._backing)
         cell_idx = np.asarray(cell_idx)
-        if self.normMethod is norm_lib_size and self.sf is None:
+        if (self.normMethod is norm_lib_size or log_transform) and self.sf is None:
             raise ValueError(
                 "RNA library-size normalization requires a size factor (sf), got None"
             )
         sf = float(self.sf) if self.sf is not None else 1.0
-        scalar = np.asarray(
-            self.cells.fetch_all(self.name + "_nCounts")[cell_idx], dtype=np.float64
-        )
+        scalar = self._cell_count_totals(cell_idx)
         scalar[scalar == 0] = 1
 
         union = np.unique(
@@ -774,6 +780,8 @@ class RNAassay(Assay):
         ):
             end = start + raw.shape[0]
             normed = (sf * raw.astype(np.float64)) / scalar[start:end, None]
+            if log_transform:
+                np.log1p(normed, out=normed)
             for key, pos in local_pos.items():
                 out[key][start:end] = normed[:, pos].mean(axis=1)
         return out
@@ -782,6 +790,8 @@ class RNAassay(Assay):
         self,
         cell_idx: np.ndarray,
         feat_idx: np.ndarray,
+        *,
+        log_transform: bool = False,
     ) -> dict[str, np.ndarray]:
         """Per-feature library-size normalized stats via cell-band countsT.
 
@@ -796,14 +806,12 @@ class RNAassay(Assay):
 
         cell_idx = np.asarray(cell_idx)
         feat_idx = np.asarray(feat_idx)
-        if self.normMethod is norm_lib_size and self.sf is None:
+        if (self.normMethod is norm_lib_size or log_transform) and self.sf is None:
             raise ValueError(
                 "RNA library-size normalization requires a size factor (sf), got None"
             )
         sf = float(self.sf) if self.sf is not None else 1.0
-        scalar = np.asarray(
-            self.cells.fetch_all(self.name + "_nCounts")[cell_idx], dtype=np.float64
-        )
+        scalar = self._cell_count_totals(cell_idx)
         scalar[scalar == 0] = 1
         inv_scalar = 1.0 / scalar
 
@@ -864,6 +872,7 @@ class RNAassay(Assay):
                 local_s1,
                 local_s2,
                 selected=band.selectedLocal,
+                log_transform=log_transform,
             )
             compute_sec = time.perf_counter() - t_compute
             logger.debug(
@@ -930,6 +939,8 @@ class RNAassay(Assay):
         self,
         cell_idx: np.ndarray,
         feat_idx: np.ndarray,
+        *,
+        log_transform: bool = False,
     ) -> dict[str, np.ndarray]:
         """Compute sufficient feature statistics without persisting metadata."""
         cell_idx = np.asarray(cell_idx, dtype=np.int64)
@@ -942,8 +953,12 @@ class RNAassay(Assay):
                 "sigmas": zeros.copy(),
             }
         if self.normMethod is norm_lib_size:
-            return self._streaming_feature_stats(cell_idx, feat_idx)
+            return self._streaming_feature_stats(
+                cell_idx, feat_idx, log_transform=log_transform
+            )
         normed = self.normed(cell_idx, feat_idx)
+        if log_transform:
+            normed = cast(ChunkedArray, np.log1p(normed))
         return {
             "normed_tot": np.asarray(
                 compute_with_progress(

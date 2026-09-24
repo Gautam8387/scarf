@@ -26,9 +26,6 @@ from ...storage.artifact_writer import (
 from ...storage.arrays import create_zarr_dataset
 from ...storage.types import as_zarr_array, as_zarr_group
 from ...storage.errors import ArtifactResolutionError
-from ...storage.selections import (
-    validate_stored_selection_integrity,
-)
 from ...utils.logging import logger
 from ...utils.shutdown import shutdown_checkpoint
 
@@ -93,14 +90,6 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         artifact_scope = graph_ref.scope
         artifact_assay = graph_ref.assay
         cell_selection = graph_cell_selection(self.zw, graph_ref)
-        validate_stored_selection_integrity(
-            self.zw,
-            cell_selection,
-            kind="cell_selection",
-            scope="datastore",
-            assay=None,
-            table_path="cellData",
-        )
         n_cells, _effective_k = self._get_graph_ncells_k(graph_loc)
         cut_mode: Literal["adaptive", "fixed"] = (
             "fixed" if fixed_cluster_count is not None else "adaptive"
@@ -360,18 +349,11 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         n_cells, _effective_k = self._get_graph_ncells_k(graph_loc)
         artifact_scope = graph_input.scope
         selection = graph_cell_selection(self.zw, graph_input)
-        validate_stored_selection_integrity(
-            self.zw,
-            selection,
-            kind="cell_selection",
-            scope="datastore",
-            assay=None,
-            table_path="cellData",
-        )
         arguments = LeidenArguments(
             graph=graph_input,
             resolution=resolution,
             backend=backend,
+            edge_weighting="graph",
             symmetric_graph=symmetric_graph,
             graph_upper_only=graph_upper_only,
             random_seed=random_seed,
@@ -729,14 +711,6 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             raise ValueError("clusters must be a Paris cluster_cut artifact")
         graph_input = graph
         selection = graph_cell_selection(self.zw, graph_input)
-        validate_stored_selection_integrity(
-            self.zw,
-            selection,
-            kind="cell_selection",
-            scope="datastore",
-            assay=None,
-            table_path="cellData",
-        )
         cut_status = inspect_artifact(self.zw, clusters)
         if not cut_status.complete or cut_status.operation != "cut_paris_hierarchy":
             raise ArtifactResolutionError(
@@ -815,7 +789,8 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             symmetric=False,
             upper_only=False,
             use_k=use_k,
-        )
+        ).copy()
+        graph_matrix.eliminate_zeros()
 
         if len(cluster_values) != graph_matrix.shape[0]:
             raise ValueError(

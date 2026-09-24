@@ -186,15 +186,100 @@ def test_initialization_concurrency_respects_a_tight_memory_budget():
     _assert_one_counts_stream(store, expected_reads)
 
 
-def test_cached_initialization_is_read_and_write_free():
+@pytest.mark.parametrize("mode", ["r", "r+"])
+def test_cached_initialization_is_read_and_write_free(mode):
     store, _ = _qc_store()
     _open_qc_store(store)
     store.reset()
 
-    _open_qc_store(store, zarr_mode="r")
+    _open_qc_store(store, zarr_mode=mode, default_assay=None)
 
     assert _count_chunk_gets(store) == []
     assert [operation for operation, _ in store.ops if operation == "set"] == []
+
+
+def test_fresh_import_opens_read_only_without_initializing_qc():
+    store, _ = _qc_store()
+    dataset = _open_qc_store(store, zarr_mode="r")
+    np.testing.assert_array_equal(dataset.RNA.rawData.compute(), _QC_VALUES)
+    assert "RNA_nFeatures" not in dataset.cells.columns
+    assert "nCells" not in dataset.RNA.feats.columns
+    assert dataset.RNA.sf == 1000
+    assert [operation for operation, _ in store.ops if operation == "set"] == []
+
+
+@pytest.mark.parametrize("assay_type", ["RNA", "ATAC"])
+@pytest.mark.parametrize("rows", [[3, 1, 0], []])
+def test_fresh_read_only_normalization_uses_all_features_for_totals(assay_type, rows):
+    from scarf.features.values import fetch_normalized_feature_matrix, resolve_feature
+    from scarf.metadata.selection import FeatureRef
+
+    store, _ = _qc_store()
+    dataset = _open_qc_store(store, zarr_mode="r", assay_types={"RNA": assay_type})
+    cell_idx = np.asarray(rows, dtype=np.int64)
+    feat_idx = np.array([0, 3])
+    counts = _QC_VALUES[np.ix_(cell_idx, feat_idx)].astype(np.float64)
+    totals = _QC_VALUES.sum(axis=1)[cell_idx]
+    expected = counts / totals[:, None]
+    if assay_type == "RNA":
+        expected *= dataset.RNA.sf
+    else:
+        expected *= np.log2(1 + len(rows) / (np.count_nonzero(counts, axis=0) + 1))
+
+    actual = dataset.RNA.normed(cell_idx=cell_idx, feat_idx=feat_idx).compute()
+    np.testing.assert_allclose(actual, expected)
+    features = [
+        resolve_feature(dataset, FeatureRef(f"f{index}", by="id")) for index in feat_idx
+    ]
+    np.testing.assert_allclose(
+        fetch_normalized_feature_matrix(dataset, features, cell_idx), expected
+    )
+    assert "RNA_nCounts" not in dataset.cells.columns
+    assert [operation for operation, _ in store.ops if operation == "set"] == []
+
+
+def test_fresh_read_only_rna_feature_streams_compute_missing_totals():
+    store, _ = _qc_store()
+    dataset = _open_qc_store(store, zarr_mode="r")
+    rows = np.array([3, 1, 0])
+    features = np.array([0, 3])
+    expected = (
+        1000 * _QC_VALUES[np.ix_(rows, features)] / _QC_VALUES.sum(axis=1)[rows, None]
+    )
+    blocks = list(
+        dataset.RNA.iter_normed_feature_wise(
+            rows, features, batch_size=1, msg=None, as_dataframe=False
+        )
+    )
+    np.testing.assert_array_equal(
+        np.concatenate([indices for _, indices in blocks]), features
+    )
+    np.testing.assert_allclose(
+        np.concatenate([values for values, _ in blocks]).T, expected
+    )
+    means = dataset.RNA._mean_normed_feature_groups(rows, {"pair": features})
+    np.testing.assert_allclose(means["pair"], expected.mean(axis=1))
+    stats = dataset.RNA._streaming_feature_stats(rows, features)
+    np.testing.assert_allclose(stats["normed_tot"], expected.sum(axis=0))
+    assert "RNA_nCounts" not in dataset.cells.columns
+    assert [operation for operation, _ in store.ops if operation == "set"] == []
+
+
+def test_default_mito_pattern_excludes_other_mt_prefixes():
+    store, _ = _qc_store()
+    root = zarr.open_group(store=store, mode="r+")
+    root["RNA/featureData/names"][:] = np.array(
+        ["mt-Co1", "MTOR", "MT1A", "RPL5", "ZERO", "GENE_B"]
+    )
+    dataset = _open_qc_store(store, mito_pattern=None)
+    totals = _QC_VALUES.sum(axis=1)
+    expected = np.divide(
+        100 * _QC_VALUES[:, 0],
+        totals,
+        out=np.full(len(totals), np.nan),
+        where=totals != 0,
+    )
+    np.testing.assert_allclose(dataset.cells.fetch_all("RNA_percentMito"), expected)
 
 
 def test_partial_initialization_preserves_feature_summary_cache(monkeypatch):
@@ -233,7 +318,7 @@ def test_partial_initialization_preserves_feature_summary_cache(monkeypatch):
     )
 
 
-def test_percent_cache_remains_attribute_only():
+def test_missing_percent_column_is_recomputed():
     store, expected_reads = _qc_store()
     datastore = _open_qc_store(store)
     datastore.cells.drop("RNA_percentMito")
@@ -241,14 +326,544 @@ def test_percent_cache_remains_attribute_only():
 
     cached = _open_qc_store(store)
 
-    assert _count_chunk_gets(store) == []
-    assert "RNA_percentMito" not in cached.cells.columns
+    _assert_one_counts_stream(store, expected_reads)
+    assert "RNA_percentMito" in cached.cells.columns
     store.reset()
 
-    refreshed = _open_qc_store(store, mito_pattern="^MT-|^GENE_A$")
+    previous = cached.cells.fetch_all("RNA_percentMito").copy()
+    with pytest.raises(ValueError, match="run_feature_percentage"):
+        _open_qc_store(store, mito_pattern="^MT-|^GENE_A$")
+    np.testing.assert_array_equal(cached.cells.fetch_all("RNA_percentMito"), previous)
+    assert _count_chunk_gets(store) == []
 
+
+def test_default_open_preserves_existing_percentages_and_explicit_scoring_is_separate():
+    store, _ = _qc_store()
+    root = zarr.open_group(store=store, mode="r+")
+    root["RNA/featureData/names"][:] = np.array(
+        ["mt-Co1", "MTOR", "MT1A", "RPL5", "ZERO", "GENE_B"]
+    )
+    original = _open_qc_store(store, mito_pattern="MT-|mt", ribo_pattern="")
+    previous = original.cells.fetch_all("RNA_percentMito").copy()
+    previous_attrs = dict(original.RNA.attrs)
+    column_attrs = dict(original.cells._get_array("RNA_percentMito").attrs)
+    for mode in ("r", "r+"):
+        store.reset()
+        reopened = _open_qc_store(
+            store,
+            mito_pattern=None,
+            ribo_pattern="",
+            zarr_mode=mode,
+            default_assay=None,
+        )
+        np.testing.assert_allclose(
+            reopened.cells.fetch_all("RNA_percentMito"), previous
+        )
+        assert dict(reopened.RNA.attrs) == previous_attrs
+        assert dict(reopened.cells._get_array("RNA_percentMito").attrs) == column_attrs
+        assert _count_chunk_gets(store) == []
+        assert not any(operation == "set" for operation, _ in store.ops)
+
+    cells = reopened.snapshot_cell_selection()
+    features = reopened.set_feature_selection(feature_indexes=[0])
+    metric = reopened.run_feature_percentage(cells, features)
+    selected = reopened.cells.active_index("I")
+    expected = 100 * _QC_VALUES[selected, 0] / _QC_VALUES.sum(axis=1)[selected]
+    np.testing.assert_allclose(reopened.load_artifact(metric)["values"][:], expected)
+    np.testing.assert_allclose(reopened.cells.fetch_all("RNA_percentMito"), previous)
+
+
+def test_percentages_without_matched_feature_provenance_are_preserved():
+    store, _ = _qc_store()
+    root = zarr.open_group(store=store, mode="r+")
+    root["RNA/featureData/names"][:] = np.array(
+        ["RPSX", "RPS3", "GENE_A", "RPL5", "ZERO", "GENE_B"]
+    )
+    dataset = _open_qc_store(store, mito_pattern="", ribo_pattern=r"^RPS\d+$")
+    column = dataset.cells._get_array("RNA_percentRibo")
+    totals = _QC_VALUES.sum(axis=1)
+    column[:] = np.divide(
+        100 * _QC_VALUES[:, 0],
+        totals,
+        out=np.full(len(totals), np.nan),
+        where=totals != 0,
+    )
+    del column.attrs["feature_selection_fingerprint"]
+    previous = np.asarray(column[:]).copy()
+    store.reset()
+
+    reopened = _open_qc_store(
+        store, mito_pattern="", ribo_pattern=None, default_assay=None
+    )
+    np.testing.assert_array_equal(reopened.cells.fetch_all("RNA_percentRibo"), previous)
+    assert _count_chunk_gets(store) == []
+    assert not any(operation == "set" for operation, _ in store.ops)
+    with pytest.raises(ValueError, match="provenance differs or is missing"):
+        _open_qc_store(store, mito_pattern="", ribo_pattern=r"^RPS\d+$")
+    np.testing.assert_array_equal(reopened.cells.fetch_all("RNA_percentRibo"), previous)
+
+
+@pytest.mark.parametrize("pattern", [r"^MT-", r"^ABSENT$"])
+def test_explicit_percent_pattern_conflicts_preserve_existing_values(pattern):
+    store, _ = _qc_store()
+    root = zarr.open_group(store=store, mode="r+")
+    root["RNA/featureData/names"][:] = np.array(
+        ["MTOR", "MT1A", "GENE_A", "RPL5", "ZERO", "GENE_B"]
+    )
+    original = _open_qc_store(store, mito_pattern="MT-|mt")
+    previous = original.cells.fetch_all("RNA_percentMito").copy()
+    attrs = dict(original.RNA.attrs)
+    store.reset()
+
+    with pytest.raises(ValueError, match="Cannot apply pattern"):
+        _open_qc_store(store, mito_pattern=pattern, default_assay=None)
+    np.testing.assert_array_equal(original.cells.fetch_all("RNA_percentMito"), previous)
+    assert dict(original.RNA.attrs) == attrs
+    assert _count_chunk_gets(store) == []
+    assert not any(operation == "set" for operation, _ in store.ops)
+
+
+def test_percent_unexpressed_features_initialize_and_preserve_values():
+    store, expected_reads = _qc_store()
+
+    reopened = _open_qc_store(store, mito_pattern="^ZERO$")
+
+    expected = np.where(_QC_VALUES.sum(axis=1) == 0, np.nan, 0.0)
+    np.testing.assert_allclose(reopened.cells.fetch_all("RNA_percentMito"), expected)
+    assert reopened.RNA.attrs["percentFeatures"]["RNA_percentMito"] == "^ZERO$"
     _assert_one_counts_stream(store, expected_reads)
-    assert "RNA_percentMito" in refreshed.cells.columns
+    store.reset()
+    cached = _open_qc_store(store, mito_pattern="^ZERO$", default_assay=None)
+    np.testing.assert_allclose(cached.cells.fetch_all("RNA_percentMito"), expected)
+    assert _count_chunk_gets(store) == []
+    assert [operation for operation, _ in store.ops if operation == "set"] == []
+
+
+def test_auto_filter_keeps_cells_with_zero_feature_percentages():
+    store, _ = _qc_store()
+    dataset = _open_qc_store(store, mito_pattern="^ZERO$")
+    expected = _QC_VALUES.sum(axis=1) > 0
+    dataset.cells.insert("has_counts", expected)
+    cells = dataset.snapshot_cell_selection("has_counts")
+
+    result = dataset.auto_filter_cells(
+        attrs=["RNA_percentMito"], cell_selection=cells, min_cells_per_sample=2
+    )
+
+    np.testing.assert_array_equal(dataset.load_artifact(result)["values"][:], expected)
+    status = dataset.inspect_artifact(result)
+    assert status.parameters["method"] == "mad"
+    bounds = status.parameters["resolved_bounds"]["all"]["RNA_percentMito"]
+    assert bounds["low"] is None
+    assert bounds["high"] is None
+    assert bounds["skip_reason"] == "zero_mad"
+
+
+@pytest.mark.parametrize(
+    ("pattern", "indices"),
+    [("^mt-", [0, 1]), (r"(?-i:^MT-)", [1]), (r"\ARPS\d+\Z", [2, 3])],
+)
+def test_percent_matching_preserves_regex_and_selected_rows(pattern, indices):
+    store, _ = _qc_store()
+    root = zarr.open_group(store=store, mode="r+")
+    root["RNA/featureData/names"][:] = np.array(
+        ["mt-Co1", "MT-CO1", "RPS3", "rps4", "MTOR", "GENE_B"]
+    )
+    dataset = _open_qc_store(store, mito_pattern=pattern)
+
+    totals = _QC_VALUES.sum(axis=1)
+    expected = np.divide(
+        100 * _QC_VALUES[:, indices].sum(axis=1),
+        totals,
+        out=np.full(len(totals), np.nan),
+        where=totals != 0,
+    )
+    np.testing.assert_allclose(dataset.cells.fetch_all("RNA_percentMito"), expected)
+
+
+def test_renamed_features_do_not_rewrite_existing_percentages():
+    store, _ = _qc_store()
+    dataset = _open_qc_store(store)
+    previous = dataset.cells.fetch_all("RNA_percentMito").copy()
+    dataset.RNA.feats.insert(
+        "names",
+        np.array(["GENE_C", "MT-CO2", "GENE_A", "RPL5", "ZERO", "GENE_B"]),
+        overwrite=True,
+    )
+    store.reset()
+
+    reopened = _open_qc_store(store, mito_pattern=None, ribo_pattern=None)
+    np.testing.assert_array_equal(reopened.cells.fetch_all("RNA_percentMito"), previous)
+    with pytest.raises(ValueError, match="provenance differs or is missing"):
+        _open_qc_store(store)
+    assert _count_chunk_gets(store) == []
+
+
+def test_percent_failed_computation_does_not_cache_a_new_pattern(monkeypatch):
+    store, _ = _qc_store()
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("count read failed")
+
+    with monkeypatch.context() as context:
+        context.setattr(Assay, "_stream_initialization_stats", fail)
+        with pytest.raises(RuntimeError, match="count read failed"):
+            _open_qc_store(store, mito_pattern="^GENE_A$")
+
+    root = zarr.open_group(store=store, mode="r")
+    assert "RNA_percentMito" not in root["cellData"]
+    assert "RNA_percentMito" not in root["RNA"].attrs.get("percentFeatures", {})
+    reopened = _open_qc_store(store, mito_pattern="^GENE_A$")
+    assert "RNA_percentMito" in reopened.cells.columns
+
+
+def test_cell_cycle_transforms_before_binning_and_scores_with_the_same_values():
+    from scarf.assay.feature_summary import (
+        ensure_feature_summary,
+        feature_summary_values,
+    )
+    from scarf.assay.normalization import norm_lib_size
+    from scarf.storage.artifacts import callable_identity
+
+    store, _ = _qc_store()
+    dataset = _open_qc_store(store)
+    cells = dataset.snapshot_cell_selection()
+    rows = dataset.cells.active_index("I")
+    linear = 1000 * _QC_VALUES[rows] / _QC_VALUES.sum(axis=1)[rows, None]
+    logged = np.log1p(linear)
+    summary = ensure_feature_summary(dataset.zw, dataset.RNA, cells)
+    options = dict(s_genes=["GENE_A"], g2m_genes=["RPS3"], n_bins=2, ctrl_size=10000)
+    scores = dataset.run_cell_cycle_scoring(cells, **options)
+    raw_scores = dataset.run_cell_cycle_scoring(cells, log_transform=False, **options)
+
+    assert scores != raw_scores
+    assert dataset.run_cell_cycle_scoring(cells, **options) == scores
+    for ref, values, transform in ((scores, logged, True), (raw_scores, linear, False)):
+        group = dataset.load_artifact(ref)
+        np.testing.assert_allclose(
+            group["s_score"][:], values[:, 2] - values[:, [0, 1, 4, 5]].mean(axis=1)
+        )
+        np.testing.assert_allclose(
+            group["g2m_score"][:], values[:, 1] - values[:, [0, 2, 4, 5]].mean(axis=1)
+        )
+        status = dataset.inspect_artifact(ref)
+        assert status.parameters["log_transform"] is transform
+        assert status.parameters["control_size"] == 10000
+        summary_ref = ArtifactRef.from_dict(status.inputs["feature_summary"])
+        stats = feature_summary_values(dataset.zw, summary_ref, n_selected=len(rows))
+        np.testing.assert_allclose(stats["avg"], values.mean(axis=0))
+        summary_parameters = dataset.inspect_artifact(summary_ref).parameters
+        assert summary_parameters["normalization_method"] == callable_identity(
+            norm_lib_size
+        )
+        assert summary_parameters.get("log_transform", False) is transform
+        assert (summary_ref == summary) is (not transform)
+    assert ensure_feature_summary(dataset.zw, dataset.RNA, cells) == summary
+    assert dataset.RNA.normMethod is norm_lib_size
+    different_controls = dataset.run_cell_cycle_scoring(
+        cells, **(options | {"ctrl_size": 2})
+    )
+    assert different_controls != scores
+    assert dataset.inspect_artifact(different_controls).parameters["control_size"] == 2
+
+
+def test_cell_cycle_logs_the_configured_normalizer_without_replacing_it():
+    from scarf.assay.normalization import norm_dummy, norm_lib_size
+    from scarf.storage.artifacts import callable_identity
+
+    store, _ = _qc_store()
+    dataset = _open_qc_store(store)
+    dataset.RNA.normMethod = norm_dummy
+    dataset.RNA.sf = None
+    cells = dataset.snapshot_cell_selection()
+    rows = dataset.cells.active_index("I")
+    logged = np.log1p(_QC_VALUES[rows])
+    expected = logged[:, 2] - logged[:, [0, 1, 4, 5]].mean(axis=1)
+    options = dict(s_genes=["GENE_A"], g2m_genes=["RPS3"], n_bins=2, ctrl_size=10000)
+
+    scores = dataset.run_cell_cycle_scoring(cells, **options)
+
+    np.testing.assert_allclose(dataset.load_artifact(scores)["s_score"][:], expected)
+    np.testing.assert_allclose(
+        dataset.RNA.score_features(["GENE_A"], "I", 10000, 2, 4466, log_transform=True),
+        expected,
+    )
+    summary = ArtifactRef.from_dict(
+        dataset.inspect_artifact(scores).inputs["feature_summary"]
+    )
+    assert dataset.inspect_artifact(summary).parameters == {
+        "normalization_method": callable_identity(norm_dummy),
+        "size_factor": None,
+        "log_transform": True,
+    }
+    assert dataset.RNA.normMethod is norm_dummy
+    dataset.RNA.normMethod = norm_lib_size
+    dataset.RNA.sf = 1000
+    assert dataset.run_cell_cycle_scoring(cells, **options) != scores
+
+
+@pytest.mark.parametrize("operation", ["normalization", "pca", "ann"])
+def test_completed_artifact_reuse_reads_metadata_and_new_work_validates_inputs(
+    operation,
+):
+    from scarf.storage.errors import ArtifactResolutionError
+    from scarf.storage.selections import validate_stored_selection_integrity
+
+    store, _ = _qc_store()
+    dataset = _open_qc_store(store)
+    cells = dataset.snapshot_cell_selection()
+    features = dataset.select_all_features(from_assay="RNA")
+    normalized = dataset.run_normalization(cells, features)
+    pca = dataset.run_pca(normalized, dims=2, local_cache=False)
+    ann = dataset.build_ann_index(pca)
+    calls = {
+        "normalization": lambda **kwargs: dataset.run_normalization(
+            cells, features, **kwargs
+        ),
+        "pca": lambda **kwargs: dataset.run_pca(normalized, dims=2, **kwargs),
+        "ann": lambda **kwargs: dataset.build_ann_index(pca, **kwargs),
+    }
+    expected = {"normalization": normalized, "pca": pca, "ann": ann}[operation]
+    store.reset()
+
+    assert calls[operation]() == expected
+    assert not [key for action, key in store.ops if action == "get" and "/c/" in key]
+
+    dataset.zw["cellData/ids"][0] = "changed"
+    assert calls[operation]() == expected
+    with pytest.raises(ArtifactResolutionError, match="row identity"):
+        validate_stored_selection_integrity(
+            dataset.zw,
+            cells,
+            kind="cell_selection",
+            scope="datastore",
+            assay=None,
+            table_path="cellData",
+        )
+    with pytest.raises(ArtifactResolutionError, match="row identity"):
+        calls[operation](invalidate_cache=True)
+
+
+def _normalized_qc_dataset() -> tuple[DataStore, ArtifactRef, ArtifactRef]:
+    store, _ = _qc_store()
+    dataset = _open_qc_store(store)
+    cells = dataset.snapshot_cell_selection()
+    features = dataset.select_all_features(from_assay="RNA")
+    return dataset, cells, dataset.run_normalization(cells, features)
+
+
+def test_new_normalization_rejects_an_empty_cell_selection():
+    dataset, _, _ = _normalized_qc_dataset()
+    dataset.cells.insert("none", np.zeros(dataset.cells.N, dtype=bool))
+    empty = dataset.snapshot_cell_selection("none")
+    features = dataset.select_all_features(from_assay="RNA")
+
+    with pytest.raises(ValueError, match="requires selected cells and features"):
+        dataset.run_normalization(empty, features)
+
+
+def test_new_reduction_rejects_underdetermined_inputs():
+    dataset, cells, normalized = _normalized_qc_dataset()
+    two_features = dataset.set_feature_selection(
+        from_assay="RNA", feature_indexes=[0, 1]
+    )
+    narrow = dataset.run_normalization(cells, two_features)
+
+    with pytest.raises(ValueError, match=r"at least dims \+ 1 selected features"):
+        dataset.run_pca(narrow, dims=2, local_cache=False)
+    # The public wrapper widens batch_size, so only direct callers reach this guard.
+    with pytest.raises(ValueError, match=r"batch_size must be at least dims \+ 1"):
+        dataset._run_reduction_artifact_impl(
+            method="pca",
+            normalized=normalized,
+            dims=3,
+            pca_cell_selection=None,
+            feat_scaling=True,
+            lsi_skip_first=False,
+            custom_loadings=None,
+            rand_state=4466,
+            batch_size=3,
+            show_elbow_plot=False,
+            invalidate_cache=False,
+        )
+    with pytest.raises(ValueError, match="exceed the normalized matrix rank"):
+        dataset.run_lsi(normalized, dims=6, local_cache=False)
+
+
+@pytest.mark.parametrize(
+    ("axis", "message"),
+    [(1, "columns do not match"), (0, "rows do not match")],
+)
+def test_new_reduction_rejects_normalized_shape_that_disagrees_with_lineage(
+    axis, message
+):
+    from scarf.storage.errors import ArtifactResolutionError
+
+    dataset, _, normalized = _normalized_qc_dataset()
+    group = artifact_group(dataset.zw, normalized)
+    data = np.asarray(group["data"][:])
+    truncated = data[:, :-1] if axis == 1 else data[:-1]
+    group.create_array("data", data=truncated, overwrite=True)
+
+    with pytest.raises(ArtifactResolutionError, match=message):
+        dataset.run_pca(normalized, dims=2, local_cache=False)
+
+
+def test_reused_pca_warns_that_no_elbow_plot_is_available():
+    from scarf.utils.logging import logger
+
+    dataset, _, normalized = _normalized_qc_dataset()
+    pca = dataset.run_pca(normalized, dims=2, local_cache=False)
+    messages: list[str] = []
+    sink = logger.add(
+        lambda message: messages.append(message.record["message"]),
+        level="WARNING",
+    )
+    try:
+        reused = dataset.run_pca(
+            normalized, dims=2, local_cache=False, show_elbow_plot=True
+        )
+    finally:
+        logger.remove(sink)
+
+    assert reused == pca
+    assert "PCA was not fitted so no elbow plot is available" in messages
+
+
+def test_pca_streams_scaling_statistics_when_normalized_sums_are_absent():
+    dataset, _, normalized = _normalized_qc_dataset()
+    expected = dataset.load_artifact(
+        dataset.run_pca(normalized, dims=2, local_cache=False)
+    )
+    other, _, other_normalized = _normalized_qc_dataset()
+    group = artifact_group(other.zw, other_normalized)
+    del group["feature_sum"]
+    del group["feature_squared_sum"]
+
+    observed = other.load_artifact(
+        other.run_pca(other_normalized, dims=2, local_cache=False)
+    )
+
+    np.testing.assert_allclose(observed["data"][:], expected["data"][:], atol=1e-5)
+    np.testing.assert_allclose(
+        observed["loadings"][:], expected["loadings"][:], atol=1e-6
+    )
+
+
+def test_ann_index_rejects_non_coordinates_and_projects_unmaterialized_pca():
+    dataset, _, normalized = _normalized_qc_dataset()
+    with pytest.raises(ValueError, match="Coordinates must reference"):
+        dataset.build_ann_index(normalized)
+
+    pca = dataset.run_pca(normalized, dims=2, local_cache=False)
+    expected = dataset.load_artifact(
+        dataset.query_neighbors(dataset.build_ann_index(pca), coordinates=pca, k=2)
+    )
+    other, _, other_normalized = _normalized_qc_dataset()
+    other_pca = other.run_pca(other_normalized, dims=2, local_cache=False)
+    del artifact_group(other.zw, other_pca)["data"]
+
+    observed = other.load_artifact(
+        other.query_neighbors(
+            other.build_ann_index(other_pca), coordinates=other_pca, k=2
+        )
+    )
+
+    for name in expected.array_keys():
+        np.testing.assert_allclose(observed[name][:], expected[name][:], atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    ("options", "error", "message"),
+    [
+        ({"ctrl_size": True}, TypeError, "ctrl_size must be a positive integer"),
+        ({"ctrl_size": 2.0}, TypeError, "ctrl_size must be a positive integer"),
+        ({"ctrl_size": 0}, ValueError, "ctrl_size must be a positive integer"),
+        ({"log_transform": 1}, TypeError, "log_transform must be a bool"),
+    ],
+)
+def test_cell_cycle_rejects_invalid_controls_before_summarizing(
+    options, error, message
+):
+    from scarf.storage.artifacts import list_artifacts
+
+    store, _ = _qc_store()
+    dataset = _open_qc_store(store)
+    cells = dataset.snapshot_cell_selection()
+
+    with pytest.raises(error, match=message):
+        dataset.run_cell_cycle_scoring(
+            cells, s_genes=["GENE_A"], g2m_genes=["RPS3"], **options
+        )
+
+    assert not list_artifacts(
+        dataset.zw, scope="assay", assay="RNA", kind="feature_summary"
+    )
+
+
+def test_score_features_rejects_a_target_set_without_controls():
+    store, _ = _qc_store()
+    dataset = _open_qc_store(store)
+    with pytest.raises(ValueError, match="No control features"):
+        dataset.RNA.score_features(_QC_FEATURE_NAMES.tolist(), "I", 10000, 2, 4466)
+
+
+def test_cell_cycle_preserves_scores_without_transform_provenance():
+    from scarf.assay.feature_summary import ensure_feature_summary
+    from scarf.metadata.artifacts import (
+        plan_cell_data_artifact,
+        write_cell_data_artifact,
+    )
+    from scarf.quality_control.cell_cycle import assign_cell_cycle_phase
+
+    store, _ = _qc_store()
+    dataset = _open_qc_store(store)
+    cells = dataset.snapshot_cell_selection()
+    rows = dataset.cells.active_index("I")
+    values = 1000 * _QC_VALUES[rows] / _QC_VALUES.sum(axis=1)[rows, None]
+    s_score = values[:, 2] - values[:, [0, 1, 4, 5]].mean(axis=1)
+    g2m_score = values[:, 1] - values[:, [0, 2, 4, 5]].mean(axis=1)
+    arrays = {
+        "s_score": s_score,
+        "g2m_score": g2m_score,
+        "phase": np.asarray(assign_cell_cycle_phase(s_score, g2m_score)),
+    }
+    planned = plan_cell_data_artifact(
+        dataset.zw,
+        scope="assay",
+        assay="RNA",
+        kind="cell_cycle",
+        operation="run_cell_cycle_scoring",
+        parameters={
+            "s_gene_indices": (2,),
+            "g2m_gene_indices": (1,),
+            "control_size": 10000,
+            "n_bins": 2,
+            "rand_seed": 4466,
+        },
+        inputs={
+            "feature_summary": ensure_feature_summary(dataset.zw, dataset.RNA, cells)
+        },
+        execution_options={},
+        cell_selection=cells,
+        arrays={name: (array.shape, None) for name, array in arrays.items()},
+    )
+    group = write_cell_data_artifact(dataset.zw, planned, arrays)
+    original_attrs = dict(group.attrs)
+
+    for transform in (False, True):
+        ref = dataset.run_cell_cycle_scoring(
+            cells,
+            s_genes=["GENE_A"],
+            g2m_genes=["RPS3"],
+            ctrl_size=10000,
+            n_bins=2,
+            log_transform=transform,
+        )
+        assert ref != planned.ref
+    assert dict(group.attrs) == original_attrs
+    for name, values in arrays.items():
+        np.testing.assert_array_equal(group[name][:], values)
 
 
 def test_partial_feature_props_are_recomputed_together():

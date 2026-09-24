@@ -72,6 +72,18 @@ def test_leiden_membership_preserves_disconnected_partitions(backend):
     assert adjusted_rand_score([1, 1, 1, 1, 2, 2, 2, 2], actual) == pytest.approx(1.0)
 
 
+@pytest.mark.parametrize("backend", ["igraph", "leidenalg"])
+def test_leiden_membership_uses_edge_weights(backend):
+    weights = np.full((8, 8), 0.001)
+    weights[:4, :4] = 1.0
+    weights[4:, 4:] = 1.0
+    np.fill_diagonal(weights, 0)
+
+    actual = leiden_membership(csr_matrix(weights), 1.0, 11, backend)
+
+    assert adjusted_rand_score([0, 0, 0, 0, 1, 1, 1, 1], actual) == 1.0
+
+
 def test_native_leiden_membership_is_seeded_and_repeatable():
     graph = _simple_knn_graph(100)
 
@@ -93,7 +105,8 @@ def test_leiden_membership_rejects_unknown_backend():
         )
 
 
-def test_igraph_leiden_ignores_explicit_zero_weight_edges():
+@pytest.mark.parametrize("backend", ["igraph", "leidenalg"])
+def test_leiden_ignores_explicit_zero_weight_edges(backend):
     solid = _grouped_knn_graph([[0, 1, 2, 3], [4, 5, 6, 7]]).tocoo()
     padded = coo_matrix(
         (
@@ -108,8 +121,12 @@ def test_igraph_leiden_ignores_explicit_zero_weight_edges():
 
     assert np.count_nonzero(padded.data) != padded.nnz
 
-    actual = leiden_membership(padded, resolution=1.0, random_seed=4444)
-    expected = leiden_membership(solid, resolution=1.0, random_seed=4444)
+    actual = leiden_membership(
+        padded, resolution=1.0, random_seed=4444, backend=backend
+    )
+    expected = leiden_membership(
+        solid, resolution=1.0, random_seed=4444, backend=backend
+    )
 
     np.testing.assert_array_equal(actual, expected)
 
@@ -573,7 +590,7 @@ def test_build_connectivity_arrays_runs_in_memory():
     np.testing.assert_allclose(weights, expected_weights, rtol=1e-6, atol=1e-7)
 
 
-def test_connectivity_omits_zero_membership_edges():
+def test_connectivity_preserves_zero_weight_neighbors():
     n_cells, n_neighbors = 10, 5
     indices = np.array(
         [
@@ -594,10 +611,13 @@ def test_connectivity_omits_zero_membership_edges():
     )
 
     expected = np.tile(
-        np.array([1.0, 1.0, 1.0, 0.9512299], dtype=np.float32),
+        np.array([1.0, 1.0, 1.0, 0.9512299, 0.0], dtype=np.float32),
         n_cells,
     )
-    assert len(edges) == n_cells * 4
+    np.testing.assert_array_equal(
+        edges,
+        np.column_stack((np.repeat(np.arange(n_cells), n_neighbors), indices.ravel())),
+    )
     np.testing.assert_allclose(weights, expected, rtol=1e-6, atol=1e-7)
 
 

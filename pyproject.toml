@@ -61,7 +61,7 @@ cytebase = [
     "duckdb>=1.5.5",
 ]
 agent = [
-    "pydantic-ai-slim[openai]>=2.0",
+    "pydantic-ai-slim[openai]>=2.19.0",
 ]
 extra = [
     "anndata>=0.12",
@@ -79,7 +79,7 @@ test = [
     "anndata>=0.12",
     "scikit-network>=0.33.1",
     "rdata>=1.1.0",
-    "pydantic-ai-slim[openai]>=2.0",
+    "pydantic-ai-slim[openai]>=2.19.0",
 ]
 docs = [
     "jinja2",

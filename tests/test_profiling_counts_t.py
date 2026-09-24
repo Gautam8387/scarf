@@ -111,6 +111,24 @@ def test_write_counts_t_runs_as_standard_profile_stage(tmp_path):
     np.testing.assert_array_equal(reopened["RNA/countsT"][:], values.T)
 
 
+def test_write_counts_t_accounts_for_process_resident_memory(tmp_path):
+    root_path = tmp_path / "store.zarr"
+    _seed_counts(root_path, np.arange(24, dtype=np.uint32).reshape(6, 4))
+    resources = _resources().model_copy(update={"scarfMemoryBudget": 1024**2})
+
+    result = run_stage(
+        "writeCountsT",
+        nRows=6,
+        storeUri=str(root_path),
+        workflow=WorkflowParameters(),
+        resources=resources,
+        sampleIntervalSeconds=0.01,
+    )
+
+    assert result.status == "error"
+    assert "countsT" not in zarr.open_group(str(root_path), mode="r")["RNA"]
+
+
 def test_write_counts_t_forwards_storage_io(tmp_path):
     from scarf.storage.async_execution import reset_zarr_runtime_for_tests
 

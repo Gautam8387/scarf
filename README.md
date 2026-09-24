@@ -11,7 +11,11 @@
 </p>
 
 > [!IMPORTANT]
-> **Scarf 1.0 is coming soon.** Install the ![Latest release](https://img.shields.io/github/v/release/NygenAnalytics/scarf) release candidate with `uv pip install --prerelease allow "scarf[extra]"`. The current stable release on PyPI is `0.32.3`.
+> **Scarf 1.0 is coming soon.** Install the [![GitHub Pre-Release](https://img.shields.io/github/v/release/NygenAnalytics/scarf?include_prereleases&label=pre-release)](https://github.com/NygenAnalytics/scarf/releases)
+ release candidate with `uv pip install --prerelease allow "scarf[extra]"`. The current stable release on PyPI is `0.32.3`.
+
+
+
 
 Scarf is a Python framework for analysing single-cell RNA, ATAC, protein, and multi-omic data, from a few thousand cells to tens of millions.
 

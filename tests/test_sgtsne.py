@@ -7,19 +7,15 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from scipy.sparse import csr_matrix
+from scipy.io import mmread
 
 import scarf.embeddings.sgtsne as sgtsne_module
 
 
 def _graph() -> csr_matrix:
     return csr_matrix(
-        np.array(
-            [
-                [0.0, 1.0, 0.0],
-                [1.0, 0.0, 1.0],
-                [0.0, 1.0, 0.0],
-            ]
-        )
+        ([1.0, 1.0, 1.0, 1.0, 0.0], ([0, 1, 1, 2, 0], [1, 0, 2, 1, 2])),
+        shape=(3, 3),
     )
 
 
@@ -32,6 +28,7 @@ def test_run_sgtsne_validates_initial_embedding_shape():
         )
 
 
+@pytest.mark.parametrize("sparse_format", ["csr", "coo"])
 @pytest.mark.parametrize(
     ("verbose", "parallel", "expected_threads", "expected_runner"),
     [
@@ -46,13 +43,10 @@ def test_run_sgtsne_cli_backend_builds_command_and_cleans_temporary_files(
     parallel,
     expected_threads,
     expected_runner,
+    sparse_format,
 ):
-    graph = _graph()
+    graph = _graph().asformat(sparse_format)
     captured = {}
-
-    def fake_export(path, received_graph):
-        captured["graph"] = received_graph
-        Path(path).write_text("mock matrix", encoding="utf-8")
 
     def execute(command, runner):
         captured["command"] = command
@@ -60,12 +54,12 @@ def test_run_sgtsne_cli_backend_builds_command_and_cleans_temporary_files(
         arguments = shlex.split(command)
         initial_path = Path(arguments[arguments.index("-i") + 1])
         output_path = Path(arguments[arguments.index("-o") + 1])
+        captured["graph"] = mmread(arguments[-1])
         captured["initial_values"] = initial_path.read_text(encoding="utf-8")
         output_path.write_text("1 10\n2 20\n3 30\n", encoding="utf-8")
 
     monkeypatch.setattr(sgtsne_module.shutil, "which", lambda _name: "/mock/sgtsne")
     monkeypatch.setattr(sgtsne_module, "uuid4", lambda: "fixed")
-    monkeypatch.setattr(sgtsne_module, "export_knn_to_mtx", fake_export)
     monkeypatch.setattr(
         sgtsne_module,
         "system_call",
@@ -116,7 +110,10 @@ def test_run_sgtsne_cli_backend_builds_command_and_cleans_temporary_files(
         str((tmp_path / "fixed.mtx").resolve()),
     ]
     assert captured["runner"] == expected_runner
-    assert captured["graph"] is graph
+    assert captured["graph"].nnz == 4
+    assert np.all(captured["graph"].data > 0)
+    np.testing.assert_array_equal(captured["graph"].toarray(), graph.toarray())
+    assert graph.nnz == 5
     assert captured["initial_values"] == "0\n1\n2\n3\n4\n5"
     np.testing.assert_array_equal(
         embedding,
@@ -129,12 +126,8 @@ def test_run_sgtsne_cli_backend_cleans_inputs_when_output_is_missing(
     monkeypatch,
     tmp_path,
 ):
-    def fake_export(path, _graph):
-        Path(path).write_text("mock matrix", encoding="utf-8")
-
     monkeypatch.setattr(sgtsne_module.shutil, "which", lambda _name: "/mock/sgtsne")
     monkeypatch.setattr(sgtsne_module, "uuid4", lambda: "failed")
-    monkeypatch.setattr(sgtsne_module, "export_knn_to_mtx", fake_export)
     monkeypatch.setattr(sgtsne_module, "system_call", lambda _command: None)
 
     with pytest.raises(FileNotFoundError):
@@ -147,6 +140,7 @@ def test_run_sgtsne_cli_backend_cleans_inputs_when_output_is_missing(
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize("sparse_format", ["csr", "coo"])
 @pytest.mark.parametrize(
     ("parallel", "expected_warnings"),
     [
@@ -164,8 +158,9 @@ def test_run_sgtsne_python_backend_forwards_parameters(
     monkeypatch,
     parallel,
     expected_warnings,
+    sparse_format,
 ):
-    graph = _graph()
+    graph = _graph().asformat(sparse_format)
     initial = np.arange(6, dtype=np.float64).reshape(3, 2)
     captured = {}
     warnings = []
@@ -199,7 +194,10 @@ def test_run_sgtsne_python_backend_forwards_parameters(
         nthreads=12,
     )
 
-    assert captured["graph"] is graph
+    assert captured["graph"].nnz == 4
+    assert np.all(captured["graph"].data > 0)
+    np.testing.assert_array_equal(captured["graph"].toarray(), graph.toarray())
+    assert graph.nnz == 5
     assert captured["kwargs"] == {
         "y0": pytest.approx(initial.T),
         "d": 2,

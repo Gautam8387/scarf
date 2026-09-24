@@ -72,6 +72,11 @@ scarf/_version.py
 /performance_reconfig.md
 .env
 temp/
+cellxgene_cytebase/datasets/
+# Dev testing scard reports
+modal_scarf/
 notebook/
 PR/
-cellxgene_cytebase/datasets/
+scarf/agent/*.md
+.cache/
+review/

@@ -44,6 +44,7 @@ def _ref(
 def _model() -> ScaledPCAProjectionModel:
     return ScaledPCAProjectionModel(
         feature_means=np.array([0.0, 1.0]),
+        center=np.zeros_like(np.array([0.0, 1.0])),
         feature_scales=np.array([1.0, 2.0]),
         loadings=np.eye(2),
     )
@@ -83,6 +84,8 @@ def _reference(*, metadata: Mapping[str, Any] | None = None) -> MappingReference
         },
         reference_distance_quantiles=np.array([0.0, 1.0]),
         reference_distance_values=np.array([0.1, 0.2]),
+        payload_fingerprint="payload",
+        model_digest="model",
     )
 
 
@@ -992,25 +995,15 @@ def test_mapping_artifact_writer_contract_edges(monkeypatch) -> None:
     monkeypatch.setattr(mapping_artifact, "create_zarr_obj_array", create_object_array)
     monkeypatch.setattr(mapping_artifact, "_payload_fingerprint", lambda *_: "hash")
     monkeypatch.setattr(mapping_artifact, "array_geometry", lambda _array: None)
-    model = _model()
     root = _root()
-    with pytest.raises(ValueError, match="unsupported method"):
-        mapping_artifact.write_artifact_mapping_reference(
-            root.create_group("bad_method"),
-            model,
-            None,
-            np.array(["g0", "g1"]),
-            {"method": "invalid"},
-            np.array([0.0, 1.0]),
-            np.array([0.1, 0.2]),
-        )
-
     means = _array(root, "means", np.array([0.0, 1.0]))
     scales = _array(root, "scales", np.array([1.0, 2.0]))
+    center = _array(root, "center", np.zeros(2))
     loadings = _array(root, "loadings", np.eye(2))
     common = {
         "feature_means": means,
         "feature_scales": scales,
+        "center": center,
         "loadings": loadings,
         "feature_ids": np.array(["g0", "g1"]),
         "reference_distance_quantiles": np.array([0.0, 1.0]),
@@ -1089,12 +1082,14 @@ def test_mapping_artifact_source_validation_edges(monkeypatch) -> None:
     root = _root()
     means = _array(root, "means", np.zeros(2))
     scales = _array(root, "scales", np.ones(2))
+    center = _array(root, "center", np.zeros(2))
     loadings = _array(root, "loadings", np.eye(2))
 
     with pytest.raises(ValueError, match="incompatible dimensions"):
         mapping_artifact.validate_mapping_reference_sources(
             feature_means=means,
             feature_scales=scales,
+            center=center,
             loadings=means,
             symphony_sources=None,
         )
@@ -1102,6 +1097,7 @@ def test_mapping_artifact_source_validation_edges(monkeypatch) -> None:
         mapping_artifact.validate_mapping_reference_sources(
             feature_means=means,
             feature_scales=scales,
+            center=center,
             loadings=loadings,
             symphony_sources={"centroids": loadings},
         )
@@ -1109,6 +1105,7 @@ def test_mapping_artifact_source_validation_edges(monkeypatch) -> None:
         mapping_artifact.validate_mapping_reference_sources(
             feature_means=means,
             feature_scales=scales,
+            center=center,
             loadings=loadings,
             symphony_sources=_symphony_sources(
                 root,
@@ -1120,6 +1117,7 @@ def test_mapping_artifact_source_validation_edges(monkeypatch) -> None:
         mapping_artifact.validate_mapping_reference_sources(
             feature_means=means,
             feature_scales=scales,
+            center=center,
             loadings=loadings,
             symphony_sources=_symphony_sources(
                 root,
@@ -1133,6 +1131,7 @@ def test_mapping_artifact_source_validation_edges(monkeypatch) -> None:
         mapping_artifact.validate_mapping_reference_sources(
             feature_means=means,
             feature_scales=scales,
+            center=center,
             loadings=loadings,
             symphony_sources=invalid,
         )
@@ -1141,6 +1140,7 @@ def test_mapping_artifact_source_validation_edges(monkeypatch) -> None:
         mapping_artifact.mapping_reference_source_fingerprint(
             feature_means=means,
             feature_scales=scales,
+            center=center,
             loadings=loadings,
             symphony_sources={"centroids": loadings},
         )
@@ -1194,7 +1194,7 @@ def test_mapping_artifact_numeric_and_stored_array_helpers(monkeypatch) -> None:
     )
 
 
-def test_mapping_artifact_payload_matching_and_contract_helpers(monkeypatch) -> None:
+def test_mapping_artifact_contract_helpers(monkeypatch) -> None:
     monkeypatch.setattr(
         mapping_artifact,
         "as_zarr_array",
@@ -1202,60 +1202,6 @@ def test_mapping_artifact_payload_matching_and_contract_helpers(monkeypatch) -> 
     )
     monkeypatch.setattr(mapping_artifact, "array_geometry", lambda _array: None)
     root = _root()
-    model = _model()
-    metadata = {"method": "pca", "nested": {"value": 1}}
-    quantiles = np.array([0.0, 1.0])
-    distances = np.array([0.1, 0.2])
-    group = root.create_group("payload")
-    group.attrs["reference_metadata"] = metadata
-    group["feature_ids"] = _FakeArray(np.array(["g0", "g1"]))
-    group["feature_means"] = _FakeArray(model.feature_means)
-    group["feature_scales"] = _FakeArray(model.feature_scales)
-    group["loadings"] = _FakeArray(model.loadings)
-    group["reference_distance_quantiles"] = _FakeArray(quantiles)
-    group["reference_distance_values"] = _FakeArray(distances)
-    assert mapping_artifact.mapping_reference_payload_matches_expected(
-        group,
-        model=model,
-        symphony_state=None,
-        feature_ids=np.array(["g0", "g1"]),
-        metadata=metadata,
-        reference_distance_quantiles=quantiles,
-        reference_distance_values=distances,
-    )
-    del group["loadings"]
-    assert not mapping_artifact.mapping_reference_payload_matches_expected(
-        group,
-        model=model,
-        symphony_state=None,
-        feature_ids=np.array(["g0", "g1"]),
-        metadata=metadata,
-        reference_distance_quantiles=quantiles,
-        reference_distance_values=distances,
-    )
-
-    symphony_group = root.create_group("symphony_payload")
-    state = _symphony()
-    symphony_metadata = {"method": "symphony"}
-    symphony_group.attrs["reference_metadata"] = symphony_metadata
-    symphony_group["feature_ids"] = _FakeArray(np.array(["g0", "g1"]))
-    symphony_group["feature_means"] = _FakeArray(model.feature_means)
-    symphony_group["feature_scales"] = _FakeArray(model.feature_scales)
-    symphony_group["loadings"] = _FakeArray(model.loadings)
-    symphony_group["reference_distance_quantiles"] = _FakeArray(quantiles)
-    symphony_group["reference_distance_values"] = _FakeArray(distances)
-    for name in mapping_artifact._SYMPHONY_ARRAYS:
-        symphony_group[name] = _FakeArray(getattr(state, name))
-    assert mapping_artifact.mapping_reference_payload_matches_expected(
-        symphony_group,
-        model=model,
-        symphony_state=state,
-        feature_ids=np.array(["g0", "g1"]),
-        metadata=symphony_metadata,
-        reference_distance_quantiles=quantiles,
-        reference_distance_values=distances,
-    )
-
     status = SimpleNamespace(ref=_ref("neighbors", "1"), inputs={})
     with pytest.raises(ValueError, match="missing from the graph chain"):
         mapping_artifact._ref_from_input(status, "coordinates")
@@ -1275,21 +1221,3 @@ def test_mapping_artifact_payload_matching_and_contract_helpers(monkeypatch) -> 
         mapping_artifact._validate_payload_names(names_group, "pca")
     with pytest.raises(ValueError, match="metadata 'assay' is missing"):
         mapping_artifact._metadata_string({}, "assay")
-
-    monkeypatch.setattr(
-        mapping_artifact,
-        "mapping_reference_source_fingerprint",
-        lambda **_: "expected",
-    )
-    assert not mapping_artifact.mapping_reference_payload_matches_sources(
-        symphony_group,
-        feature_means=symphony_group["feature_means"],
-        feature_scales=symphony_group["feature_scales"],
-        loadings=symphony_group["loadings"],
-        symphony_sources={"centroids": symphony_group["centroids"]},
-        feature_ids=np.array(["g0", "g1"]),
-        metadata=symphony_metadata,
-        reference_distance_quantiles=quantiles,
-        reference_distance_values=distances,
-        expected_source_fingerprint="expected",
-    )

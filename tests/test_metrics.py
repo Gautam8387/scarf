@@ -247,6 +247,23 @@ def test_lisi_summary_default_perplexity_matches_floor_k_over_three():
     )
 
 
+@pytest.mark.parametrize("n_neighbors", [11, 90, 300])
+def test_lisi_entry_points_share_graph_width_default(n_neighbors):
+    rng = np.random.default_rng(18)
+    n_cells = n_neighbors + 1
+    indices = np.array([np.delete(np.arange(n_cells), i) for i in range(n_cells)])
+    distances = np.sort(rng.uniform(0.1, 3, indices.shape), axis=1)
+    labels = np.arange(n_cells) % 3
+    metadata = pd.DataFrame({"labels": labels})
+    actual = compute_lisi(distances, indices, metadata, ["labels"])[:, 0]
+    explicit = compute_lisi(
+        distances, indices, metadata, ["labels"], perplexity=n_neighbors // 3
+    )[:, 0]
+    np.testing.assert_array_equal(actual, explicit)
+    assert ilisi_knn(distances, indices, labels, scale=False) == np.median(actual)
+    assert clisi_knn(distances, indices, labels, scale=False) == np.median(actual)
+
+
 @pytest.mark.parametrize("metric", [ilisi_knn, clisi_knn])
 def test_lisi_summary_validates_categories_and_alignment(metric):
     distances, indices, labels = _uniform_self_free_knn()
@@ -347,18 +364,44 @@ def test_graph_connectivity_matches_materialized_symmetric_reference():
     ) == pytest.approx(1 / 3)
 
 
-def test_graph_connectivity_matches_chunked_zarr_and_chunk_sizes():
-    labels = np.array([0, 0, 0, 1, 1])
+@pytest.mark.parametrize("batch_rows", [1, 3, 10])
+@pytest.mark.parametrize("stored", [False, True])
+def test_graph_connectivity_ignores_zero_weight_bridges(batch_rows, stored):
+    labels = np.zeros(4, dtype=int)
     edges = np.array(
-        [[0, 1], [1, 0], [1, 2], [3, 4], [4, 3]],
+        [[0, 1], [1, 0], [2, 3], [3, 2], [1, 2]],
         dtype=np.uint64,
     )
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    z_edges = root.create_array("edges", data=edges, chunks=(2, 2))
-    expected = graph_connectivity(edges, labels, batch_rows=len(edges))
+    weights = np.array([1.0, 0.5, 0.25, 1.0, 0.0], dtype=np.float32)
+    if stored:
+        root = zarr.open_group(store=MemoryStore(), mode="w")
+        edges = root.create_array("edges", data=edges, chunks=(2, 2))
+        weights = root.create_array("weights", data=weights, chunks=(3,))
 
-    assert graph_connectivity(edges, labels, batch_rows=1) == pytest.approx(expected)
-    assert graph_connectivity(z_edges, labels, batch_rows=3) == pytest.approx(expected)
+    assert (
+        graph_connectivity(edges, labels, batch_rows=batch_rows, weights=weights) == 0.5
+    )
+    assert graph_connectivity(edges, labels, batch_rows=batch_rows) == 1.0
+
+
+@pytest.mark.parametrize(
+    ("weights", "error", "message"),
+    [
+        (np.ones((2, 1)), ValueError, "one value per edge"),
+        (np.ones(1), ValueError, "one value per edge"),
+        (np.array(["1", "0"]), TypeError, "real numbers"),
+        (np.array([1.0, np.nan]), ValueError, "finite and non-negative"),
+        (np.array([1.0, -1.0]), ValueError, "finite and non-negative"),
+    ],
+)
+def test_graph_connectivity_rejects_invalid_weights(weights, error, message):
+    with pytest.raises(error, match=message):
+        graph_connectivity(
+            np.array([[0, 1], [1, 0]]),
+            np.zeros(2),
+            batch_rows=1,
+            weights=weights,
+        )
 
 
 def test_graph_connectivity_validates_inputs():
@@ -1037,6 +1080,12 @@ def test_datastore_scib_metrics(datastore, connectivity_graph):
     assert lisi_ref.kind == "quality_metric"
     lisi = datastore.load_metric_lisi(lisi_ref)
     assert np.isfinite(lisi["metric_annotations"]).all()
+    width = datastore.zw[datastore.inspect_artifact(neighbors).path]["indices"].shape[1]
+    assert datastore.inspect_artifact(lisi_ref).parameters["perplexity"] == width // 3
+    assert (
+        datastore.metric_lisi(["metric_annotations"], neighbors, perplexity=width // 3)
+        == lisi_ref
+    )
 
     ilisi = datastore.metric_ilisi("metric_batches", neighbors)
     clisi = datastore.metric_clisi(

@@ -15,6 +15,16 @@ feature-selection artifact. `run_mapping` returns only the projection ref; loade
 methods, score readers, and plots require that ref plus the explicit reference. There is no named
 mapping registry, live `cell_key` routing, omitted-result lookup, or reference fallback.
 
+A handle is validated against its store in full when `get_mapping_reference` loads it. Every later
+operation that takes the handle checks the stored artifact record and its attributes against the
+handle, validates the cell selection against the current ordered cell IDs, and recomputes the digest
+of the handle's arrays. Repeated label transfer and score calls
+avoid reading the reference model payload, index and neighbours. The reference dataset fingerprint
+is read from the assay when it is stored there and otherwise recomputed for each operation. Reading
+reference cell metadata also validates the stored selection against the current ordered cell IDs.
+A handle whose arrays or references changed is rejected with `does not match its stored artifact`;
+reload it with `get_mapping_reference`.
+
 ```{eval-rst}
 .. autoclass:: scarf.MappingReference
     :members:

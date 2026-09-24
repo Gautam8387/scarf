@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 import zarr
-from zarr.storage import MemoryStore
+from zarr.storage import LocalStore, MemoryStore
 
 from scarf.readers import CSVReader
 from scarf.storage.count_matrix import CountMatrixPolicy
@@ -858,7 +858,7 @@ def test_h5adtozarr_propagates_band_write_failure(
     assert ("set", "RNA/counts/c/2/0") in store.ops
 
 
-def test_h5adtozarr_counts_materialized_csr_as_resident_memory(tmp_path):
+def test_h5adtozarr_spills_csc_with_bounded_resident_memory(tmp_path):
     from scarf.readers import H5adReader
     from scarf.writers import H5adToZarr
 
@@ -869,18 +869,53 @@ def test_h5adtozarr_counts_materialized_csr_as_resident_memory(tmp_path):
     reader = H5adReader(str(path), feature_name_key="feature_name")
     try:
         reader.infer_storage_dtype()
-        conversion_peak = reader.csc_conversion_peak_bytes()
         writer = H5adToZarr(
             reader,
             zarr_loc=MemoryStore(),
-            mem_budget=conversion_peak,
-            nthreads=4,
+            mem_budget=4 * 1024 * 1024,
+            nthreads=2,
+            policy=CountMatrixPolicy(unitBytes=64 * 1024, chunkBytes=16 * 1024),
         )
-        assert reader.materialized_csr_bytes() > 0
-        with pytest.raises(MemoryError, match="operation limit"):
-            writer.dump(batch_size=values.shape[0])
+        assert reader.materialized_csr_bytes() == (values.shape[0] + 1) * 8
+        writer.dump(batch_size=8)
+        np.testing.assert_array_equal(writer.z["RNA/counts"][:], values)
+        np.testing.assert_array_equal(writer.z["RNA/countsT"][:], values.T)
     finally:
-        reader.h5.close()
+        reader.close()
+
+
+@pytest.mark.parametrize("convert_clone", [False, True])
+def test_h5ad_clones_share_spill_until_the_last_reader_closes(tmp_path, convert_clone):
+    from pathlib import Path
+    from scarf.readers import H5adReader, inspect_h5ad
+
+    values = np.array([[1, 0], [0, 2], [3, 4]], dtype=np.uint16)
+    path = _write_h5ad(tmp_path / "shared_csc.h5ad", values, encoding="csc")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    if convert_clone:
+        parent = H5adReader.from_inspect(inspect_h5ad(path), temp_dir=scratch)
+        try:
+            reader = parent.open_clone()
+        finally:
+            parent.close()
+    else:
+        reader = H5adReader(
+            str(path), feature_name_key="feature_name", temp_dir=str(scratch)
+        )
+    reader.materialize_csc()
+    directory = Path(reader._convertedCsr._directory.name)
+    clone = reader.open_clone()
+    try:
+        assert directory.parent == scratch
+        reader.close()
+        assert directory.exists()
+        np.testing.assert_array_equal(next(clone.consume(3)).toarray(), values)
+    finally:
+        reader.close()
+        clone.close()
+    assert not directory.exists()
+    assert list(scratch.iterdir()) == []
 
 
 def test_loomtozarr(loom_reader, tmp_path):
@@ -922,6 +957,105 @@ def test_loomtozarr_preserves_exact_counts_and_transpose(tmp_path):
     np.testing.assert_array_equal(root["RNA/counts"][:], values)
     assert "countsT" in root["RNA"]
     assert root["RNA/countsT"].attrs["complete"] is True
+
+
+@pytest.mark.parametrize("batch_size", [0, -1])
+def test_loom_reader_and_writer_reject_nonpositive_batch_sizes(tmp_path, batch_size):
+    import h5py
+    from scarf.readers import LoomReader
+    from scarf.writers import LoomToZarr
+
+    path = tmp_path / "counts.loom"
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("matrix", data=np.ones((3, 2), dtype=np.uint16))
+    reader = LoomReader(str(path))
+    try:
+        writer = LoomToZarr(reader, MemoryStore(), nthreads=1)
+        with pytest.raises(ValueError, match="batch_size must be positive"):
+            list(reader.consume_dense(batch_size))
+        with pytest.raises(ValueError, match="batch_size must be positive"):
+            writer.dump(batch_size)
+        assert writer.z["RNA/counts"].nchunks_initialized == 0
+    finally:
+        reader.h5.close()
+
+
+def test_loom_import_rejects_budget_smaller_than_a_source_row(tmp_path):
+    import h5py
+    from scarf.readers import LoomReader
+    from scarf.writers import LoomToZarr
+
+    path = tmp_path / "counts.loom"
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("matrix", data=np.ones((3, 2), dtype=np.uint16))
+    reader = LoomReader(str(path))
+    try:
+        writer = LoomToZarr(reader, MemoryStore(), mem_budget=1, nthreads=1)
+        with pytest.raises(MemoryError, match="Loom import cannot fit"):
+            writer.dump(batch_size=1)
+        assert writer.z["RNA/counts"].nchunks_initialized == 0
+    finally:
+        reader.h5.close()
+
+
+def test_dense_loom_import_fits_a_bounded_memory_budget(tmp_path):
+    import h5py
+    from scarf.readers import LoomReader
+    from scarf.writers import LoomToZarr
+
+    values = np.ones((2000, 512), dtype=np.uint16)
+    values[::3, ::5] = 0
+    path = tmp_path / "dense.loom"
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("matrix", data=values.T, chunks=(128, 128))
+    reader = LoomReader(str(path), dtype="uint32")
+    try:
+        writer = LoomToZarr(
+            reader,
+            MemoryStore(),
+            mem_budget="8M",
+            nthreads=1,
+            policy=CountMatrixPolicy(unitBytes=256 * 1024, chunkBytes=64 * 1024),
+        )
+        writer.dump()
+        np.testing.assert_array_equal(writer.z["RNA/counts"][:], values)
+        np.testing.assert_array_equal(writer.z["RNA/countsT"][:], values.T)
+    finally:
+        reader.h5.close()
+
+
+@pytest.mark.parametrize("budget", ["10M", "32M"])
+def test_loom_admits_memory_for_incompressible_shard_writes(tmp_path, budget):
+    import h5py
+    from scarf.readers import LoomReader
+    from scarf.writers import LoomToZarr
+
+    values = np.random.default_rng(17).integers(
+        0, 2**32, size=(1024, 1024), dtype=np.uint32
+    )
+    path = tmp_path / "counts.loom"
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("matrix", data=values.T, chunks=(128, 128))
+    reader = LoomReader(str(path))
+    try:
+        writer = LoomToZarr(
+            reader,
+            str(tmp_path / "counts.zarr"),
+            mem_budget=budget,
+            nthreads=4,
+            profile="fast_local",
+            policy=CountMatrixPolicy(unitBytes=4 * 1024**2, chunkBytes=512 * 1024),
+        )
+        if budget == "10M":
+            with pytest.raises(MemoryError, match="Loom import cannot fit"):
+                writer.dump(batch_size=1)
+            assert writer.z["RNA/counts"].nchunks_initialized == 0
+        else:
+            writer.dump(batch_size=1)
+            np.testing.assert_array_equal(writer.z["RNA/counts"][:], values)
+            np.testing.assert_array_equal(writer.z["RNA/countsT"][:], values.T)
+    finally:
+        reader.h5.close()
 
 
 def test_sparsetozarr(tmp_path):
@@ -1065,6 +1199,79 @@ def test_csv_to_zarr_writes_extra_cell_columns_into_workspace(tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    "columns",
+    [
+        ["quality", "batch", "score"],
+        ["score", "batch", "quality"],
+        ["score", "quality"],
+    ],
+)
+@pytest.mark.parametrize("text_dtype", [None, object])
+def test_csv_to_zarr_preserves_metadata_column_order_and_counts(
+    tmp_path, columns, text_dtype
+):
+    path = tmp_path / "counts.csv"
+    path.write_text(
+        "cell,quality,g1,batch,score,g2,drop\n"
+        "c1,9007199254740993,1,batch_A,0.5,2,unused_A\n"
+        "c2,8,3,batch_B,1.5,4,unused_B\n"
+        "c3,9,5,batch_γ_longer,2.5,6,unused_C\n"
+    )
+    reader = CSVReader(
+        str(path),
+        id_column=0,
+        cell_data_cols=columns,
+        skip_cols=["drop"] + ([] if "batch" in columns else ["batch"]),
+        batch_size=2,
+        pandas_kwargs={"dtype": {"batch": text_dtype}} if text_dtype else None,
+    )
+    store = MemoryStore()
+    CSVtoZarr(reader, store, assay_name="RNA", nthreads=1).dump()
+
+    root = zarr.open_group(store=store, mode="r")
+    counts = np.array([[1, 2], [3, 4], [5, 6]])
+    np.testing.assert_array_equal(root["RNA/counts"][:], counts)
+    np.testing.assert_array_equal(root["RNA/countsT"][:], counts.T)
+    np.testing.assert_array_equal(root["cellData/ids"][:], ["c1", "c2", "c3"])
+    np.testing.assert_array_equal(root["cellData/quality"][:], [2**53 + 1, 8, 9])
+    np.testing.assert_array_equal(root["cellData/score"][:], [0.5, 1.5, 2.5])
+    if "batch" in columns:
+        np.testing.assert_array_equal(
+            root["cellData/batch"][:], ["batch_A", "batch_B", "batch_γ_longer"]
+        )
+
+
+def test_csv_to_zarr_preserves_supplied_cell_ids(tmp_path):
+    from scarf import DataStore
+
+    csv_path = tmp_path / "counts.csv"
+    csv_path.write_text("cell,g1,g2\ncell_A,1,2\ncell_B,3,4\n")
+    reader = CSVReader(str(csv_path), id_column=0, batch_size=1)
+    store = MemoryStore()
+
+    CSVtoZarr(reader, store, assay_name="RNA", nthreads=1).dump()
+
+    result = DataStore(store, min_features_per_cell=0, nthreads=1)
+    np.testing.assert_array_equal(result.cells.fetch_all("ids"), ["cell_A", "cell_B"])
+    np.testing.assert_array_equal(result.RNA.rawData.compute(), [[1, 2], [3, 4]])
+
+
+def test_csv_to_zarr_rejects_misaligned_ids_before_opening_destination(tmp_path):
+    csv_path = tmp_path / "counts.csv"
+    csv_path.write_text("cell,g1\ncell_A,1\ncell_B,2\n")
+    reader = CSVReader(str(csv_path), id_column=0)
+    reader.cellIds = np.array(["cell_A"])
+    store = MemoryStore()
+    root = zarr.open_group(store=store, mode="w")
+    root.create_array("existing", data=np.array([123]))
+
+    with pytest.raises(ValueError, match="cell IDs.*row count"):
+        CSVtoZarr(reader, store, assay_name="RNA", nthreads=1)
+
+    np.testing.assert_array_equal(root["existing"][:], [123])
+
+
 def test_subset_assay_zarr_selects_ordered_rows_and_columns():
     store = MemoryStore()
     root = zarr.open_group(store=store, mode="w")
@@ -1091,11 +1298,36 @@ def test_subset_assay_zarr_selects_ordered_rows_and_columns():
 
     selected = root["selected"]
     assert result is None
-    assert selected.dtype == np.dtype(np.uint32)
+    assert selected.dtype == np.dtype(np.uint16)
     np.testing.assert_array_equal(
         selected[:],
         values[np.ix_(cells, features)],
     )
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        np.array([[1.25, 4.5], [2.75, 3.25]], dtype=np.float32),
+        np.array([[1, 2**32 + 1], [2**40, 3]], dtype=np.uint64),
+    ],
+)
+def test_subset_assay_zarr_preserves_numeric_dtype_and_values(values):
+    store = MemoryStore()
+    root = zarr.open_group(store=store, mode="w")
+    root.create_array("source", data=values)
+
+    subset_assay_zarr(
+        store,
+        "source",
+        "selected",
+        cells_idx=np.array([1, 0]),
+        feat_idx=np.array([1, 0]),
+        nthreads=1,
+    )
+
+    assert root["selected"].dtype == values.dtype
+    np.testing.assert_array_equal(root["selected"][:], values[::-1, ::-1])
 
 
 def test_bed_to_sparse_array_bins_filters_and_drops_unknown_features(tmp_path):
@@ -1211,9 +1443,13 @@ def test_to_h5ad_preserves_counts_metadata_and_embeddings(export_assay_store, tm
         assert "RNA_UMAP2" not in h5["obs"]
 
 
+@pytest.mark.parametrize("skip_recalc", [True, False])
+@pytest.mark.parametrize("preserve_total", [True, False])
 def test_to_h5ad_recalculates_counts_without_mutating_qc_metadata(
     export_assay_store,
     tmp_path,
+    skip_recalc,
+    preserve_total,
 ):
     import h5py
     from scipy.sparse import csr_matrix
@@ -1222,11 +1458,16 @@ def test_to_h5ad_recalculates_counts_without_mutating_qc_metadata(
 
     assay = export_assay_store.RNA
     source_qc = np.full(assay.cells.N, 99, dtype=np.int64)
+    if preserve_total:
+        source_qc = np.count_nonzero(assay.rawData.compute(), axis=1)
+        donor = int(np.flatnonzero(source_qc)[0])
+        source_qc[donor] -= 1
+        source_qc[(donor + 1) % assay.cells.N] += 1
     assay.cells.insert("RNA_nFeatures", source_qc, overwrite=True)
     columns_before = set(assay.cells.columns)
 
     path = tmp_path / "recalculated_export.h5ad"
-    to_h5ad(assay, str(path), skip_recalc_nfeats=False)
+    to_h5ad(assay, str(path), skip_recalc_nfeats=skip_recalc)
 
     assert set(assay.cells.columns) == columns_before
     np.testing.assert_array_equal(
@@ -1236,11 +1477,39 @@ def test_to_h5ad_recalculates_counts_without_mutating_qc_metadata(
     expected = csr_matrix(assay.rawData.compute())
     with h5py.File(path, "r") as h5:
         shape = tuple(int(value) for value in h5["X"].attrs["shape"])
+        assert h5["X/data"].chunks == (65_536,)
+        assert h5["X/indices"].chunks == (65_536,)
         exported = csr_matrix(
             (h5["X/data"][:], h5["X/indices"][:], h5["X/indptr"][:]),
             shape=shape,
         )
         np.testing.assert_array_equal(exported.toarray(), expected.toarray())
+
+
+@pytest.mark.parametrize(("row_delta", "column_delta"), [(1, 0), (-1, 0), (0, 1)])
+def test_to_h5ad_rejects_count_metadata_shape_mismatches_and_closes_output(
+    export_assay_store, tmp_path, row_delta, column_delta
+):
+    import h5py
+
+    from scarf.matrix import ChunkedArray
+    from scarf.writers import to_h5ad
+
+    assay = export_assay_store.RNA
+    values = np.ones(
+        (assay.cells.N + row_delta, assay.feats.N + column_delta), dtype=np.uint16
+    )
+    group = zarr.group(store=MemoryStore())
+    assay.rawData = ChunkedArray(group.create_array("counts", data=values), nthreads=1)
+    path = tmp_path / "invalid.h5ad"
+    handles = h5py.h5f.get_obj_count()
+    with pytest.raises(
+        ValueError, match="Count matrix .* does not match assay metadata"
+    ):
+        to_h5ad(assay, str(path), nthreads=1)
+    assert h5py.h5f.get_obj_count() == handles
+    with h5py.File(path, "r") as handle:
+        assert "encoding-type" not in handle["X"].attrs
 
 
 def _completed_export_run():
@@ -1399,6 +1668,7 @@ def test_to_mtx_preserves_counts_barcodes_and_features(export_assay_store, tmp_p
     from scarf.writers import to_mtx
 
     assay = export_assay_store.RNA
+    assay.cells.insert("RNA_nFeatures", np.full(assay.cells.N, 99), overwrite=True)
     out_dir = tmp_path / "toy_mtx"
     to_mtx(assay, str(out_dir), compress=False)
 
@@ -1432,6 +1702,7 @@ def test_to_mtx_compress_writes_gzipped_matrix_market(export_assay_store, tmp_pa
     from scarf.writers import to_mtx
 
     assay = export_assay_store.RNA
+    assay.cells.insert("RNA_nFeatures", np.full(assay.cells.N, 99), overwrite=True)
     out_dir = tmp_path / "toy_mtx_gz"
     to_mtx(assay, str(out_dir), compress=True)
 
@@ -1446,6 +1717,32 @@ def test_to_mtx_compress_writes_gzipped_matrix_market(export_assay_store, tmp_pa
     with gzip.open(out_dir / "barcodes.tsv.gz", "rt") as handle:
         barcodes = [line.strip() for line in handle if line.strip()]
     assert barcodes == list(assay.cells.fetch_all("ids").astype(str))
+
+
+@pytest.mark.parametrize("compress", [False, True])
+def test_to_mtx_preserves_fractional_counts(tmp_path, compress):
+    from scipy.io import mmread
+    from scipy.sparse import csr_matrix
+
+    from scarf import DataStore
+    from scarf.writers import SparseToZarr, to_mtx
+
+    values = np.array([[1.5, 0, 2.75], [0, 3.25, 1]], dtype=np.float32)
+    store = MemoryStore()
+    SparseToZarr(
+        csr_matrix(values),
+        store,
+        cell_ids=["c1", "c2"],
+        feature_ids=["g1", "g2", "g3"],
+        nthreads=1,
+    ).dump()
+    dataset = DataStore(store, min_features_per_cell=0, nthreads=1)
+    out_dir = tmp_path / "fractional_counts"
+
+    to_mtx(dataset.RNA, str(out_dir), compress=compress)
+
+    filename = "matrix.mtx.gz" if compress else "matrix.mtx"
+    np.testing.assert_array_equal(mmread(out_dir / filename).toarray(), values.T)
 
 
 def test_zarr_subset(datastore, tmp_path):
@@ -1467,6 +1764,73 @@ def test_zarr_subset(datastore, tmp_path):
     subset_ds = DataStore(zarr_path, default_assay="RNA", assay_types={"RNA": "RNA"})
     assert subset_ds.RNA.rawDataT is not None
     assert subset_ds.RNA.rawDataT.shape == (root["RNA/counts"].shape[1], 4)
+
+
+@pytest.mark.parametrize("workspace", [None, "source"])
+@pytest.mark.parametrize(
+    ("assay_name", "assay_type"), [("expression", "RNA"), ("protein", "ADT")]
+)
+def test_zarr_subset_preserves_custom_assay_types(workspace, assay_name, assay_type):
+    from scipy.sparse import csr_matrix
+
+    from scarf import DataStore
+    from scarf.assay import ADTassay, RNAassay
+    from scarf.writers import SparseToZarr
+    from scarf.writers.counts_t import finalize_writer_counts_t
+
+    values = np.array([[1, 4, 9], [2, 20, 3], [12, 2, 2]], dtype=np.uint16)
+    source = MemoryStore()
+    writer = SparseToZarr(
+        csr_matrix(values),
+        source,
+        cell_ids=["c1", "c2", "c3"],
+        feature_ids=["f1", "f2", "f3"],
+        assay_name=assay_name,
+        workspace=workspace,
+        nthreads=1,
+    )
+    writer.dump()
+    finalize_writer_counts_t(
+        writer.z, assay_name, workspace, assay_type=assay_type, nthreads=1
+    )
+    dataset = DataStore(
+        source,
+        default_assay=assay_name,
+        workspace=workspace,
+        min_features_per_cell=0,
+        nthreads=1,
+    )
+    destination = MemoryStore()
+    out_workspace = "selected" if workspace is not None else None
+
+    SubsetZarr(
+        destination,
+        assays=[getattr(dataset, assay_name)],
+        in_workspace=workspace,
+        out_workspace=out_workspace,
+        cell_idx=np.array([0, 2]),
+        nthreads=1,
+    ).dump()
+
+    result = DataStore(
+        destination,
+        default_assay=assay_name,
+        workspace=out_workspace,
+        min_features_per_cell=0,
+        nthreads=1,
+    )
+    assert result.zw.attrs["assayTypes"][assay_name] == assay_type
+    assay = getattr(result, assay_name)
+    np.testing.assert_array_equal(assay.rawData.compute(), values[[0, 2]])
+    if assay_type == "RNA":
+        assert isinstance(assay, RNAassay)
+        np.testing.assert_array_equal(assay.rawDataT[:], values[[0, 2]].T)
+    else:
+        assert isinstance(assay, ADTassay)
+        selected = values[[0, 2]].astype(float)
+        expected = np.log1p(selected / np.exp(np.log1p(selected).mean(axis=0))[None, :])
+        np.testing.assert_allclose(assay.normed().compute(), expected, rtol=1e-6)
+        assert assay.rawDataT is None
 
 
 def test_zarr_subset_does_not_copy_source_pipeline_runs(
@@ -1550,6 +1914,16 @@ def test_subset_zarr_resolves_consistent_cell_key():
     )
 
 
+def test_subset_zarr_rejects_different_cell_masks():
+    subset = object.__new__(SubsetZarr)
+    subset.assays = [
+        _FakeAssay("RNA", 2, {"selected": np.array([True, False])}),
+        _FakeAssay("ATAC", 2, {"selected": np.array([False, True])}),
+    ]
+    with pytest.raises(ValueError):
+        subset._check_idx("selected", None)
+
+
 def test_subset_zarr_local_path_guard(tmp_path):
     existing = tmp_path / "out.zarr"
     existing.mkdir()
@@ -1560,28 +1934,76 @@ def test_subset_zarr_local_path_guard(tmp_path):
         SubsetZarr._check_files(subset, str(existing))
 
 
-def test_subset_zarr_store_skips_local_guard():
-    mem = MemoryStore()
+def test_subset_zarr_allows_empty_store():
     subset = object.__new__(SubsetZarr)
     subset.overFn = False
     subset.storage_options = None
-    root = SubsetZarr._check_files(subset, mem)
+    root = SubsetZarr._check_files(subset, MemoryStore())
     assert isinstance(root, zarr.Group)
 
 
-def test_subset_zarr_remote_uri_skips_local_guard(monkeypatch):
+@pytest.mark.parametrize("on_disk", [False, True])
+def test_subset_zarr_refuses_existing_store_without_overwrite(tmp_path, on_disk):
+    store = LocalStore(tmp_path / "existing.zarr") if on_disk else MemoryStore()
+    root = zarr.open_group(store=store, mode="w")
+    root.create_array("existing", data=np.array([123]))
+
+    with pytest.raises(ValueError, match="already exists"):
+        SubsetZarr(store, assays=[_FakeAssay("RNA", 2)], cell_idx=np.array([0]))
+
+    np.testing.assert_array_equal(root["existing"][:], [123])
+
+
+@pytest.mark.parametrize("invalid_assays", [False, True])
+def test_subset_zarr_validates_inputs_before_overwriting(invalid_assays):
+    store = MemoryStore()
+    root = zarr.open_group(store=store, mode="w")
+    root.create_array("existing", data=np.array([123]))
+
+    with pytest.raises(ValueError, match="actual assay objects|max value"):
+        SubsetZarr(
+            store,
+            assays=[object()] if invalid_assays else [_FakeAssay("RNA", 2)],
+            cell_idx=np.array([2]),
+            overwrite_existing_file=True,
+        )
+
+    np.testing.assert_array_equal(root["existing"][:], [123])
+
+
+def test_subset_zarr_remote_uri_checks_contents(monkeypatch):
     calls = []
+    store = MemoryStore()
+    root = zarr.open_group(store=store, mode="w")
+    root.create_array("existing", data=np.array([123]))
 
-    def fake_load_zarr(zarr_loc, mode, storage_options=None):
-        calls.append((zarr_loc, mode, storage_options))
-        return zarr.open_group(store=MemoryStore(), mode="w")
+    def make_store(location, storage_options=None, read_only=False):
+        calls.append((location, storage_options, read_only))
+        return store
 
-    monkeypatch.setattr("scarf.writers.subset.load_zarr", fake_load_zarr)
+    monkeypatch.setattr("scarf.storage.stores.make_store", make_store)
     subset = object.__new__(SubsetZarr)
     subset.overFn = False
     subset.storage_options = {"access_key_id": "key"}
-    SubsetZarr._check_files(subset, "s3://bucket/out.zarr")
-    assert calls == [("s3://bucket/out.zarr", "w", {"access_key_id": "key"})]
+    with pytest.raises(ValueError, match="already exists"):
+        SubsetZarr._check_files(subset, "s3://bucket/out.zarr")
+    assert calls == [("s3://bucket/out.zarr", {"access_key_id": "key"}, True)]
+    np.testing.assert_array_equal(root["existing"][:], [123])
+
+
+def test_subset_zarr_refuses_to_overwrite_after_probe_failure(monkeypatch):
+    store = MemoryStore()
+    root = zarr.open_group(store=store, mode="w")
+    root.create_array("existing", data=np.array([123]))
+
+    async def fail_probe(prefix):
+        raise OSError("Cannot inspect destination")
+
+    monkeypatch.setattr(store, "is_empty", fail_probe)
+    with pytest.raises(OSError, match="Cannot inspect destination"):
+        SubsetZarr(store, assays=[_FakeAssay("RNA", 2)], cell_idx=np.array([0]))
+
+    np.testing.assert_array_equal(root["existing"][:], [123])
 
 
 def test_crtozarr_forwards_storage_options(monkeypatch):
@@ -1935,21 +2357,14 @@ def test_h5ad_process_windows_run_in_the_parent_process(tmp_path) -> None:
         reader.h5.close()
 
 
-def test_source_assay_types_tolerates_missing_parent() -> None:
+def test_source_assay_types_reads_artifact_root() -> None:
     from types import SimpleNamespace
 
     from scarf.writers.subset import _source_assay_types
 
-    class _Broken:
-        @property
-        def parent(self):
-            raise RuntimeError("no parent")
-
-    assert _source_assay_types(SimpleNamespace(z=_Broken())) == {}
-    assert _source_assay_types(SimpleNamespace(z=SimpleNamespace(parent=None))) == {}
-    parent = SimpleNamespace(attrs={"assayTypes": ["RNA"]})
-    assert _source_assay_types(SimpleNamespace(z=SimpleNamespace(parent=parent))) == {}
+    root = SimpleNamespace(attrs={})
+    assert _source_assay_types(SimpleNamespace(_artifact_root=root)) == {}
+    untyped = SimpleNamespace(attrs={"assayTypes": ["RNA"]})
+    assert _source_assay_types(SimpleNamespace(_artifact_root=untyped)) == {}
     typed = SimpleNamespace(attrs={"assayTypes": {"RNA": "RNA"}})
-    assert _source_assay_types(SimpleNamespace(z=SimpleNamespace(parent=typed))) == {
-        "RNA": "RNA"
-    }
+    assert _source_assay_types(SimpleNamespace(_artifact_root=typed)) == {"RNA": "RNA"}

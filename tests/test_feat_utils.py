@@ -70,116 +70,132 @@ def test_fit_lowess_fixed_regression():
     np.testing.assert_allclose(corrected, expected, rtol=1e-12, atol=1e-12)
 
 
-def test_fit_lowess_adaptive_balances_bins_and_interpolates(monkeypatch):
-    rng = np.random.default_rng(3)
-    mean_expr = np.exp(rng.exponential(1.0, 101))
-    variance = mean_expr**1.2 * np.exp(rng.normal(0, 0.1, len(mean_expr)))
-    captured: dict[str, np.ndarray] = {}
+def test_fit_lowess_rejects_unconverged_adaptive_fit(monkeypatch):
+    import scipy.optimize
 
-    def fake_lowess(
-        endog,
-        exog,
-        *,
-        return_sorted,
-        frac,
-        it,
-    ):
-        captured["endog"] = np.asarray(endog)
-        captured["exog"] = np.asarray(exog)
-        return np.asarray(exog)
+    minimize = scipy.optimize.minimize
 
-    monkeypatch.setattr(
-        "statsmodels.nonparametric.smoothers_lowess.lowess",
-        fake_lowess,
+    def stop_after_one_iteration(*args, **kwargs):
+        kwargs["options"] = dict(kwargs["options"], maxiter=1)
+        return minimize(*args, **kwargs)
+
+    monkeypatch.setattr(scipy.optimize, "minimize", stop_after_one_iteration)
+    means = np.geomspace(1, 100, 30)
+    variances = means**1.4 * np.exp(np.random.default_rng(7).normal(0, 0.2, 30))
+    with pytest.raises(ValueError, match="Adaptive variance trend fit failed"):
+        fit_lowess(means, variances, n_bins=10, lowess_frac=0.5)
+
+
+def test_fit_lowess_rejects_unrepresentable_adaptive_scores():
+    variance = np.array([np.nextafter(0.0, 1.0), 1.0, np.finfo(float).max])
+    with pytest.raises(ValueError, match="nonfinite or zero scores"):
+        fit_lowess(np.ones(3), variance, n_bins=10, lowess_frac=0.5)
+
+
+@pytest.mark.parametrize("trend", ["power", "curved", "steep_tail"])
+@pytest.mark.parametrize(
+    ("n_genes", "seed"), [(2_000, 17), (5_000, 23), (20_000, 17), (20_000, 23)]
+)
+def test_fit_lowess_adaptive_removes_trend_through_sparse_tails(trend, n_genes, seed):
+    mean_expr = np.exp(np.random.default_rng(seed).normal(0, 2, n_genes))
+    if trend == "power":
+        variance = mean_expr**1.4
+    elif trend == "curved":
+        variance = mean_expr + mean_expr**2
+    else:
+        variance = mean_expr**1.4 * np.sqrt(1 + (mean_expr / 100) ** 2)
+
+    corrected = fit_lowess(mean_expr, variance, n_bins=200, lowess_frac=0.1)
+
+    np.testing.assert_allclose(corrected, 1.0, rtol=0.05)
+
+
+def test_fit_lowess_adaptive_calibrates_the_lower_quartile():
+    means = np.repeat(np.geomspace(0.01, 100, 40), 9)
+    offsets = np.tile(np.arange(-4, 5) / 10, 40)
+    variance = means**1.4 * np.exp(offsets)
+
+    corrected = fit_lowess(means, variance, n_bins=200, lowess_frac=0.1)
+
+    np.testing.assert_allclose(corrected, np.exp(offsets + 0.2), rtol=0.005)
+
+
+@pytest.mark.parametrize("multiplier", [4.0, 1e-12])
+def test_fit_lowess_adaptive_protects_curved_tails_from_isolated_outliers(
+    multiplier,
+):
+    means = np.sort(np.exp(np.random.default_rng(41).normal(0, 2, 5_000)))
+    variance = means**1.4 * np.sqrt(1 + (means / 100) ** 2)
+    baseline = fit_lowess(means, variance, n_bins=200, lowess_frac=0.1)
+    variance[-1] *= multiplier
+
+    corrected = fit_lowess(means, variance, n_bins=200, lowess_frac=0.1)
+
+    np.testing.assert_allclose(corrected[-1] / baseline[-1], multiplier, rtol=0.05)
+    np.testing.assert_allclose(corrected[:-1], baseline[:-1], rtol=0.05)
+
+
+@pytest.mark.parametrize("seed", [9, 12, 14])
+def test_fit_lowess_adaptive_bounds_error_with_sparse_expression_support(seed):
+    means = np.exp(np.random.default_rng(seed).normal(0, 2, 2_000))
+    variance = means**1.4 * np.sqrt(1 + (means / 100) ** 2)
+
+    corrected = fit_lowess(means, variance, n_bins=200, lowess_frac=0.1)
+
+    np.testing.assert_allclose(corrected, 1.0, rtol=0.2)
+
+
+@pytest.mark.parametrize("lowess_frac", [0.0, 0.1])
+@pytest.mark.parametrize(
+    "mean_expr",
+    [
+        np.ones(80),
+        np.repeat([1.0, 2.0, 4.0], [30, 25, 25]),
+        np.repeat([1.0, 10.0], [70, 70]),
+        np.concatenate([np.ones(300), np.geomspace(2.0, 100.0, 70)]),
+    ],
+    ids=["all_tied", "three_means", "two_large_ties", "large_tie_and_tail"],
+)
+def test_fit_lowess_adaptive_preserves_variance_signal_with_tied_means(
+    mean_expr, lowess_frac
+):
+    variance = mean_expr**1.4
+    variance[-1] *= 4
+    expected = np.ones(len(mean_expr))
+    expected[-1] = 4
+
+    corrected = fit_lowess(mean_expr, variance, n_bins=200, lowess_frac=lowess_frac)
+
+    np.testing.assert_allclose(corrected, expected, rtol=0.01)
+
+
+@pytest.mark.parametrize("position", [0, -1, -25])
+def test_fit_lowess_adaptive_preserves_injected_variance_signal(position):
+    mean_expr = np.sort(np.exp(np.random.default_rng(17).normal(0, 2, 20_000)))
+    variance = mean_expr**1.4
+    variance[position] *= 4
+    expected = np.ones(len(mean_expr))
+    expected[position] = 4
+
+    corrected = fit_lowess(mean_expr, variance, n_bins=200, lowess_frac=0.1)
+
+    np.testing.assert_allclose(corrected, expected, rtol=0.05)
+
+
+def test_fit_lowess_adaptive_is_invariant_to_order_and_units():
+    rng = np.random.default_rng(23)
+    mean_expr = np.exp(rng.normal(0, 2, 2000))
+    variance = (mean_expr + mean_expr**2) * np.exp(rng.normal(0, 0.1, 2000))
+    order = rng.permutation(len(mean_expr))
+
+    corrected = fit_lowess(mean_expr, variance, n_bins=200, lowess_frac=0.1)
+    permuted = fit_lowess(
+        mean_expr[order], variance[order], n_bins=200, lowess_frac=0.1
     )
-    corrected = fit_lowess(
-        mean_expr,
-        variance,
-        n_bins=4,
-        lowess_frac=0.4,
-        bin_strategy="adaptive",
-    )
+    scaled = fit_lowess(mean_expr * 1000, variance * 1e6, n_bins=200, lowess_frac=0.1)
 
-    order = np.argsort(np.log(mean_expr), kind="stable")
-    sorted_means = np.log(mean_expr)[order]
-    sorted_variances = np.log(variance)[order]
-    bins = (slice(0, 26), slice(26, 51), slice(51, 76), slice(76, 101))
-    expected_x = np.array([np.median(sorted_means[idx]) for idx in bins])
-    expected_y = np.array([np.quantile(sorted_variances[idx], 0.1) for idx in bins])
-
-    np.testing.assert_allclose(captured["exog"], expected_x)
-    np.testing.assert_allclose(captured["endog"], expected_y)
-    expected_correction = np.interp(np.log(mean_expr), expected_x, expected_x)
-    np.testing.assert_allclose(
-        corrected,
-        np.exp(np.log(variance) - expected_correction),
-    )
-
-
-def test_fit_lowess_adaptive_keeps_equal_means_in_one_bin(monkeypatch):
-    mean_expr = np.repeat([1.0, 2.0, 4.0], [30, 25, 25])
-    variance = np.linspace(1.0, 3.0, len(mean_expr))
-    captured: dict[str, np.ndarray] = {}
-
-    def fake_lowess(
-        endog,
-        exog,
-        *,
-        return_sorted,
-        frac,
-        it,
-    ):
-        captured["exog"] = np.asarray(exog)
-        return np.asarray(endog)
-
-    monkeypatch.setattr(
-        "statsmodels.nonparametric.smoothers_lowess.lowess",
-        fake_lowess,
-    )
-    corrected = fit_lowess(
-        mean_expr,
-        variance,
-        n_bins=3,
-        lowess_frac=0.5,
-        bin_strategy="adaptive",
-    )
-
-    np.testing.assert_allclose(captured["exog"], np.log([1.0, 2.0, 4.0]))
-    assert np.all(np.isfinite(corrected))
-    assert np.all(corrected > 0)
-
-
-def test_fit_lowess_adaptive_reduces_bins_after_large_tie(monkeypatch):
-    mean_expr = np.concatenate([np.ones(30), np.geomspace(2.0, 100.0, 70)])
-    variance = mean_expr**1.2
-    captured: dict[str, np.ndarray] = {}
-
-    def fake_lowess(
-        endog,
-        exog,
-        *,
-        return_sorted,
-        frac,
-        it,
-    ):
-        captured["exog"] = np.asarray(exog)
-        return np.asarray(endog)
-
-    monkeypatch.setattr(
-        "statsmodels.nonparametric.smoothers_lowess.lowess",
-        fake_lowess,
-    )
-    corrected = fit_lowess(
-        mean_expr,
-        variance,
-        n_bins=4,
-        lowess_frac=0.5,
-        bin_strategy="adaptive",
-    )
-
-    assert len(captured["exog"]) == 3
-    assert captured["exog"][0] == 0
-    assert np.all(np.isfinite(corrected))
+    np.testing.assert_allclose(permuted, corrected[order], rtol=1e-7)
+    np.testing.assert_allclose(scaled, corrected, rtol=1e-7)
 
 
 def test_fit_lowess_adaptive_resists_single_low_variance_outlier():
@@ -210,8 +226,8 @@ def test_fit_lowess_adaptive_resists_single_low_variance_outlier():
 
 
 def test_fit_lowess_adaptive_handles_small_and_invalid_inputs():
-    mean_expr = np.array([1.0, 2.0, 3.0, 4.0, np.nan, 0.0])
-    variance = np.array([1.0, 0.0, -1.0, 4.0, 2.0, 2.0])
+    mean_expr = np.array([1.0, 2.0, 3.0, 4.0, np.nan, 0.0, 8.0])
+    variance = np.array([1.0, 0.0, -1.0, 4.0, 2.0, 2.0, 16.0])
 
     corrected = fit_lowess(
         mean_expr,
@@ -222,7 +238,7 @@ def test_fit_lowess_adaptive_handles_small_and_invalid_inputs():
     )
 
     assert np.all(np.isfinite(corrected))
-    assert np.all(corrected[[0, 3]] > 0)
+    assert np.all(corrected[[0, 3, 6]] > 0)
     np.testing.assert_array_equal(corrected[[1, 2, 4, 5]], np.zeros(4))
     np.testing.assert_array_equal(
         fit_lowess(
@@ -282,6 +298,17 @@ def test_fit_lowess_adaptive_handles_small_and_invalid_inputs():
             n_bins=20,
             lowess_frac=0.1,
             bin_strategy="unknown",
+        )
+
+
+@pytest.mark.parametrize("n_genes", [1, 2])
+def test_fit_lowess_adaptive_rejects_insufficient_valid_genes(n_genes):
+    with pytest.raises(ValueError, match="At least three genes"):
+        fit_lowess(
+            np.r_[np.arange(1, n_genes + 1), np.nan, 0],
+            np.ones(n_genes + 2),
+            n_bins=200,
+            lowess_frac=0.1,
         )
 
 
@@ -348,6 +375,29 @@ def _hvg_kwargs(**overrides):
     return values
 
 
+@pytest.mark.parametrize(
+    ("names", "blacklist", "expected"),
+    [
+        (["RPS3", "RPSX", "GENE"], r"^RPS\d+$", [False, True, True]),
+        (["g_a", "g-", "GENE"], r"^g_\w+$", [False, True, True]),
+        (["x y", "xy", "GENE"], r"^x\sy$", [False, True, True]),
+        (["MT-CO1", "mt-Co1", "GENE"], r"(?-i:^MT-)", [False, True, True]),
+        (["MT-CO1", "mt-Co1", "GENE"], r"(?i)^mt-", [False, False, True]),
+    ],
+)
+def test_hvg_blacklist_preserves_regex_semantics(names, blacklist, expected):
+    selected = select_highly_variable_features(
+        corrected_variance=np.array([3.0, 2.0, 1.0]),
+        normalized_cell_counts=np.full(3, 5),
+        mean_nonzero=np.ones(3),
+        active_features=np.ones(3, dtype=bool),
+        feature_names=np.array(names),
+        top_n=3,
+        **_hvg_kwargs(blacklist=blacklist),
+    )
+    np.testing.assert_array_equal(selected, expected)
+
+
 def test_hvg_exact_top_n_selects_all_when_top_n_equals_valid_count():
     selected = select_highly_variable_features(
         corrected_variance=np.array([3.0, 1.0, 2.0]),
@@ -404,6 +454,45 @@ def test_binned_sampling_excludes_query_genes():
     assert len(controls) > 0
     assert set(controls).isdisjoint(query_genes)
     assert all(name in gene_names for name in controls)
+
+
+def test_binned_sampling_advances_between_bins_without_changing_global_rng():
+    values = pd.Series(np.arange(60), index=[f"g{i}" for i in range(60)])
+    targets = ["g0", "g9", "g19", "g29", "g39", "g49", "g59"]
+    before = np.random.get_state()
+    controls = binned_sampling(values, targets, ctrl_size=3, n_bins=7, rand_seed=4466)
+    after = np.random.get_state()
+
+    offsets = [
+        tuple(i for i in range(10) if f"g{start + i}" in controls)
+        for start in (9, 19, 29, 39, 49)
+    ]
+    assert len(set(offsets)) == 5
+    assert controls == binned_sampling(values, targets, 3, 7, 4466)
+    assert set(controls).isdisjoint(targets)
+    assert before[0] == after[0]
+    np.testing.assert_array_equal(before[1], after[1])
+    assert before[2:] == after[2:]
+
+
+@pytest.mark.parametrize(
+    ("ctrl_size", "n_bins", "error", "message"),
+    [
+        (True, 4, TypeError, "ctrl_size must be a positive integer"),
+        (1.5, 4, TypeError, "ctrl_size must be a positive integer"),
+        (0, 4, ValueError, "ctrl_size must be a positive integer"),
+        (2, True, TypeError, "n_bins must be an integer greater than one"),
+        (2, 1, ValueError, "n_bins must be greater than one"),
+        (2, 20, ValueError, "n_bins is too large"),
+    ],
+)
+def test_binned_sampling_rejects_invalid_controls_and_bins(
+    ctrl_size, n_bins, error, message
+):
+    values = pd.Series(np.arange(6), index=[f"g{i}" for i in range(6)])
+
+    with pytest.raises(error, match=message):
+        binned_sampling(values, ["g0"], ctrl_size, n_bins, 4466)
 
 
 def test_hto_negative_binomial_cutoff_is_unshifted(monkeypatch):

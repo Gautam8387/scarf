@@ -91,9 +91,10 @@ class BaseDataStore:
                        when DataStore loads a Zarr file for the first time
         min_features_per_cell: Minimum number of non-zero features in a cell. If lower than this then the cell
                                will be filtered out.
-        mito_pattern: Regex pattern to capture mitochondrial genes. When None, uses ``MT-|mt``.
-        ribo_pattern: Regex pattern to capture ribosomal genes. When None, uses
-                      ``RPS|RPL|MRPS|MRPL``.
+        mito_pattern: Pattern for missing mitochondrial percentages. None preserves existing values
+                      and uses ``^MT-`` for new values. Explicit patterns must match existing provenance.
+        ribo_pattern: Pattern for missing ribosomal percentages. None preserves existing values
+                      and uses ``RPS|RPL|MRPS|MRPL`` for new values.
         zarr_mode: For read-write mode use ``r+`` or for read-only use ``r``.
                    (Default value: ``r+``)
         workspace: Workspace name within the Zarr store (None for legacy single-workspace layout).
@@ -425,9 +426,7 @@ class BaseDataStore:
             "assay_types={'assay1': 'RNA', 'assay2': 'ADT'} "
             "Just replace with actual assay names instead of assay1 and assay2"
         )
-        if "assayTypes" not in self.zw.attrs:
-            self.zw.attrs["assayTypes"] = {}
-        raw_types = self.zw.attrs["assayTypes"]
+        raw_types = self.zw.attrs.get("assayTypes", {})
         z_attrs: dict[str, str] = (
             {str(k): str(v) for k, v in raw_types.items()}
             if isinstance(raw_types, dict)
@@ -481,7 +480,7 @@ class BaseDataStore:
                     storageIo=self.storageIo,
                 )
             setattr(self, i, loaded_assay)
-        if self.zw.attrs["assayTypes"] != z_attrs:
+        if not self.zw.read_only and self.zw.attrs.get("assayTypes") != z_attrs:
             self.zw.attrs["assayTypes"] = z_attrs
         return None
 
@@ -644,6 +643,8 @@ class BaseDataStore:
 
         Returns:
         """
+        if self.zw.read_only:
+            return
         for from_assay in self.assay_names:
             assay = self._get_assay(from_assay)
 
@@ -654,30 +655,45 @@ class BaseDataStore:
             compute_n_cells = assay._deferred_feature_props
 
             percent_feature_indices: dict[str, np.ndarray] = {}
+            percent_feature_provenance: dict[str, tuple[str, str]] = {}
             if isinstance(assay, RNAassay):
-                if mito_pattern != "":
+                percent_mito_name = from_assay + "_percentMito"
+                if mito_pattern != "" and not (
+                    mito_pattern is None and percent_mito_name in self.cells.columns
+                ):
                     resolved_mito_pattern = (
-                        "MT-|mt" if mito_pattern is None else mito_pattern
+                        "^MT-" if mito_pattern is None else mito_pattern
                     )
-                    percent_mito_name = from_assay + "_percentMito"
-                    mito_idx = assay._plan_percent_feature(
+                    mito_plan = assay._plan_percent_feature(
                         resolved_mito_pattern,
                         percent_mito_name,
                     )
-                    if mito_idx is not None:
+                    if mito_plan is not None:
+                        mito_idx, fingerprint = mito_plan
                         percent_feature_indices[percent_mito_name] = mito_idx
+                        percent_feature_provenance[percent_mito_name] = (
+                            resolved_mito_pattern,
+                            fingerprint,
+                        )
 
-                if ribo_pattern != "":
+                percent_ribo_name = from_assay + "_percentRibo"
+                if ribo_pattern != "" and not (
+                    ribo_pattern is None and percent_ribo_name in self.cells.columns
+                ):
                     resolved_ribo_pattern = (
                         "RPS|RPL|MRPS|MRPL" if ribo_pattern is None else ribo_pattern
                     )
-                    percent_ribo_name = from_assay + "_percentRibo"
-                    ribo_idx = assay._plan_percent_feature(
+                    ribo_plan = assay._plan_percent_feature(
                         resolved_ribo_pattern,
                         percent_ribo_name,
                     )
-                    if ribo_idx is not None:
+                    if ribo_plan is not None:
+                        ribo_idx, fingerprint = ribo_plan
                         percent_feature_indices[percent_ribo_name] = ribo_idx
+                        percent_feature_provenance[percent_ribo_name] = (
+                            resolved_ribo_pattern,
+                            fingerprint,
+                        )
 
             stats: dict[str, np.ndarray] = {}
             if (
@@ -721,9 +737,12 @@ class BaseDataStore:
                 )
 
             for name in percent_feature_indices:
+                pattern, fingerprint = percent_feature_provenance[name]
                 assay._write_percent_feature(
                     name,
                     stats[name],
+                    feat_pattern=pattern,
+                    feature_fingerprint=fingerprint,
                     n_counts=computed_n_counts,
                 )
 
