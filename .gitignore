@@ -72,3 +72,6 @@ scarf/_version.py
 /performance_reconfig.md
 .env
 temp/
+notebook/
+PR/
+cellxgene_cytebase/datasets/
