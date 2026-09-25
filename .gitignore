@@ -81,3 +81,4 @@ scarf/agent/*.md
 .cache/
 review/
 scarf/cytebase/collection/collections.json
+scarf/cytebase/README.md

@@ -2,14 +2,29 @@
 
 import json
 import re
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
+
+from zarr.storage import FsspecStore
 
 from ._storage import Bucket, dataset_prefix, json_bytes
 
 if TYPE_CHECKING:
     from scarf import DataStore
+
+
+class _HfReadStore(FsspecStore):
+    """Filter repeated HF cache entries before Zarr traverses child metadata."""
+
+    async def list_dir(self, prefix: str) -> AsyncIterator[str]:
+        # Concurrent HF listings can append the same paths to its directory cache.
+        seen: set[str] = set()
+        async for name in super().list_dir(prefix):
+            if name not in seen:
+                seen.add(name)
+                yield name
 
 
 def _identity(storage: Bucket, cytebase_id: str) -> dict:
@@ -144,13 +159,23 @@ def open_dataset(
 
     options = _options(datastore_options, mode="r")
     identity = _identity(storage, cytebase_id)
-    datastore = DataStore(
+    storage_options = {"token": storage.token, "skip_instance_cache": True}
+    store = _HfReadStore.from_url(
         identity["zarrUri"],
-        zarr_mode="r",
-        storage_options={"token": storage.token, "skip_instance_cache": True},
-        zarrProfile="cloud",
-        **options,
+        read_only=True,
+        storage_options=storage_options,
     )
+    try:
+        datastore = DataStore(
+            store,
+            zarr_mode="r",
+            storage_options=storage_options,
+            zarrProfile="cloud",
+            **options,
+        )
+    except Exception:
+        store.close()
+        raise
     try:
         _verify_opened(datastore, identity)
         _assert_unchanged(storage, cytebase_id, identity)

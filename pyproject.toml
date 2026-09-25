@@ -60,6 +60,7 @@ dependencies = [
 cytebase = [
     "duckdb>=1.5.5",
     "matplotlib>=3.9",
+    "pytz>=2026.3.post1",
     "seaborn>=0.13",
 ]
 agent = [
@@ -170,7 +171,7 @@ badge-format = "svg"
 [dependency-groups]
 cytebase = [
     "modal>=1.5.2",
-    "fastapi",
+    "fastapi>=0.141.1",
     "httpx>=0.28.1",
     "pydantic>=2.13.4",
     "duckdb>=1.5.5",

@@ -3526,6 +3526,7 @@ agent = [
 cytebase = [
     { name = "duckdb" },
     { name = "matplotlib" },
+    { name = "pytz" },
     { name = "seaborn" },
 ]
 docs = [
@@ -3623,6 +3624,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'test'", specifier = ">=7.0" },
     { name = "pytest-cov", marker = "extra == 'test'", specifier = ">=4" },
     { name = "pytest-xdist", marker = "extra == 'test'", specifier = ">=3" },
+    { name = "pytz", marker = "extra == 'cytebase'", specifier = ">=2026.3.post1" },
     { name = "rdata", marker = "extra == 'test'", specifier = ">=1.1.0" },
     { name = "scikit-learn", specifier = ">=1.5" },
     { name = "scikit-network", marker = "extra == 'test'", specifier = ">=0.33.1" },
@@ -3653,7 +3655,7 @@ provides-extras = ["cytebase", "agent", "extra", "test", "docs"]
 [package.metadata.requires-dev]
 cytebase = [
     { name = "duckdb", specifier = ">=1.5.5" },
-    { name = "fastapi" },
+    { name = "fastapi", specifier = ">=0.141.1" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "modal", specifier = ">=1.5.2" },
     { name = "natsort", specifier = ">=8.4.0" },
