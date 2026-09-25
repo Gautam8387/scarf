@@ -726,7 +726,7 @@ def convert_local(
             assay_name="RNA",
             profile="cloud",
             nthreads=8,
-            mem_budget='12G',
+            mem_budget="12G",
         )
         imported = writer.dump()
     finally:
@@ -741,7 +741,7 @@ def convert_local(
         default_assay="RNA",
         min_features_per_cell=-1,
         nthreads=8,
-        mem_budget='12G',
+        mem_budget="12G",
     )
     try:
         record["qcSummary"] = datastore.summary().to_dict()

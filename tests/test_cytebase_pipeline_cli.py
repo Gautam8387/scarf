@@ -230,6 +230,28 @@ def test_collection_ids_prints_public_collections(monkeypatch, capsys, catalog_m
     assert _run(monkeypatch, capsys, "collection-ids") == {"collectionIds": ids}
 
 
+def test_command_diagnostics_use_stderr(monkeypatch, capsys, catalog_module):
+    from scarf.utils import logger
+
+    def list_collection_ids():
+        logger.info("Fetching collection metadata")
+        print("Resolving collection previews")
+        return [COLLECTION_ID]
+
+    monkeypatch.setattr(catalog_module, "list_collection_ids", list_collection_ids)
+    # Exercise stdout logging even when the test session silences INFO logs.
+    handler = logger.add(lambda message: sys.stdout.write(str(message)), level="INFO")
+    try:
+        _set_argv(monkeypatch, "collection-ids")
+        main()
+    finally:
+        logger.remove(handler)
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"collectionIds": [COLLECTION_ID]}
+    assert "Fetching collection metadata" in captured.err
+    assert "Resolving collection previews" in captured.err
+
+
 @pytest.mark.parametrize(
     ("bucket_args", "bucket"),
     [

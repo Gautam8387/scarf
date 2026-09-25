@@ -2,6 +2,8 @@
 
 import argparse
 import json
+import sys
+from contextlib import redirect_stdout
 from pathlib import Path
 
 
@@ -34,6 +36,13 @@ def main() -> None:
     reset.add_argument("--env", help="Modal environment containing the deployment")
     args = parser.parse_args()
 
+    # Keep stdout machine-readable while preserving command diagnostics.
+    with redirect_stdout(sys.stderr):
+        result = _run_command(args)
+    print(json.dumps(result, indent=2, allow_nan=False))
+
+
+def _run_command(args: argparse.Namespace) -> dict:
     if args.command == "inspect":
         from .build import inspect_file
 
@@ -76,7 +85,7 @@ def main() -> None:
             },
         )
         result = {"callId": call.object_id}
-    print(json.dumps(result, indent=2, allow_nan=False))
+    return result
 
 
 if __name__ == "__main__":
