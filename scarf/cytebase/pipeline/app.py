@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 
 from .._storage import Bucket, dataset_prefix, error_message
 from .catalog import load_record, select_dataset_ids
+from .download import download_connections
 from .models import ProcessRequest, PruneRequest, RegisterRequest
 
 app = modal.App("cellxgene-cytebase")
@@ -56,6 +57,7 @@ image = (
     .env(
         {
             "CYTEBASE_PIPELINE_VERSION": _SHA,
+            "CYTEBASE_DOWNLOAD_CONNECTIONS": str(download_connections()),
             **{
                 f"CYTEBASE_{key}_CONTAINERS": str(value)
                 for key, value in LIMITS.items()
@@ -238,8 +240,8 @@ def download_h5ad(cytebase_id: str, run_id: str, request: dict) -> dict:
 @app.function(
     image=image,
     secrets=[secret],
-    cpu=(2, 8),  # request 2 cpus with soft limit of 8
-    memory=(8192, 32768),  # request 8 GB with soft limit of 32 GB
+    cpu=2,
+    memory=4096,
     timeout=86400,
     retries=0,
     max_containers=LIMITS["BUILD"],

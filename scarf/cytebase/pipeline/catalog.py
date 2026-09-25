@@ -20,6 +20,8 @@ from natsort import natsorted
 
 from .._storage import Bucket, dataset_prefix, retry
 from .models import DatasetRecord, DatasetVersion, FacetTerm
+from .selection import classify_dataset
+from .selection import is_main_dataset as is_main_dataset
 
 _CURATION_API = "https://api.cellxgene.cziscience.com/curation/v1"
 
@@ -126,36 +128,6 @@ _ONTOLOGY_FACETS = (
     "sex",
     "development_stage",
 )
-
-
-def is_main_dataset(dataset: dict) -> bool:
-    """Keep any-primary datasets; reject missing or contradictory primary metadata."""
-    dataset_id = dataset.get("dataset_id", "unknown")
-    count = dataset.get("primary_cell_count")
-    cells = dataset.get("cell_count")
-    flags = dataset.get("is_primary_data")
-    if count is not None and (type(count) is not int or count < 0):
-        raise ValueError(f"Invalid primary_cell_count for dataset {dataset_id}")
-    if cells is not None and (type(cells) is not int or cells < 0):
-        raise ValueError(f"Invalid cell_count for dataset {dataset_id}")
-    if flags is not None and (
-        not isinstance(flags, list) or any(type(flag) is not bool for flag in flags)
-    ):
-        raise ValueError(f"Invalid is_primary_data list for dataset {dataset_id}")
-    primary_flags = set(flags or [])
-    if count is None and not primary_flags:
-        raise ValueError(f"Primary-data metadata is missing for dataset {dataset_id}")
-    contradictory = count is not None and (
-        (cells is not None and count > cells)
-        or (bool(primary_flags) and (count > 0) != (True in primary_flags))
-        or (cells is not None and primary_flags == {True} and count != cells)
-        or (cells is not None and primary_flags == {True, False} and count == cells)
-    )
-    if contradictory:
-        raise ValueError(
-            f"Primary-data metadata contradicts itself for dataset {dataset_id}"
-        )
-    return count > 0 if count is not None else True in primary_flags
 
 
 def _slug(text: str) -> str:
@@ -279,7 +251,7 @@ def prepare_registration(
     pipeline_version: str,
     now: datetime | None = None,
 ) -> tuple[list[DatasetRecord], list[dict], list[tuple[bytes, str]]]:
-    """Prepare all main records, collection rows, and raw-metadata uploads atomically."""
+    """Prepare primary RNA records and metadata before performing any uploads."""
     timestamp = now or datetime.now(UTC)
     by_id = {record.datasetId: record for record in existing}
     reserved = {record.cytebaseId: record.datasetId for record in existing}
@@ -302,7 +274,24 @@ def prepare_registration(
         skipped = {}
         seen_datasets = set()
         main_count = 0
-        for dataset in sorted(datasets, key=lambda item: item["dataset_id"]):
+        classified = []
+        for dataset in datasets:
+            decision = classify_dataset(dataset)
+            if decision["selection"] == "needsReview":
+                dataset_id = (
+                    dataset.get("dataset_id", "unknown")
+                    if isinstance(dataset, dict)
+                    else "unknown"
+                )
+                raise ValueError(
+                    f"Collection {collection_id}, dataset {dataset_id} needs review: "
+                    f"{decision['reason']}. Resolve its metadata before registering "
+                    "this collection. No records in this request were changed."
+                )
+            classified.append((dataset, decision))
+        for dataset, decision in sorted(
+            classified, key=lambda item: item[0]["dataset_id"]
+        ):
             dataset_id = UUID(dataset["dataset_id"])
             if dataset_id in seen_datasets:
                 raise ValueError(f"Collection repeats dataset {dataset_id}")
@@ -310,16 +299,17 @@ def prepare_registration(
             if dataset_id in owners and owners[dataset_id] != collection_id:
                 raise ValueError(f"Dataset {dataset_id} occurs in multiple collections")
             owners[dataset_id] = collection_id
-            if is_main_dataset(dataset):
-                pending.append((raw, collection, dataset))
+            if decision["primary"] is True:
                 main_count += 1
+            if decision["selection"] == "selected":
+                pending.append((raw, collection, dataset))
+            elif decision["primary"] is False and dataset_id in by_id:
+                raise ValueError(
+                    f"Registered dataset {dataset_id} is now all-secondary; "
+                    "review its existing files before removing its registration"
+                )
             else:
-                if dataset_id in by_id:
-                    raise ValueError(
-                        f"Registered dataset {dataset_id} is now all-secondary; "
-                        "review its existing files before removing its registration"
-                    )
-                skipped[str(dataset_id)] = "All cells are secondary (no primary cells)"
+                skipped[str(dataset_id)] = decision["reason"]
         author, year, _ = _publication(collection)
         registered = [
             record.registeredAt

@@ -18,6 +18,14 @@ def main() -> None:
     convert.add_argument("--manifest", type=Path, required=True)
     convert.add_argument("--output", type=Path, required=True)
     commands.add_parser("collection-ids", help="List public CELLxGENE collection IDs")
+    inventory = commands.add_parser(
+        "inventory",
+        help="Save a public collection inventory with primary RNA selection",
+    )
+    inventory.add_argument("--output", type=Path, required=True)
+    inventory.add_argument(
+        "--bucket", help="Optionally join a verified Cytebase catalog snapshot"
+    )
     reset = commands.add_parser(
         "reset-run", help="Reset an interrupted run only after draining its workers"
     )
@@ -46,6 +54,14 @@ def main() -> None:
         from .catalog import list_collection_ids
 
         result = {"collectionIds": list_collection_ids()}
+    elif args.command == "inventory":
+        from .inventory import build_inventory
+
+        snapshot = build_inventory(args.output, bucket=args.bucket)
+        result = {"output": str(args.output), **snapshot["summary"]}
+        result["selectedDatasetsOverMillionCells"] = len(
+            result["selectedDatasetsOverMillionCells"]
+        )
     else:
         import modal
 

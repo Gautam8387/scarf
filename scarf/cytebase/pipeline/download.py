@@ -1,11 +1,16 @@
 """Resumable CELLxGENE downloads with verified bucket chunk checkpoints."""
 
 import hashlib
+import logging
+import os
 import re
 from collections.abc import Callable
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event, Lock, Thread
+from time import monotonic
 from uuid import UUID
 
 import httpx
@@ -17,6 +22,89 @@ from .models import DatasetRecord
 DOWNLOADS_PREFIX = "_internal/downloads"
 CHUNK_BYTES = 512 * 1024 * 1024
 _BUFFER_BYTES = 1024 * 1024
+
+
+def download_connections() -> int:
+    """Return the bounded number of concurrent CELLxGENE range requests."""
+    try:
+        connections = int(os.environ.get("CYTEBASE_DOWNLOAD_CONNECTIONS", "2"))
+    except ValueError as error:
+        raise ValueError("CYTEBASE_DOWNLOAD_CONNECTIONS must be 1 to 4") from error
+    if not 1 <= connections <= 4:
+        raise ValueError("CYTEBASE_DOWNLOAD_CONNECTIONS must be 1 to 4")
+    return connections
+
+
+class _DownloadProgress:
+    """Aggregate source activity without allowing workers to change the stage."""
+
+    def __init__(self, progress: Callable | None, storage: Bucket, total: int | None):
+        self.progress, self.storage = progress, storage
+        self.lock, self.stopped = Lock(), Event()
+        self.fetched: dict[int, int] = {}
+        self.active: set[int] = set()
+        self.retries: dict[int, dict] = {}
+        self.resume_bytes = 0
+        self.stage = "downloading"
+        self.values = {
+            "completed": 0,
+            "total": total,
+            "unit": "bytes",
+            "checkpointBytes": 0,
+            "verifiedBytes": 0,
+            "checkpointPaths": [],
+            "consumerStep": "probe",
+        }
+
+    def _emit(self) -> None:
+        # Serialize emissions as well as snapshots so an older stage cannot win.
+        with self.lock:
+            if self.progress is not None:
+                self.progress(
+                    self.stage,
+                    **self.values,
+                    fetchedBytes=self.resume_bytes + sum(self.fetched.values()),
+                    activeFetches=len(self.active),
+                    sourceRetries=[self.retries[key] for key in sorted(self.retries)],
+                )
+
+    def update(self, stage: str | None = None, **values) -> None:
+        with self.lock:
+            if stage is not None:
+                self.stage = stage
+            self.values.update(values)
+        self._emit()
+
+    def source_bytes(self, start: int, size: int) -> None:
+        with self.lock:
+            # Count each byte range once even if a source retry restarts its file.
+            self.fetched[start] = max(self.fetched.get(start, 0), size)
+
+    def source_retry(self, start: int, stage: str, **values) -> None:
+        with self.lock:
+            self.retries[start] = {"start": start, "stage": stage, **values}
+
+    def heartbeat(self) -> None:
+        # Refresh local counters; the Modal callback retains its 15-second flush.
+        while not self.stopped.wait(1):
+            try:
+                self._emit()
+            except Exception as error:
+                logging.warning(
+                    "Download progress update failed: %s", error_message(error)
+                )
+
+    def __enter__(self):
+        self.previous_progress = self.storage.progress
+        self.storage.progress = self.update
+        self.thread = Thread(target=self.heartbeat, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self.stopped.set()
+        self.thread.join()
+        self.storage.progress = self.previous_progress
 
 
 class _Chunk(BaseModel):
@@ -268,6 +356,7 @@ def run_download(
                 storage=storage,
                 progress=progress,
                 assert_owner=assert_owner,
+                timings=record.timings,
             )
         completion = get_completion(record, storage)
         if completion is None or (
@@ -576,7 +665,10 @@ def _fetch_chunk(
     total: int,
     etag: str,
     report: Callable,
+    stopped: Event,
 ) -> str:
+    if stopped.is_set():
+        raise CancelledError("Download prefetch was cancelled")
     digest = hashlib.sha256()
     size = 0
     with client.stream(
@@ -587,12 +679,14 @@ def _fetch_chunk(
         _response_identity(response, start, end, total, etag)
         with path.open("wb") as output:
             for block in response.iter_raw(chunk_size=_BUFFER_BYTES):
+                if stopped.is_set():
+                    raise CancelledError("Download prefetch was cancelled")
                 size += len(block)
                 if size > end - start + 1:
                     raise ValueError("CELLxGENE returned more bytes than requested")
                 output.write(block)
                 digest.update(block)
-                report("downloading", start + size)
+                report(size)
     if size != end - start + 1:
         raise httpx.RemoteProtocolError("CELLxGENE returned an incomplete byte range")
     return digest.hexdigest()
@@ -608,45 +702,47 @@ def download_h5ad(
     storage: Bucket,
     progress: Callable | None = None,
     assert_owner: Callable | None = None,
+    timings: dict[str, float] | None = None,
 ) -> tuple[int, str]:
-    """Restore committed chunks, fetch missing ranges, and hash the full source.
+    """Prefetch bounded ranges and commit verified HF chunks in byte order.
 
-    A chunk becomes reusable only after its upload and a separate manifest write
-    both succeed. Interrupted uploads may leave orphan objects; they are never
-    trusted as committed ranges. A completion receipt is committed last, after
-    every saved chunk and the assembled source have been verified. A completed
-    download is restored without contacting CELLxGENE.
+    Local prefetched files never advance the checkpoint. Upload and manifest
+    writes remain separate because HF operations are not transactional. A final
+    completion receipt covers the full source and every read-back bucket chunk.
     """
+    connections = download_connections()
+    timings = timings if timings is not None else {}
+    timings["downloadSourceWaitSeconds"] = 0.0
+    timings["downloadCheckpointSeconds"] = 0.0
     prefix = checkpoint_prefix(dataset_id, version_id)
     manifest_path = f"{prefix}/manifest.json"
     saved = _read_completion(dataset_id, version_id, url, expected_bytes, storage)
     if saved is not None:
-        return _restore_completed(*saved, destination, progress, storage)
+        started = monotonic()
+        try:
+            return _restore_completed(*saved, destination, progress, storage)
+        finally:
+            timings["downloadCheckpointSeconds"] += monotonic() - started
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_name(f"{destination.name}.part")
-    checkpoint_bytes = 0
     checkpoint_paths = list_checkpoint_paths(dataset_id, version_id, storage)
-    total = expected_bytes
 
-    def report(stage: str, completed: int, message: str | None = None) -> None:
-        if progress is not None:
-            progress(
-                stage,
-                completed=completed,
-                total=total,
-                unit="bytes",
-                message=message,
-                checkpointBytes=checkpoint_bytes,
-                checkpointPaths=sorted(set(checkpoint_paths)),
-            )
-
-    report("downloading", 0, "Checking source identity and saved checkpoints")
-    with httpx.Client(
-        timeout=httpx.Timeout(60, connect=30),
-        follow_redirects=True,
-        headers={"Accept-Encoding": "identity"},
-    ) as client:
-        total, etag = retry(lambda: _probe(client, url), progress=progress)
+    with (
+        _DownloadProgress(progress, storage, expected_bytes) as report,
+        httpx.Client(
+            timeout=httpx.Timeout(60, connect=30),
+            follow_redirects=True,
+            headers={"Accept-Encoding": "identity"},
+            limits=httpx.Limits(max_connections=connections),
+        ) as client,
+    ):
+        report.update(
+            "downloading",
+            message="Checking source identity and saved checkpoints",
+            checkpointPaths=sorted(set(checkpoint_paths)),
+        )
+        total, etag = retry(lambda: _probe(client, url), progress=report.update)
+        report.update(total=total)
         if expected_bytes is not None and total != expected_bytes:
             raise ValueError(
                 f"CELLxGENE source is {total} bytes, expected {expected_bytes}"
@@ -664,22 +760,77 @@ def download_h5ad(
             )
             # The server can commit even when its response never reaches us.
             checkpoint_paths.append(manifest_path)
-            report("checkpointing_download", 0, "Creating the download checkpoint")
-
-            def create_checkpoint() -> None:
-                if assert_owner is not None:
-                    assert_owner()
-                storage.write_json(manifest_path, checkpoint.model_dump())
-
-            create_checkpoint()
+            report.update(
+                "checkpointing_download",
+                consumerStep="checkpoint",
+                message="Creating the download checkpoint",
+                checkpointPaths=sorted(set(checkpoint_paths)),
+            )
+            if assert_owner is not None:
+                assert_owner()
+            storage.write_json(manifest_path, checkpoint.model_dump())
         else:
             checkpoint = _Checkpoint.model_validate(raw)
         checkpoint_bytes = _validate_checkpoint(
             checkpoint, prefix, dataset_id, version_id, url, total, etag
         )
         checkpoint_paths.extend([manifest_path, *(c.path for c in checkpoint.chunks)])
+        with report.lock:
+            report.resume_bytes = checkpoint_bytes
+        report.update(
+            completed=checkpoint_bytes,
+            checkpointBytes=checkpoint_bytes,
+            checkpointPaths=sorted(set(checkpoint_paths)),
+        )
         full_digest = hashlib.sha256()
         assembled = 0
+        stopped = Event()
+        source_errors: list[BaseException] = []
+        error_lock = Lock()
+
+        def check_sources() -> None:
+            with error_lock:
+                if source_errors:
+                    raise source_errors[0]
+
+        def fetch(start: int, end: int, chunk_file: Path) -> str:
+            def attempt() -> str:
+                if stopped.is_set():
+                    raise CancelledError("Download prefetch was cancelled")
+                with report.lock:
+                    report.active.add(start)
+                    report.retries.pop(start, None)
+                try:
+                    return _fetch_chunk(
+                        client,
+                        url,
+                        chunk_file,
+                        start,
+                        end,
+                        total,
+                        etag,
+                        lambda size: report.source_bytes(start, size),
+                        stopped,
+                    )
+                finally:
+                    with report.lock:
+                        report.active.discard(start)
+
+            try:
+                return retry(
+                    attempt,
+                    progress=lambda stage, **values: report.source_retry(
+                        start, stage, **values
+                    ),
+                    stop_event=stopped,
+                )
+            except BaseException as error:
+                if not isinstance(error, CancelledError):
+                    with error_lock:
+                        source_errors.append(error)
+                stopped.set()
+                raise
+
         try:
             with (
                 TemporaryDirectory(
@@ -687,101 +838,172 @@ def download_h5ad(
                 ) as directory,
                 partial.open("wb") as output,
             ):
-                chunk_file = Path(directory) / "chunk"
-                if checkpoint.chunks:
-                    report("restoring_download", 0, "Restoring committed HF chunks")
+                chunk_dir = Path(directory)
+                restored = chunk_dir / "restored"
                 for chunk in checkpoint.chunks:
-                    storage.download(chunk.path, chunk_file)
-                    assembled = _append_verified_chunk(
-                        chunk,
-                        chunk_file,
-                        output,
-                        full_digest,
-                        lambda completed: report("restoring_download", completed),
+                    report.update(
+                        "restoring_download",
+                        consumerStep="restore",
+                        message="Restoring and verifying committed HF chunks",
                     )
-                while assembled < total:
-                    start = assembled
-                    end = min(start + CHUNK_BYTES, total) - 1
-                    report("downloading", start, "Fetching the next source byte range")
-                    sha256 = retry(
-                        lambda: _fetch_chunk(
-                            client, url, chunk_file, start, end, total, etag, report
-                        ),
-                        progress=progress,
-                    )
-                    chunk = _Chunk(
-                        start=start,
-                        end=end,
-                        path=_chunk_path(prefix, start, end),
-                        sha256=sha256,
-                    )
-                    # Track this exact path even if a failed upload leaves an orphan.
-                    checkpoint_paths.append(chunk.path)
-                    report(
-                        "checkpointing_download", end + 1, "Uploading completed chunk"
-                    )
+                    started = monotonic()
+                    try:
+                        storage.download(chunk.path, restored)
+                        assembled = _append_verified_chunk(
+                            chunk,
+                            restored,
+                            output,
+                            full_digest,
+                            lambda completed: report.update(verifiedBytes=completed),
+                        )
+                    finally:
+                        timings["downloadCheckpointSeconds"] += monotonic() - started
+                    restored.unlink()
 
-                    def upload_chunk() -> None:
-                        if assert_owner is not None:
-                            assert_owner()
-                        storage.upload([(chunk_file, chunk.path)])
+                pending = {}
+                next_start = assembled
+                executor = ThreadPoolExecutor(
+                    max_workers=connections, thread_name_prefix="cytebase-fetch"
+                )
 
-                    upload_chunk()
-                    updated = checkpoint.model_copy(
-                        update={
-                            "chunks": [*checkpoint.chunks, chunk],
-                            "updatedAt": datetime.now(UTC).isoformat(),
-                        }
-                    )
-                    # Separate calls are intentional: HF batch writes are not atomic.
+                def fill_window() -> None:
+                    nonlocal next_start
+                    check_sources()
+                    # The oldest entry remains in the window until HF verification
+                    # and hashing finish, so the consumer also occupies one slot.
+                    while len(pending) < 2 * connections and next_start < total:
+                        check_sources()
+                        end = min(next_start + CHUNK_BYTES, total) - 1
+                        chunk_file = chunk_dir / f"{next_start:020d}.bin"
+                        pending[next_start] = (
+                            executor.submit(fetch, next_start, end, chunk_file),
+                            chunk_file,
+                            end,
+                        )
+                        next_start = end + 1
 
-                    def commit_chunk() -> None:
-                        if assert_owner is not None:
-                            assert_owner()
-                        storage.write_json(manifest_path, updated.model_dump())
-
-                    commit_chunk()
-                    checkpoint = updated
-                    checkpoint_bytes = end + 1
-                    report("checkpointing_download", end + 1, "Chunk committed")
-                    # Read back the committed object so a completion receipt covers
-                    # verified bucket bytes, including newly uploaded chunks.
-                    storage.download(chunk.path, chunk_file)
-                    assembled = _append_verified_chunk(
-                        chunk,
-                        chunk_file,
-                        output,
-                        full_digest,
-                        lambda completed: report("verifying_download", completed),
-                    )
+                try:
+                    fill_window()
+                    while pending:
+                        start = assembled
+                        future, chunk_file, end = pending[start]
+                        report.update(
+                            "downloading",
+                            consumerStep="waiting_for_source",
+                            message="Waiting for the next prefetched byte range",
+                        )
+                        started = monotonic()
+                        try:
+                            try:
+                                sha256 = future.result()
+                            except CancelledError:
+                                check_sources()
+                                raise
+                        finally:
+                            timings["downloadSourceWaitSeconds"] += (
+                                monotonic() - started
+                            )
+                        check_sources()
+                        chunk = _Chunk(
+                            start=start,
+                            end=end,
+                            path=_chunk_path(prefix, start, end),
+                            sha256=sha256,
+                        )
+                        # Include the exact path if an interrupted upload leaves an orphan.
+                        checkpoint_paths.append(chunk.path)
+                        report.update(
+                            "checkpointing_download",
+                            consumerStep="upload",
+                            message="Uploading completed chunk",
+                            checkpointPaths=sorted(set(checkpoint_paths)),
+                        )
+                        started = monotonic()
+                        try:
+                            if assert_owner is not None:
+                                assert_owner()
+                            storage.upload([(chunk_file, chunk.path)])
+                            check_sources()
+                            updated = checkpoint.model_copy(
+                                update={
+                                    "chunks": [*checkpoint.chunks, chunk],
+                                    "updatedAt": datetime.now(UTC).isoformat(),
+                                }
+                            )
+                            report.update(
+                                "checkpointing_download",
+                                consumerStep="checkpoint",
+                                message="Committing the uploaded chunk",
+                            )
+                            if assert_owner is not None:
+                                assert_owner()
+                            storage.write_json(manifest_path, updated.model_dump())
+                            checkpoint = updated
+                            checkpoint_bytes = end + 1
+                            report.update(
+                                "verifying_download",
+                                consumerStep="verify",
+                                completed=checkpoint_bytes,
+                                checkpointBytes=checkpoint_bytes,
+                                message="Reading back and verifying the committed chunk",
+                            )
+                            # Release the source copy before downloading HF's copy;
+                            # the consumer continues occupying the same window slot.
+                            chunk_file.unlink()
+                            storage.download(chunk.path, chunk_file)
+                            assembled = _append_verified_chunk(
+                                chunk,
+                                chunk_file,
+                                output,
+                                full_digest,
+                                lambda completed: report.update(
+                                    "verifying_download", verifiedBytes=completed
+                                ),
+                            )
+                        finally:
+                            timings["downloadCheckpointSeconds"] += (
+                                monotonic() - started
+                            )
+                        chunk_file.unlink()
+                        del pending[start]
+                        fill_window()
+                finally:
+                    stopped.set()
+                    for future, _, _ in pending.values():
+                        future.cancel()
+                    # Stop and join before the temporary files or shared client close.
+                    executor.shutdown(wait=True, cancel_futures=True)
                 if assembled != total:
                     raise ValueError(f"Assembled {assembled} bytes, expected {total}")
             partial.replace(destination)
         except BaseException:
             partial.unlink(missing_ok=True)
             raise
-    report("verifying_download", assembled, "Source assembled and SHA-256 calculated")
-    receipt = _Completion(
-        datasetId=str(UUID(str(dataset_id))),
-        datasetVersionId=str(UUID(str(version_id))),
-        sourceUrl=url,
-        etag=etag,
-        sourceBytes=assembled,
-        sourceSha256=full_digest.hexdigest(),
-        completedAt=datetime.now(UTC).isoformat(),
-    )
-    completion_path = f"{prefix}/completion.json"
-
-    def commit_completion() -> None:
+        receipt = _Completion(
+            datasetId=str(UUID(str(dataset_id))),
+            datasetVersionId=str(UUID(str(version_id))),
+            sourceUrl=url,
+            etag=etag,
+            sourceBytes=assembled,
+            sourceSha256=full_digest.hexdigest(),
+            completedAt=datetime.now(UTC).isoformat(),
+        )
+        completion_path = f"{prefix}/completion.json"
+        report.update(
+            "checkpointing_download",
+            consumerStep="completion",
+            message="Committing the verified source completion receipt",
+        )
         if assert_owner is not None:
             assert_owner()
         storage.write_json(completion_path, receipt.model_dump())
-
-    commit_completion()
-    checkpoint_paths.append(completion_path)
-    report(
-        "downloaded",
-        assembled,
-        "Verified staged source and committed completion receipt",
-    )
-    return assembled, receipt.sourceSha256
+        checkpoint_paths.append(completion_path)
+        report.update(
+            "downloaded",
+            consumerStep="complete",
+            completed=assembled,
+            verifiedBytes=assembled,
+            checkpointPaths=sorted(set(checkpoint_paths)),
+            message="Verified staged source and committed completion receipt",
+        )
+        return assembled, receipt.sourceSha256

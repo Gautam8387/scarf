@@ -5,10 +5,12 @@ import os
 import re
 import time
 from collections.abc import Callable
+from concurrent.futures import CancelledError
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event
 
 import httpx
 from huggingface_hub import (
@@ -77,13 +79,21 @@ def _retry_delay(error: httpx.HTTPError, attempt: int) -> float:
     return delay
 
 
-def retry[T](operation: Callable[[], T], progress: Callable | None = None) -> T:
+def retry[T](
+    operation: Callable[[], T],
+    progress: Callable | None = None,
+    *,
+    stop_event: Event | None = None,
+) -> T:
     """Retry transient HTTP failures three times, respecting server backoff.
 
     Server waits above five minutes are left for an explicit job retry instead
     of sleeping indefinitely or retrying before the server permits it.
+    A supplied stop event interrupts backoff and prevents another attempt.
     """
     for attempt in range(4):
+        if stop_event is not None and stop_event.is_set():
+            raise CancelledError("Transfer cancelled")
         try:
             return operation()
         except (httpx.TransportError, httpx.HTTPStatusError, HfHubHTTPError) as error:
@@ -105,7 +115,10 @@ def retry[T](operation: Callable[[], T], progress: Callable | None = None) -> T:
                     else "retrying_transfer",
                     message=f"Retry {attempt + 1}/3 after {delay:g} seconds",
                 )
-            time.sleep(delay)
+            if stop_event is None:
+                time.sleep(delay)
+            elif stop_event.wait(delay):
+                raise CancelledError("Transfer cancelled") from error
     raise AssertionError("Unreachable retry state")
 
 
