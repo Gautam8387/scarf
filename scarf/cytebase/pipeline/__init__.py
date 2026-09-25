@@ -1,1 +1,1 @@
-"""Four-stage CELLxGENE ingestion, deployed explicitly through Modal."""
+"""CELLxGENE ingestion and scarf dataset catalog build through Modal."""

@@ -66,7 +66,7 @@ def main() -> None:
         import modal
 
         function = modal.Function.from_name(
-            "cellxgene-cytebase", "run_pipeline", environment_name=args.env
+            "cytebase", "run_pipeline", environment_name=args.env
         )
         call = function.spawn(
             "reset",

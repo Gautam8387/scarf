@@ -19,8 +19,9 @@ if TYPE_CHECKING:
     import zarr
 
     from .catalog import Catalog as Catalog
+    from .dataset import CytebaseDataset as CytebaseDataset
 
-__all__ = ["Catalog", "Repository", "connect", "list_repositories"]
+__all__ = ["Catalog", "CytebaseDataset", "Repository", "connect", "list_repositories"]
 
 _BUCKET_ID = "Nygen/cytebase"
 _ZARR_ARCHIVE_SUFFIX = ".zarr.tar.gz"
@@ -33,6 +34,11 @@ def __getattr__(name: str) -> Any:
 
         globals()[name] = Catalog
         return Catalog
+    if name == "CytebaseDataset":
+        from .dataset import CytebaseDataset
+
+        globals()[name] = CytebaseDataset
+        return CytebaseDataset
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

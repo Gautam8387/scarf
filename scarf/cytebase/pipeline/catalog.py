@@ -18,7 +18,7 @@ from huggingface_hub import BucketFolder, list_bucket_tree
 from huggingface_hub.errors import EntryNotFoundError
 from natsort import natsorted
 
-from .._storage import Bucket, dataset_prefix, retry
+from .._storage import Bucket, dataset_prefix, error_message, retry
 from .models import DatasetRecord, DatasetVersion, FacetTerm
 from .selection import classify_dataset
 from .selection import is_main_dataset as is_main_dataset
@@ -172,7 +172,20 @@ def _facets(dataset: dict) -> dict[str, list[FacetTerm]]:
     return facets
 
 
-def _name_parts(collection: dict, facets: dict[str, list[FacetTerm]]) -> list[str]:
+def _title_slug(title: str) -> str:
+    """Keep the source title descriptive without guessing biological groupings."""
+    ascii_title = (
+        unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode()
+    )
+    text = re.sub(r"\b(sc|sn)rna[\s_-]*seq\b", r"\1rna", ascii_title.lower())
+    words = re.findall(r"[a-z0-9]+", text)
+    connectors = {"a", "an", "and", "from", "in", "of", "the", "to", "with"}
+    return "_".join(word for word in words if word not in connectors) or "dataset"
+
+
+def _name_parts(
+    collection: dict, facets: dict[str, list[FacetTerm]], dataset: dict
+) -> list[str]:
     _, year, author = _publication(collection)
     parts = [author, f"{year:04d}" if year is not None else "0000"]
     organisms = sorted({term.label for term in facets["organism"]})
@@ -185,26 +198,39 @@ def _name_parts(collection: dict, facets: dict[str, list[FacetTerm]]) -> list[st
             else "unknown"
         )
         parts.append(_slug(organism))
-    tissues = {term.label for term in facets["tissue"]}
-    parts.append(_slug(next(iter(tissues))) if len(tissues) == 1 else "multitissue")
-    diseases = {term.label for term in facets["disease"]}
-    non_normal = diseases - {"normal"}
-    disease = (
-        "healthy"
-        if diseases == {"normal"}
-        else next(iter(non_normal))
-        if len(non_normal) == 1
-        else "multidisease"
+    parts.append(
+        _title_slug(dataset.get("title") or collection.get("name") or "dataset")
     )
-    parts.append(_slug(disease))
     return parts
 
 
+def _shorten_name_part(part: str, limit: int) -> str:
+    """Retain title beginnings and endings, including sample or puck identifiers."""
+    if len(part) <= limit:
+        return part
+    if limit < 3:
+        return part[:limit]
+    left = (limit - 1) // 2
+    right = limit - left - 1
+    beginning = part[:left].rstrip("_")
+    ending = part[-right:].lstrip("_")
+    # Prefer whole words, but retain single long identifiers when unavoidable.
+    if "_" in beginning and part[left] != "_":
+        beginning = beginning.rsplit("_", 1)[0]
+    if "_" in ending and part[-right - 1] != "_":
+        ending = ending.split("_", 1)[1]
+    return f"{beginning}_{ending}"
+
+
 def _name_with_suffix(parts: list[str], suffix: str) -> str:
-    shortened = list(parts)
-    while len("_".join([*shortened, suffix])) > 80:
-        longest = max(range(len(shortened)), key=lambda index: len(shortened[index]))
-        shortened[longest] = shortened[longest][:-1].rstrip("_")
+    limits = [len(part) for part in parts]
+    while sum(limits) + len(parts) + len(suffix) > 80:
+        longest = max(range(len(limits)), key=limits.__getitem__)
+        limits[longest] -= 1
+    shortened = [
+        _shorten_name_part(part, limit)
+        for part, limit in zip(parts, limits, strict=True)
+    ]
     return "_".join([*shortened, suffix])
 
 
@@ -286,7 +312,7 @@ def prepare_registration(
                 raise ValueError(
                     f"Collection {collection_id}, dataset {dataset_id} needs review: "
                     f"{decision['reason']}. Resolve its metadata before registering "
-                    "this collection. No records in this request were changed."
+                    "this collection."
                 )
             classified.append((dataset, decision))
         for dataset, decision in sorted(
@@ -345,7 +371,9 @@ def prepare_registration(
         name = (
             previous.cytebaseId
             if previous
-            else _assign_name(_name_parts(collection, facets), dataset_id, reserved)
+            else _assign_name(
+                _name_parts(collection, facets, dataset), dataset_id, reserved
+            )
         )
         versions = list(previous.versions) if previous else []
         if not any(version.datasetVersionId == version_id for version in versions):
@@ -692,27 +720,40 @@ def publish_catalog(
 
 
 def run_catalog(request: dict, storage: Bucket, assert_owner) -> dict:
-    """Register requested collections or publish the supplied dataset changes."""
+    """Save valid collections independently, then publish their catalog changes."""
     collection_rows = []
     records = []
+    failed_collections = []
     if request.get("collectionIds"):
-        ids = list(
-            dict.fromkeys(str(UUID(value)) for value in request["collectionIds"])
-        )
-        records, collection_rows, files = prepare_registration(
-            [fetch_collection(key) for key in ids],
-            list_records(storage),
-            pipeline_version=os.environ["CYTEBASE_PIPELINE_VERSION"],
-        )
-        assert_owner()
-        if files:
-            storage.upload(files)
-        for record in records:
+        ids = sorted({str(UUID(value)) for value in request["collectionIds"]})
+        known = {record.datasetId: record for record in list_records(storage)}
+        pipeline_version = os.environ["CYTEBASE_PIPELINE_VERSION"]
+        for collection_id in ids:
             assert_owner()
-            storage.write_json(
-                f"{dataset_prefix(record.cytebaseId)}/dataset.json",
-                record.model_dump(mode="json"),
-            )
+            try:
+                prepared, rows, files = prepare_registration(
+                    [fetch_collection(collection_id)],
+                    list(known.values()),
+                    pipeline_version=pipeline_version,
+                )
+            except Exception as error:
+                failed_collections.append(
+                    {"collectionId": collection_id, "error": error_message(error)}
+                )
+                continue
+            # Storage and ownership failures are batch failures, not bad metadata.
+            assert_owner()
+            if files:
+                storage.upload(files)
+            for record in prepared:
+                assert_owner()
+                storage.write_json(
+                    f"{dataset_prefix(record.cytebaseId)}/dataset.json",
+                    record.model_dump(mode="json"),
+                )
+            known.update({record.datasetId: record for record in prepared})
+            records.extend(prepared)
+            collection_rows.extend(rows)
     elif "updates" in request:
         records = [DatasetRecord.model_validate(row) for row in request["updates"]]
     else:
@@ -726,5 +767,6 @@ def run_catalog(request: dict, storage: Bucket, assert_owner) -> dict:
                 for record in records
             ],
             registeredCollections=collection_rows,
+            failedCollections=failed_collections,
         )
     return result

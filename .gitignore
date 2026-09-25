@@ -80,3 +80,4 @@ PR/
 scarf/agent/*.md
 .cache/
 review/
+scarf/cytebase/collection/collections.json

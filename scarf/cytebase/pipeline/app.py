@@ -1,12 +1,14 @@
-"""Four Modal stage pools, a queued orchestrator, and the development HTTP API."""
+"""One worker per dataset, a queued orchestrator, and the development HTTP API."""
 
 import asyncio
 import logging
 import os
+import re
 import subprocess
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import Event, Lock, Thread
 from time import monotonic
 
@@ -17,9 +19,28 @@ from fastapi.responses import JSONResponse
 from .._storage import Bucket, dataset_prefix, error_message
 from .catalog import load_record, select_dataset_ids
 from .download import download_connections
-from .models import ProcessRequest, PruneRequest, RegisterRequest
+from .models import ProcessRequest, RegisterRequest
 
-app = modal.App("cellxgene-cytebase")
+
+class _LogFormatter(logging.Formatter):
+    def format(self, record):
+        message = super().format(record)
+        token = os.environ.get("HF_TOKEN")
+        if token:
+            message = message.replace(token, "[redacted]")
+        message = re.sub(r"hf_[A-Za-z0-9]+", "[redacted]", message)
+        return re.sub(r"(?:https?|hf)://[^\s\"'<>]+", "[remote URL]", message)
+
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logger.propagate = False
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(_LogFormatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+
+app = modal.App("cytebase")
 secret = modal.Secret.from_name(
     "scarf-env", required_keys=["HF_TOKEN", "CYTEBASE_BUCKET"]
 )
@@ -34,10 +55,7 @@ def _limit(name: str) -> int:
     return value
 
 
-LIMITS = {
-    name: _limit(f"CYTEBASE_{name}_CONTAINERS")
-    for name in ("DOWNLOAD", "BUILD", "CLEANUP")
-}
+PROCESS_CONTAINERS = _limit("CYTEBASE_PROCESS_CONTAINERS")
 _SHA = (
     subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=Path(__file__).parent, text=True
@@ -58,10 +76,8 @@ image = (
         {
             "CYTEBASE_PIPELINE_VERSION": _SHA,
             "CYTEBASE_DOWNLOAD_CONNECTIONS": str(download_connections()),
-            **{
-                f"CYTEBASE_{key}_CONTAINERS": str(value)
-                for key, value in LIMITS.items()
-            },
+            "CYTEBASE_PROCESS_CONTAINERS": str(PROCESS_CONTAINERS),
+            "HF_HUB_DISABLE_PROGRESS_BARS": "1",
         }
     )
 )
@@ -76,6 +92,30 @@ def _storage() -> Bucket:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _progress_summary(counters: dict | None) -> str:
+    if not counters:
+        return ""
+    parts = []
+    completed, total = counters.get("completed"), counters.get("total")
+    if completed is not None:
+        if counters.get("unit") == "bytes":
+            expected = f"{total / 1024**3:.2f}" if total is not None else "?"
+            parts.append(f"assembled={completed / 1024**3:.2f}/{expected} GiB")
+        else:
+            expected = f"{total:,}" if total is not None else "?"
+            parts.append(f"checked={completed:,}/{expected} {counters.get('unit', '')}")
+    if counters.get("percent") is not None:
+        parts.append(f"{counters['percent']:.1f}%")
+    if counters.get("fetchedBytes") is not None:
+        parts.append(f"fetched={counters['fetchedBytes'] / 1024**3:.2f} GiB")
+    for key in ("activeFetches", "consumerStep", "storedValuesChecked", "message"):
+        if counters.get(key) is not None:
+            parts.append(f"{key}={counters[key]}")
+    if counters.get("sourceRetries"):
+        parts.append(f"sourceRetries={len(counters['sourceRetries'])}")
+    return " ".join(parts)
 
 
 def _owner(storage: Bucket, run_id: str, key: str, call_id: str) -> None:
@@ -96,7 +136,8 @@ def _owner(storage: Bucket, run_id: str, key: str, call_id: str) -> None:
 def _progress(record, stage: str):
     """Progress is display-only; expiry never changes durable dataset readiness."""
     key = f"{record.runId}:{record.cytebaseId}:{stage}"
-    lock, stopped = Lock(), Event()
+    lock, publish_lock, stopped = Lock(), Lock(), Event()
+    started = stage_started = monotonic()
     value = {
         "runId": record.runId,
         "callId": record.callId,
@@ -107,15 +148,28 @@ def _progress(record, stage: str):
     }
 
     def publish():
-        with lock:
-            value["heartbeatAt"] = _now()
-            snapshot = dict(value)
-        try:
-            progress_store.put(key, snapshot)
-        except Exception as error:
-            logging.warning("Progress update failed: %s", error_message(error))
+        # Serialize writes so a delayed heartbeat cannot replace a newer stage.
+        with publish_lock:
+            with lock:
+                value["heartbeatAt"] = _now()
+                snapshot = dict(value)
+                stage_seconds = monotonic() - stage_started
+            logger.info(
+                "dataset=%s attempt=%s stage=%s elapsed=%.1fs stageElapsed=%.1fs %s",
+                record.cytebaseId,
+                record.attempt,
+                snapshot["stage"],
+                monotonic() - started,
+                stage_seconds,
+                _progress_summary(snapshot["progress"]),
+            )
+            try:
+                progress_store.put(key, snapshot)
+            except Exception as error:
+                logger.warning("Progress update failed: %s", error_message(error))
 
     def update(name: str, **counters):
+        nonlocal stage_started
         completed, total = counters.get("completed"), counters.get("total")
         counters["percent"] = (
             min(100, 100 * completed / total)
@@ -124,6 +178,16 @@ def _progress(record, stage: str):
         )
         with lock:
             changed = name != value["stage"]
+            if changed:
+                logger.info(
+                    "dataset=%s stage transition %s -> %s after %.1fs; %s",
+                    record.cytebaseId,
+                    value["stage"],
+                    name,
+                    monotonic() - stage_started,
+                    _progress_summary(value["progress"]),
+                )
+                stage_started = monotonic()
             value.update(stage=name, progress=counters)
         if changed:
             publish()
@@ -142,14 +206,106 @@ def _progress(record, stage: str):
         thread.join()
 
 
-def _execute(stage: str, cytebase_id: str, run_id: str, request: dict) -> dict:
-    from .build import run_build
-    from .cleanup import run_cleanup
-    from .download import run_download
+def _cleanup_local(workspace: TemporaryDirectory, record, progress) -> None:
+    """Release this worker's files without hiding the result of publication."""
+    started = monotonic()
+    try:
+        progress("cleaning_local", message="Removing temporary source and store files")
+    except Exception as error:
+        logger.warning("Cleanup progress failed: %s", error_message(error))
+    try:
+        workspace.cleanup()
+    except Exception as error:
+        logger.warning("Local workspace cleanup failed: %s", error_message(error))
+    finally:
+        record.timings["cleanupSeconds"] = monotonic() - started
 
+
+def _run_dataset(record, request: dict, storage: Bucket, progress, check) -> dict:
+    from .build import build_local, publish_store, replacement_paths
+    from .download import download_h5ad
+
+    if (
+        record.status == "ready"
+        and record.processedVersionId == record.latestVersionId
+        and record.zarrUri is not None
+        and not request.get("force", False)
+    ):
+        return {
+            "outcome": "skipped",
+            "message": "The registered version already has a ready Scarf store",
+        }
+    progress("preflight", message="Checking source metadata and replacement approval")
+    raw = storage.read_json(
+        f"{dataset_prefix(record.cytebaseId)}/cellxgene/dataset.json"
+    )
+    if (
+        raw is None
+        or raw.get("dataset_id") != str(record.datasetId)
+        or raw.get("dataset_version_id") != str(record.latestVersionId)
+    ):
+        raise ValueError("Registered source metadata is missing or has changed")
+    missing = sorted(
+        set(replacement_paths(record, storage))
+        - set(request.get("approvedDeletionPaths", []))
+    )
+    if missing:
+        return {
+            "outcome": "needsApproval",
+            "message": "Review these exact generated paths and resubmit with approvedDeletionPaths",
+            "deletionPaths": missing,
+        }
+    check()
+    if record.status != "ready":
+        record.status = "processing"
+    record.needsInput = None
+    record.updatedAt = datetime.now(UTC)
+    storage.write_json(
+        f"{dataset_prefix(record.cytebaseId)}/dataset.json",
+        record.model_dump(mode="json"),
+    )
+    workspace = TemporaryDirectory(prefix="cytebase-process-")
+    try:
+        source = Path(workspace.name) / "source.h5ad"
+        store = Path(workspace.name) / "data.zarr"
+        started = monotonic()
+        try:
+            size, checksum = download_h5ad(
+                record.sourceUrl,
+                source,
+                record.sourceBytes,
+                progress=progress,
+                timings=record.timings,
+            )
+        finally:
+            record.timings["downloadSeconds"] = monotonic() - started
+        logger.info(
+            "dataset=%s download completed: %.2f GiB in %.1fs; timings=%s",
+            record.cytebaseId,
+            size / 1024**3,
+            record.timings["downloadSeconds"],
+            record.timings,
+        )
+        check()
+        manifest, converted = build_local(
+            record, source, store, raw, size, checksum, progress
+        )
+        if converted["status"] == "done":
+            try:
+                source.unlink()
+            except OSError as error:
+                logger.warning("Local source cleanup failed: %s", error_message(error))
+        return publish_store(
+            record, request, storage, store, manifest, converted, progress, check
+        )
+    finally:
+        _cleanup_local(workspace, record, progress)
+
+
+def _execute(cytebase_id: str, run_id: str, request: dict) -> dict:
     storage = _storage()
     call_id = modal.current_function_call_id()
-    key = f"{cytebase_id}:{stage}"
+    key = f"{cytebase_id}:process"
 
     def check():
         _owner(storage, run_id, key, call_id)
@@ -159,42 +315,51 @@ def _execute(stage: str, cytebase_id: str, run_id: str, request: dict) -> dict:
     state = storage.read_json(RUN_PATH)
     if str(record.latestVersionId) != state["children"][key]["datasetVersionId"]:
         raise ValueError("Registered version changed after submission")
-    record.attempt += int(record.runId != run_id)
-    record.runId, record.callId, record.stage = run_id, call_id, stage
+    record.attempt += 1
+    record.runId, record.callId, record.stage = run_id, call_id, "process"
     record.pipelineVersion = os.environ["CYTEBASE_PIPELINE_VERSION"]
     record.stageOutcome, record.error = "running", None
     record.startedAt = datetime.now(UTC)
-    record.checkpointCleanupError = None
-    if stage not in {"cleanup", "prune"}:
-        record.needsInput = None
+    record.timings = {}
+    logger.info(
+        "Dataset worker started: dataset=%s version=%s run=%s call=%s attempt=%s",
+        cytebase_id,
+        record.latestVersionId,
+        run_id,
+        call_id,
+        record.attempt,
+    )
     storage.write_json(
         f"{dataset_prefix(cytebase_id)}/dataset.json", record.model_dump(mode="json")
     )
     started = monotonic()
     try:
-        with _progress(record, stage) as progress:
+        with _progress(record, "process") as progress:
             storage.progress = progress
-            result = {
-                "download": run_download,
-                "build": run_build,
-                "cleanup": run_cleanup,
-                "prune": run_cleanup,
-            }[stage](record, request | {"stage": stage}, storage, progress, check)
+            result = _run_dataset(record, request, storage, progress, check)
     except Exception as error:
         message = error_message(error)
+        logger.exception("Dataset worker failed: dataset=%s %s", cytebase_id, message)
         result = {"outcome": "failed", "message": message}
-        if stage in {"cleanup", "prune"}:
-            record.checkpointCleanupError = message
-        elif not (stage == "download" and record.status == "ready"):
-            record.status = "failed"
+        record.status = "failed"
+    finally:
+        storage.progress = None
     record.stageOutcome = result["outcome"]
     if result["outcome"] not in {"succeeded", "skipped"}:
         record.error = result.get("message")
-    record.timings[f"{stage}Seconds"] = monotonic() - started
+    record.timings["processSeconds"] = monotonic() - started
     record.updatedAt = datetime.now(UTC)
     check()
     storage.write_json(
         f"{dataset_prefix(cytebase_id)}/dataset.json", record.model_dump(mode="json")
+    )
+    logger.info(
+        "Dataset worker finished: dataset=%s outcome=%s status=%s timings=%s message=%s",
+        cytebase_id,
+        result["outcome"],
+        record.status,
+        {key: round(value, 2) for key, value in record.timings.items()},
+        result.get("message", ""),
     )
     return result | {
         "cytebaseId": cytebase_id,
@@ -221,20 +386,17 @@ def build_catalog(request: dict, run_id: str) -> dict:
         _owner(storage, run_id, "catalog", modal.current_function_call_id())
 
     check()
-    return run_catalog(request, storage, check)
-
-
-@app.function(
-    image=image,
-    secrets=[secret],
-    cpu=1,
-    memory=4096,
-    timeout=86400,
-    retries=0,
-    max_containers=LIMITS["DOWNLOAD"],
-)
-def download_h5ad(cytebase_id: str, run_id: str, request: dict) -> dict:
-    return _execute("download", cytebase_id, run_id, request)
+    started = monotonic()
+    logger.info("Catalog worker started: run=%s", run_id)
+    try:
+        result = run_catalog(request, storage, check)
+    except Exception:
+        logger.exception("Catalog worker failed: run=%s", run_id)
+        raise
+    logger.info(
+        "Catalog worker finished: run=%s elapsed=%.1fs", run_id, monotonic() - started
+    )
+    return result
 
 
 @app.function(
@@ -244,23 +406,10 @@ def download_h5ad(cytebase_id: str, run_id: str, request: dict) -> dict:
     memory=4096,
     timeout=86400,
     retries=0,
-    max_containers=LIMITS["BUILD"],
+    max_containers=PROCESS_CONTAINERS,
 )
-def build_scarf(cytebase_id: str, run_id: str, request: dict) -> dict:
-    return _execute("build", cytebase_id, run_id, request)
-
-
-@app.function(
-    image=image,
-    secrets=[secret],
-    cpu=2,
-    memory=4096,
-    timeout=14400,
-    retries=0,
-    max_containers=LIMITS["CLEANUP"],
-)
-def cleanup(cytebase_id: str, run_id: str, request: dict) -> dict:
-    return _execute(request.get("stage", "cleanup"), cytebase_id, run_id, request)
+def process_dataset(cytebase_id: str, run_id: str, request: dict) -> dict:
+    return _execute(cytebase_id, run_id, request)
 
 
 def _reset(storage: Bucket, request: dict) -> dict:
@@ -288,7 +437,7 @@ def _reset(storage: Bucket, request: dict) -> dict:
             # Modal re-raises original worker exceptions, not just RemoteError.
             # Failed or unavailable results rely on the required operator drain
             # confirmation; no elapsed-time inference authorizes this reset.
-            logging.warning(
+            logger.warning(
                 "Using explicit worker-drain confirmation for call %s: %s",
                 call_id,
                 error_message(error),
@@ -327,24 +476,18 @@ def _reset(storage: Bucket, request: dict) -> dict:
 )
 async def run_pipeline(action: str, request: dict) -> dict:
     """Queue submissions, but advance datasets independently inside each submission."""
-    from .catalog import list_records
-    from .download import prune_groups
-
     storage = _storage()
     if action == "reset":
         return await asyncio.to_thread(_reset, storage, request)
+    if action not in {"register", "catalog", "process"}:
+        raise ValueError(f"Unknown pipeline action: {action}")
     previous = await asyncio.to_thread(storage.read_json, RUN_PATH) or {}
     if previous and previous.get("state") not in {"completed", "failed", "reset"}:
         raise RuntimeError(
             f"Run {previous.get('runId')} has unresolved workers; drain and explicitly reset it before resubmitting"
         )
     groups = {}
-    if action == "prune":
-        records = await asyncio.to_thread(list_records, storage)
-        groups = await asyncio.to_thread(
-            prune_groups, request["approvedPaths"], storage, records, previous
-        )
-    elif action not in {"register", "catalog"}:
+    if action == "process":
         job = ProcessRequest.model_validate(request)
         keys = await asyncio.to_thread(select_dataset_ids, job, storage)
         groups = {key: request for key in keys}
@@ -358,6 +501,12 @@ async def run_pipeline(action: str, request: dict) -> dict:
         "children": {},
     }
     await asyncio.to_thread(storage.write_json, RUN_PATH, state)
+    logger.info(
+        "Pipeline started: run=%s action=%s datasets=%s",
+        state["runId"],
+        action,
+        len(groups),
+    )
     lock = asyncio.Lock()
     uncertain = False
 
@@ -372,6 +521,12 @@ async def run_pipeline(action: str, request: dict) -> dict:
                 state["updatedAt"] = _now()
                 await asyncio.to_thread(storage.write_json, RUN_PATH, state)
                 call = await function.spawn.aio(*args)
+                logger.info(
+                    "Worker submitted: run=%s work=%s call=%s",
+                    state["runId"],
+                    key,
+                    call.object_id,
+                )
                 state["children"][key].update(callId=call.object_id, state="running")
                 await asyncio.to_thread(storage.write_json, RUN_PATH, state)
             result = await call.get.aio()
@@ -381,6 +536,11 @@ async def run_pipeline(action: str, request: dict) -> dict:
                 await asyncio.to_thread(storage.write_json, RUN_PATH, state)
             return result
         except Exception:
+            logger.exception(
+                "Worker failed or result unavailable: run=%s work=%s",
+                state["runId"],
+                key,
+            )
             uncertain = True
             raise
 
@@ -400,56 +560,32 @@ async def run_pipeline(action: str, request: dict) -> dict:
             catalog_result = await publish({"updates": []})
 
             async def one(key, payload):
-                stages = (
-                    ["download", "build", "cleanup"]
-                    if action == "process"
-                    else [action]
-                )
-                outcomes = {}
                 try:
                     record = await asyncio.to_thread(load_record, storage, key)
-                    for stage in stages:
-                        arguments = payload | {
-                            "operation": action,
-                            "stage": stage,
-                            "approvedDeletionPaths": [
-                                path
-                                for path in payload.get("approvedDeletionPaths", [])
-                                if path.startswith(f"{dataset_prefix(key)}/")
-                            ],
-                        }
-                        worker = {
-                            "download": download_h5ad,
-                            "build": build_scarf,
-                            "cleanup": cleanup,
-                            "prune": cleanup,
-                        }[stage]
-                        result = await invoke(
-                            worker,
-                            f"{key}:{stage}",
-                            (key, state["runId"], arguments),
-                            {
-                                "cytebaseId": key,
-                                "datasetVersionId": str(record.latestVersionId),
-                                "stage": stage,
-                            },
-                        )
-                        dirty[key] = result.pop("record")
-                        outcomes[stage] = result
-                        if result["outcome"] not in {"succeeded", "skipped"}:
-                            break
-                    return {
-                        "cytebaseId": key,
-                        "status": result["status"],
-                        "outcome": result["outcome"],
-                        "stages": outcomes,
+                    arguments = payload | {
+                        "approvedDeletionPaths": [
+                            path
+                            for path in payload.get("approvedDeletionPaths", [])
+                            if path.startswith(f"{dataset_prefix(key)}/")
+                        ],
                     }
+                    result = await invoke(
+                        process_dataset,
+                        f"{key}:process",
+                        (key, state["runId"], arguments),
+                        {
+                            "cytebaseId": key,
+                            "datasetVersionId": str(record.latestVersionId),
+                            "stage": "process",
+                        },
+                    )
+                    dirty[key] = result.pop("record")
+                    return result
                 except Exception as error:
                     return {
                         "cytebaseId": key,
                         "outcome": "failed",
                         "message": error_message(error),
-                        "stages": outcomes,
                     }
 
             pending = {
@@ -508,11 +644,31 @@ async def run_pipeline(action: str, request: dict) -> dict:
     }
     if action == "register" and catalog_result:
         result["datasets"] = catalog_result.get("registeredDatasets", [])
+        result["successes"] = [
+            row["collection_id"] for row in catalog_result["registeredCollections"]
+        ]
+        result["failures"] = [
+            row["collectionId"] for row in catalog_result["failedCollections"]
+        ]
+    logger.info(
+        "Pipeline finished: run=%s action=%s state=%s successes=%s failures=%s error=%s",
+        state["runId"],
+        action,
+        state["state"],
+        len(result["successes"]),
+        len(result["failures"]),
+        catalog_error,
+    )
     return result
 
 
 def create_web_app() -> FastAPI:
     web = FastAPI(title="Cytebase pipeline (development)")
+
+    @web.exception_handler(405)
+    async def missing_endpoint(_request, _error):
+        # A generic dataset GET route must not claim unsupported POST endpoints.
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
 
     def submit(action, payload):
         call = run_pipeline.spawn(action, payload)
@@ -528,32 +684,17 @@ def create_web_app() -> FastAPI:
 
         return {"collectionIds": list_collection_ids()}
 
-    def submit_datasets(action: str, job: ProcessRequest):
+    @web.post("/datasets/process", status_code=202)
+    def process(job: ProcessRequest):
         try:
             keys = select_dataset_ids(job, _storage())
         except ValueError as error:
             raise HTTPException(422, detail=error_message(error)) from error
-        return submit(action, job.model_dump(mode="json")) | {
+        return submit("process", job.model_dump(mode="json")) | {
             "datasets": [
                 {"cytebaseId": key, "statusUrl": f"/datasets/{key}"} for key in keys
             ]
         }
-
-    @web.post("/datasets/download", status_code=202)
-    def download(job: ProcessRequest):
-        return submit_datasets("download", job)
-
-    @web.post("/datasets/build", status_code=202)
-    def build(job: ProcessRequest):
-        return submit_datasets("build", job)
-
-    @web.post("/datasets/cleanup", status_code=202)
-    def clean(job: ProcessRequest):
-        return submit_datasets("cleanup", job)
-
-    @web.post("/datasets/process", status_code=202)
-    def process(job: ProcessRequest):
-        return submit_datasets("process", job)
 
     @web.post("/catalog/build", status_code=202)
     def catalog():
@@ -599,8 +740,6 @@ def create_web_app() -> FastAPI:
                 "updatedAt",
                 "error",
                 "needsInput",
-                "checkpointCleanupError",
-                "checkpointPaths",
             )
         }
         if record.stageOutcome == "running":
@@ -614,46 +753,6 @@ def create_web_app() -> FastAPI:
 
             result["replacementPaths"] = replacement_paths(record, storage)
         return result
-
-    @web.get("/downloads")
-    def downloads():
-        from .catalog import list_records
-        from .download import downloads as inventory
-
-        storage = _storage()
-        return {
-            "downloads": inventory(
-                storage, list_records(storage), storage.read_json(RUN_PATH)
-            )
-        }
-
-    @web.post("/downloads/prune", response_model=None)
-    def prune(job: PruneRequest):
-        if job.preview:
-            return {"preview": True, **downloads()}
-        from .catalog import list_records
-        from .download import prune_groups
-
-        storage = _storage()
-        try:
-            groups = prune_groups(
-                job.approvedPaths,
-                storage,
-                list_records(storage),
-                storage.read_json(RUN_PATH),
-            )
-        except ValueError as error:
-            raise HTTPException(409, detail=error_message(error)) from error
-        return JSONResponse(
-            status_code=202,
-            content=submit("prune", job.model_dump(mode="json"))
-            | {
-                "datasets": [
-                    {"cytebaseId": key, "statusUrl": f"/datasets/{key}"}
-                    for key in groups
-                ]
-            },
-        )
 
     @web.get("/health")
     def health():

@@ -27,6 +27,8 @@ class Manifest(BaseModel):
     countsDtype: str | None = None
     countsIntegerLike: bool | None = None
     countsMax: float | None = None
+    countsSampleMax: float | None = None
+    countsValidationMode: Literal["sampled_rows"] | None = None
     isPrimaryDataCounts: dict[str, int]
     featureIdKey: str
     featureNameKey: str
@@ -79,13 +81,6 @@ class ProcessRequest(BaseModel):
                 "Supply exactly one of cytebaseIds, collectionId, or collectionIds"
             )
         return self
-
-
-class PruneRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    preview: bool = True
-    approvedPaths: list[str] = Field(default_factory=list)
 
 
 class FacetTerm(BaseModel):
@@ -143,6 +138,3 @@ class DatasetRecord(BaseModel):
     error: str | None = None
     needsInput: dict | None = None
     timings: dict[str, float] = Field(default_factory=dict)
-    checkpointPaths: list[str] = Field(default_factory=list)
-    checkpointCleanupError: str | None = None
-    cleanupIntent: dict | None = None

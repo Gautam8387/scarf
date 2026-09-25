@@ -1,4 +1,4 @@
-"""Inspect staged H5ADs, build Scarf stores, and verify exact published arrays."""
+"""Inspect local H5ADs, build Scarf stores, and verify exact published arrays."""
 
 import hashlib
 import math
@@ -7,7 +7,6 @@ from collections.abc import Callable, Iterator
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from time import perf_counter
 from typing import Any
 
@@ -25,6 +24,7 @@ from .._storage import Bucket, dataset_prefix, retry
 from .models import DatasetRecord, Manifest
 
 _BLOCK_VALUES = 1_000_000
+_VALIDATION_ROWS = 100
 _UNS_MAX_VALUES = 100_000
 _UNS_MAX_BYTES = 1_048_576
 
@@ -60,25 +60,33 @@ def _uns_value(node: h5py.Group | h5py.Dataset) -> Any:
     return _json_safe(node[()])
 
 
-def _value_blocks(dataset: h5py.Dataset) -> Iterator[np.ndarray]:
-    if dataset.ndim == 1:
-        for start in range(0, dataset.shape[0], _BLOCK_VALUES):
-            yield dataset[start : start + _BLOCK_VALUES]
+def _sample_row_blocks(
+    values: h5py.Dataset,
+    row: int,
+    columns: int,
+    indices: h5py.Dataset | None,
+    indptr: h5py.Dataset | None,
+) -> Iterator[np.ndarray]:
+    """Read all columns in one sampled row without materializing sparse zeros."""
+    if indices is None or indptr is None:
+        for start in range(0, columns, _BLOCK_VALUES):
+            yield values[row, start : start + _BLOCK_VALUES]
         return
-    if dataset.ndim != 2:
-        raise ValueError(f"Expected a matrix or sparse data vector: {dataset.name}")
-    rows, columns = dataset.shape
-    column_step = min(columns, _BLOCK_VALUES) or 1
-    row_step = max(1, _BLOCK_VALUES // column_step)
-    for row in range(0, rows, row_step):
-        for column in range(0, columns, column_step):
-            yield dataset[row : row + row_step, column : column + column_step].reshape(
-                -1
+    start, stop = (int(value) for value in indptr[row : row + 2])
+    if not 0 <= start <= stop <= values.size:
+        raise ValueError(f"Sparse row {row} has invalid indptr boundaries")
+    for offset in range(start, stop, _BLOCK_VALUES):
+        end = min(offset + _BLOCK_VALUES, stop)
+        gene_indices = indices[offset:end]
+        if np.any(gene_indices < 0) or np.any(gene_indices >= columns):
+            raise ValueError(
+                f"Sparse indices in sampled row {row} exceed gene dimensions"
             )
+        yield values[offset:end]
 
 
 def _matrix_info(node: h5py.Group | h5py.Dataset) -> dict[str, Any]:
-    """Read structure only; candidate validation scans stored values separately."""
+    """Read structure only; candidate validation samples rows separately."""
     sparse = isinstance(node, h5py.Group)
     values = node.get("data") if sparse else node
     shape = (
@@ -131,11 +139,13 @@ def _validate_candidate(
     info: dict[str, Any],
     progress: Callable | None,
 ) -> dict[str, Any]:
-    """Validate all count values and sparse structure with bounded reads."""
+    """Check up to 100 evenly spaced cells across every feature, using bounded reads."""
     result = info | {
         "present": True,
         "validCounts": False,
         "validationComplete": False,
+        "validationMode": "sampled_rows",
+        "fullMatrixValidated": False,
         "reasons": [],
     }
     reasons = result["reasons"]
@@ -151,7 +161,7 @@ def _validate_candidate(
         not isinstance(shape, list)
         or len(shape) != 2
         or shape != expected
-        or any(size is None for size in expected)
+        or any(size is None or size < 1 for size in expected)
     ):
         reasons.append(
             f"Matrix shape {shape} does not match obs and {feature_key} dimensions {expected}"
@@ -168,6 +178,13 @@ def _validate_candidate(
 
     encoding = str(info["encoding"]).lower()
     result["formatSupported"] = not sparse or encoding in {"csr", "csr_matrix"}
+    if not result["formatSupported"]:
+        reasons.append(
+            f"Sparse encoding {encoding!r} cannot be sampled by cell for bounded conversion. "
+            "Scarf materializes CSC inputs. Provide CSR or dense counts."
+        )
+        return result
+    indices = indptr = None
     if sparse:
         indices, indptr = node.get("indices"), node.get("indptr")
         if not all(
@@ -183,82 +200,66 @@ def _validate_candidate(
         if indices.size != values.size:
             reasons.append("Sparse indices and values have different lengths")
             return result
-        if encoding in {"csr", "csr_matrix", "csc", "csc_matrix"}:
-            compressed = 1 if encoding in {"csc", "csc_matrix"} else 0
-            if (
-                indptr.size != shape[compressed] + 1
-                or indptr[0] != 0
-                or indptr[-1] != values.size
-            ):
-                reasons.append(
-                    "Sparse indptr endpoints or length do not match the matrix dimensions"
-                )
-                return result
-            previous = 0
-            for block in _value_blocks(indptr):
-                if (
-                    np.any(block[1:] < block[:-1])
-                    or block[0] < previous
-                    or block[-1] > values.size
-                ):
-                    reasons.append(
-                        "Sparse indptr must increase monotonically within the stored values"
-                    )
-                    return result
-                previous = int(block[-1])
-            for block in _value_blocks(indices):
-                if np.any(block < 0) or np.any(block >= shape[1 - compressed]):
-                    reasons.append("Sparse indices exceed the matrix dimensions")
-                    return result
+        if indptr.size != shape[0] + 1 or indptr[0] != 0 or indptr[-1] != values.size:
+            reasons.append(
+                "Sparse indptr endpoints or length do not match the matrix dimensions"
+            )
+            return result
 
-    checked, nonzero = 0, 0
+    rows = np.linspace(0, shape[0] - 1, min(_VALIDATION_ROWS, shape[0]), dtype=np.int64)
+    result.update(sampledRows=rows.tolist(), columnsChecked=shape[1])
+    checked = 0
     finite, nonnegative, integral = True, True, True
     maximum = 0
     if progress is not None:
         progress(
             "validating_counts",
             completed=0,
-            total=int(values.size),
-            unit="values",
-            message=key,
+            total=len(rows),
+            unit="rows",
+            message=f"{key}: sampling {len(rows)} cells across all {shape[1]} genes",
         )
-    for block in _value_blocks(values):
-        finite = finite and bool(np.all(np.isfinite(block)))
-        nonnegative = nonnegative and bool(np.all(block >= 0))
-        if values.dtype.kind == "f":
-            integral = integral and bool(
-                np.all(np.isfinite(block)) and np.all(block == np.floor(block))
-            )
-        if block.size:
-            finite_values = block[np.isfinite(block)]
-            if finite_values.size:
-                maximum = max(maximum, finite_values.max().item())
-        if not sparse:
-            nonzero += int(np.count_nonzero(block))
-        checked += int(block.size)
+    for completed, row in enumerate(rows, start=1):
+        try:
+            for block in _sample_row_blocks(
+                values, int(row), shape[1], indices, indptr
+            ):
+                is_finite = np.isfinite(block)
+                finite = finite and bool(np.all(is_finite))
+                nonnegative = nonnegative and bool(np.all(block >= 0))
+                if values.dtype.kind == "f":
+                    integral = integral and bool(np.all(block == np.floor(block)))
+                finite_values = block[is_finite]
+                if finite_values.size:
+                    maximum = max(maximum, finite_values.max().item())
+                checked += int(block.size)
+        except ValueError as error:
+            reasons.append(str(error))
+            return result
         if progress is not None:
             progress(
                 "validating_counts",
-                completed=checked,
-                total=int(values.size),
-                unit="values",
-                message=key,
+                completed=completed,
+                total=len(rows),
+                unit="rows",
+                storedValuesChecked=checked,
+                message=f"{key}: sampling cells across all {shape[1]} genes",
             )
     if not finite:
-        reasons.append("Stored values include NaN or infinity")
+        reasons.append("Sampled rows include NaN or infinity")
     if not nonnegative:
-        reasons.append("Stored values include negative counts")
+        reasons.append("Sampled rows include negative counts")
     if not integral:
-        reasons.append("Stored values include non-integer counts")
+        reasons.append("Sampled rows include non-integer counts")
     result.update(
         validationComplete=True,
         validCounts=not reasons,
+        rowsChecked=len(rows),
         valuesChecked=checked,
         finite=finite,
         nonnegative=nonnegative,
         integerLike=finite and integral,
-        max=maximum,
-        nnz=info["nnz"] if sparse else nonzero,
+        sampleMax=maximum,
     )
     return result
 
@@ -316,6 +317,17 @@ def _select_counts(
             if validate(key):
                 selected = key
                 break
+            if diagnostics[key].get("formatSupported") is False:
+                return (
+                    "none",
+                    diagnostics,
+                    {
+                        "question": f"Preferred matrix {key} is unsupported: "
+                        + "; ".join(diagnostics[key]["reasons"]),
+                        "options": ["CSR H5AD", "Dense H5AD"],
+                        "candidates": diagnostics,
+                    },
+                )
     if selected == "none":
         valid_layers = [key for key in candidates[2:] if validate(key)]
         if len(valid_layers) == 1:
@@ -325,7 +337,7 @@ def _select_counts(
                 selected,
                 diagnostics,
                 {
-                    "question": "Both counts layers contain valid counts. Select the intended layer explicitly before conversion.",
+                    "question": "Both counts layers pass the sampled counts check. Select the intended layer explicitly before conversion.",
                     "options": valid_layers,
                     "candidates": diagnostics,
                 },
@@ -335,18 +347,8 @@ def _select_counts(
             selected,
             diagnostics,
             {
-                "question": "No supported candidate contains finite, nonnegative, integer counts with matching obs and feature dimensions. Review the candidate reasons and provide a corrected H5AD.",
+                "question": "No supported candidate passes the sampled counts and dimension checks. Review the candidate reasons and provide a corrected H5AD.",
                 "options": [key for key in candidates if key in h5],
-                "candidates": diagnostics,
-            },
-        )
-    if not diagnostics[selected]["formatSupported"]:
-        return (
-            selected,
-            diagnostics,
-            {
-                "question": f"Selected {selected} uses {diagnostics[selected]['encoding']}. CSC is materialized by core Scarf and other sparse encodings are unsupported. Provide CSR or dense counts for bounded conversion.",
-                "options": ["CSR H5AD", "Dense H5AD"],
                 "candidates": diagnostics,
             },
         )
@@ -431,6 +433,11 @@ def inspect_file(
         counts_location, diagnostics, needs_input = _select_counts(
             h5, matrices, progress, raw_data_location
         )
+        if progress is not None:
+            progress(
+                "inspecting_metadata",
+                message="Reading feature metadata, cell annotations and source embeddings",
+            )
         selected = matrices.get(counts_location)
         feature_attrs = "raw/var" if counts_location == "raw/X" else "var"
         feature_table = h5.get(feature_attrs)
@@ -493,7 +500,9 @@ def inspect_file(
             else "inspection",
             "countsDtype": selected["dtype"] if selected else None,
             "countsIntegerLike": selected["integerLike"] if selected else None,
-            "countsMax": selected["max"] if selected else None,
+            "countsMax": None,
+            "countsSampleMax": selected["sampleMax"] if selected else None,
+            "countsValidationMode": "sampled_rows" if selected else None,
             "isPrimaryDataCounts": {
                 "true": int(np.count_nonzero(primary == True)),  # noqa: E712
                 "false": int(np.count_nonzero(primary == False)),  # noqa: E712
@@ -544,6 +553,7 @@ def _validated_manifest(value: dict) -> dict:
         "featureAttrsKey",
         "selectionDiagnostics",
         "selectionNeedsInput",
+        "countsValidationMode",
     }
     if missing := required - value.keys():
         raise ValueError(
@@ -574,9 +584,11 @@ def _validated_manifest(value: dict) -> dict:
         selected.get("validationComplete") is True
         and selected.get("validCounts") is True
         and selected.get("formatSupported") is True
+        and selected.get("validationMode") == "sampled_rows"
+        and manifest["countsValidationMode"] == "sampled_rows"
     ):
         raise ValueError(
-            "Conversion requires fully validated, supported counts. Inspect the source before conversion."
+            "Conversion requires the current sampled-row counts check. Inspect the source before conversion."
         )
     feature_table = "raw/var" if key == "raw/X" else "var"
     if (
@@ -629,6 +641,7 @@ def convert_local(
             "featureIdKey": manifest["featureIdKey"],
             "featureNameKey": manifest["featureNameKey"],
             "selectionDiagnostics": manifest["selectionDiagnostics"],
+            "storageDtypePolicy": "preserve_source",
             "assayName": "RNA",
             "storageProfile": "cloud",
         },
@@ -673,6 +686,15 @@ def convert_local(
             [inspection.featureAttrsKey, manifest["featureAttrsKey"]],
         )
     with h5py.File(source, "r") as h5:
+        source_matrix = h5[manifest["countsLocation"]]
+        source_values = (
+            source_matrix["data"]
+            if isinstance(source_matrix, h5py.Group)
+            else source_matrix
+        )
+        source_dtype = str(source_values.dtype)
+        if source_dtype != manifest["countsDtype"]:
+            raise ValueError("Source dtype does not match the inspection manifest")
         if manifest["featureNameKey"] not in h5[inspection.featureAttrsKey]:
             return _needs_input(
                 record,
@@ -688,11 +710,16 @@ def convert_local(
         feature_ids_key=manifest["featureIdKey"],
         feature_name_key=manifest["featureNameKey"],
         embedding_roles=embedding_roles,
+        # Preserve losslessly without Scarf's separate full-matrix dtype scan.
+        dtype=source_dtype,
     )
     writer = None
     try:
         if progress is not None:
-            progress("converting")
+            progress(
+                "converting",
+                message=f"Building RNA counts and countsT; preserving source dtype {source_dtype}",
+            )
         writer = scarf.H5adToZarr(
             reader,
             zarr_loc=str(destination),
@@ -786,35 +813,6 @@ def _open_verified_arrays(
         raise
 
 
-def verify_metadata(
-    location: str,
-    manifest: dict,
-    storage_options: dict | None = None,
-    verification: dict | None = None,
-) -> dict:
-    """Check fixed metadata paths against a build receipt, without count reads."""
-    root, _, _, metadata = _open_verified_arrays(location, manifest, storage_options)
-    try:
-        if verification is not None:
-            if verification.get("countsTMatches") is not True or (
-                "sourceSampleMatches" in verification
-                and verification["sourceSampleMatches"] is not True
-            ):
-                raise ValueError("Build receipt has no successful remote sample check")
-            required = {"nObs", "nVars", "countsDtype", "countsTShape"}
-            if any(
-                verification.get(key) != value
-                for key, value in metadata.items()
-                if key in required or key in verification
-            ):
-                raise ValueError(
-                    "Scarf metadata no longer matches its verified build receipt"
-                )
-        return metadata
-    finally:
-        root.store.close()
-
-
 def verify_store(
     location: str,
     manifest: dict,
@@ -884,179 +882,179 @@ def _source_details(record: DatasetRecord, size: int, checksum: str) -> None:
             version.sourceSha256 = checksum
 
 
-def run_build(
+def build_local(
+    record: DatasetRecord,
+    source: Path,
+    store: Path,
+    raw: dict,
+    size: int,
+    checksum: str,
+    progress: Callable,
+) -> tuple[Manifest, dict]:
+    """Inspect and convert one verified source in a caller-owned workspace."""
+    step = perf_counter()
+    progress("inspecting", message="Inspecting H5AD structure and metadata")
+    inspected = inspect_file(source, raw.get("raw_data_location"), progress=progress)
+    fields = inspected["manifest"] | {
+        "title": record.title,
+        "citation": record.citation,
+        "doi": record.doi,
+        "schemaVersion": record.schemaVersion,
+        "metadataSource": "curation_api",
+        "organism": ", ".join(term.label for term in record.facets.get("organism", []))
+        or None,
+    }
+    manifest = Manifest(
+        **fields,
+        collectionId=record.collectionId,
+        datasetId=record.datasetId,
+        datasetVersionId=record.latestVersionId,
+        sourceUrl=record.sourceUrl,
+        sourceBytes=size,
+        sourceSha256=checksum,
+        ingestedAt=datetime.now(UTC),
+        pipelineVersion=record.pipelineVersion,
+    )
+    primary_count = manifest.isPrimaryDataCounts["true"]
+    if primary_count == 0 or (
+        record.primaryCellCount is not None and record.primaryCellCount != primary_count
+    ):
+        raise ValueError("H5AD primary-cell count disagrees with registration")
+    record.timings["inspectSeconds"] = perf_counter() - step
+    step = perf_counter()
+    converted = convert_local(
+        source, store, manifest.model_dump(mode="json"), progress=progress
+    )
+    record.timings["convertSeconds"] = perf_counter() - step
+    converted.update(
+        cytebaseId=record.cytebaseId,
+        collectionId=str(record.collectionId),
+        datasetId=str(record.datasetId),
+        datasetVersionId=str(record.latestVersionId),
+        pipelineVersion=record.pipelineVersion,
+        sourcePath=record.sourceUrl,
+        inspection={
+            name: inspected[name] for name in ("h5ad_keys", "obs_summary", "uns")
+        },
+    )
+    if converted["status"] not in {"done", "needsInput"}:
+        raise RuntimeError("Scarf conversion did not complete")
+    return manifest, converted
+
+
+def publish_store(
     record: DatasetRecord,
     request: dict,
     storage: Bucket,
+    store: Path,
+    manifest: Manifest,
+    converted: dict,
     progress: Callable,
     assert_owner: Callable[[], None],
 ) -> dict:
-    """Restore, inspect, convert and publish one claimed dataset version."""
-    from .download import get_completion, restore_h5ad
-
-    if (
-        record.status == "ready"
-        and record.processedVersionId == record.latestVersionId
-        and record.zarrUri is not None
-        and not request.get("force", False)
-    ):
-        return {
-            "outcome": "skipped",
-            "message": "The registered version already has a ready Scarf store",
-        }
-    if get_completion(record, storage) is None:
-        return {
-            "outcome": "unmetPrerequisite",
-            "message": "No verified staged download exists for this version; run /datasets/download first",
-        }
+    """Publish verified local output and commit readiness before local cleanup."""
     prefix = dataset_prefix(record.cytebaseId)
     version_id = str(record.latestVersionId)
     zarr_uri = f"{storage.root}/{prefix}/data.zarr"
-    with TemporaryDirectory(prefix="cytebase-build-") as directory:
-        raw = storage.read_json(f"{prefix}/cellxgene/dataset.json")
-        if raw is None or raw.get("dataset_version_id") != version_id:
-            raise ValueError("Registered source metadata is missing or has changed")
-        source = Path(directory) / "source.h5ad"
-        store = Path(directory) / "data.zarr"
-        step = perf_counter()
-        progress("restoring_download", message="Restoring committed HF chunks")
-        size, checksum = restore_h5ad(record, source, storage, progress=progress)
-        record.timings["restoreSeconds"] = perf_counter() - step
-        step = perf_counter()
-        progress("inspecting", message="Inspecting H5AD structure and metadata")
-        inspected = inspect_file(
-            source, raw.get("raw_data_location"), progress=progress
-        )
-        fields = inspected["manifest"] | {
-            "title": record.title,
-            "citation": record.citation,
-            "doi": record.doi,
-            "schemaVersion": record.schemaVersion,
-            "metadataSource": "curation_api",
-            "organism": ", ".join(
-                term.label for term in record.facets.get("organism", [])
-            )
-            or None,
-        }
-        manifest = Manifest(
-            **fields,
-            collectionId=record.collectionId,
-            datasetId=record.datasetId,
-            datasetVersionId=record.latestVersionId,
-            sourceUrl=record.sourceUrl,
-            sourceBytes=size,
-            sourceSha256=checksum,
-            ingestedAt=datetime.now(UTC),
-            pipelineVersion=record.pipelineVersion,
-        )
-        primary_count = manifest.isPrimaryDataCounts["true"]
-        if primary_count == 0 or (
-            record.primaryCellCount is not None
-            and record.primaryCellCount != primary_count
-        ):
-            raise ValueError("H5AD primary-cell count disagrees with registration")
-        record.timings["inspectSeconds"] = perf_counter() - step
-        step = perf_counter()
-        converted = convert_local(
-            source, store, manifest.model_dump(mode="json"), progress=progress
-        )
-        record.timings["convertSeconds"] = perf_counter() - step
-        converted.update(
-            cytebaseId=record.cytebaseId,
-            collectionId=str(record.collectionId),
-            datasetId=str(record.datasetId),
-            datasetVersionId=version_id,
-            pipelineVersion=record.pipelineVersion,
-            sourcePath=record.sourceUrl,
-            zarrPath=zarr_uri,
-            inspection={
-                name: inspected[name] for name in ("h5ad_keys", "obs_summary", "uns")
-            },
-        )
-        if converted["status"] not in {"done", "needsInput"}:
-            raise RuntimeError("Scarf conversion did not complete")
-        assert_owner()
-        replacements = replacement_paths(record, storage)
-        if converted["status"] == "needsInput":
-            if not replacements:
-                progress(
-                    "uploading_metadata", message="Preserving inspection and provenance"
-                )
-                assert_owner()
-                storage.write_json(f"{prefix}/scarf_ingest.json", converted)
-                record.inspection = manifest
-                _source_details(record, size, checksum)
-            record.status = "needsInput"
-            record.needsInput = converted.get("needsInput")
-            return {
-                "outcome": "needsInput",
-                "message": "Counts conversion needs a user decision",
-            }
-        approved = set(request.get("approvedDeletionPaths", []))
-        missing = sorted(set(replacements) - approved)
-        if missing:
-            return {
-                "outcome": "needsApproval",
-                "message": "Review these exact generated paths and resubmit with approvedDeletionPaths",
-                "deletionPaths": missing,
-            }
-        # Commit the unavailable state before replacing a previously ready store.
-        record.status = "processing"
-        record.processedVersionId = None
-        record.processedAt = None
-        record.zarrUri = None
-        record.buildReceipt = None
-        record.updatedAt = datetime.now(UTC)
-        assert_owner()
-        storage.write_json(f"{prefix}/dataset.json", record.model_dump(mode="json"))
-        if replacements:
+    converted["zarrPath"] = zarr_uri
+    assert_owner()
+    replacements = replacement_paths(record, storage)
+    if converted["status"] == "needsInput":
+        if not replacements:
             progress(
-                "replacing", message="Removing explicitly approved generated files"
+                "uploading_metadata", message="Preserving inspection and provenance"
             )
             assert_owner()
-            storage.delete_exact(replacements)
-        step = perf_counter()
-        progress("uploading_store", message="Uploading Scarf Zarr hierarchy")
-        assert_owner()
-        storage.sync_store(store, record.cytebaseId)
-        record.timings["uploadSeconds"] = perf_counter() - step
-        step = perf_counter()
-        progress(
-            "verifying_store",
-            message="Comparing published counts with the local store sample",
-        )
-        converted["verification"] = retry(
-            lambda: verify_store(
-                zarr_uri,
-                manifest.model_dump(mode="json"),
-                storage_options={"token": storage.token, "skip_instance_cache": True},
-                local_location=str(store),
-            ),
-            progress=progress,
-        )
-        record.timings["verifySeconds"] = perf_counter() - step
-        completed = datetime.now(UTC)
-        converted["completedAt"] = completed.isoformat()
-        assert_owner()
-        storage.write_json(f"{prefix}/scarf_ingest.json", converted)
-        record.processedVersionId = record.latestVersionId
-        record.processedAt = completed
-        record.zarrUri = zarr_uri
-        record.h5adUri = None
+            storage.write_json(f"{prefix}/scarf_ingest.json", converted)
         record.inspection = manifest
-        record.cellCount, record.nGenes = manifest.nObs, manifest.nVars
-        record.primaryCellCount = primary_count
-        record.needsInput = None
-        _source_details(record, size, checksum)
-        for version in record.versions:
-            if version.datasetVersionId == record.latestVersionId:
-                version.processedAt = completed
-        record.buildReceipt = {
-            "datasetVersionId": version_id,
-            "sourceSha256": checksum,
-            "zarrUri": zarr_uri,
-            "verifiedAt": completed.isoformat(),
-            "verification": converted["verification"],
+        _source_details(record, manifest.sourceBytes, manifest.sourceSha256)
+        record.status = "needsInput"
+        record.needsInput = converted.get("needsInput")
+        return {
+            "outcome": "needsInput",
+            "message": "Counts conversion needs a user decision",
         }
-        record.status = "ready"
+    approved = set(request.get("approvedDeletionPaths", []))
+    missing = sorted(set(replacements) - approved)
+    if missing:
+        return {
+            "outcome": "needsApproval",
+            "message": "Review these exact generated paths and resubmit with approvedDeletionPaths",
+            "deletionPaths": missing,
+        }
+    # Commit the unavailable state before replacing a previously ready store.
+    record.status = "processing"
+    record.processedVersionId = None
+    record.processedAt = None
+    record.zarrUri = None
+    record.buildReceipt = None
+    record.updatedAt = datetime.now(UTC)
+    assert_owner()
+    storage.write_json(f"{prefix}/dataset.json", record.model_dump(mode="json"))
+    assert_owner()
+    replacements = replacement_paths(record, storage)
+    missing = sorted(set(replacements) - approved)
+    if missing:
+        return {
+            "outcome": "needsApproval",
+            "message": "Generated output changed during publication; review these exact paths and resubmit with approvedDeletionPaths",
+            "deletionPaths": missing,
+        }
+    if replacements:
+        progress("replacing", message="Removing explicitly approved generated files")
+        assert_owner()
+        storage.delete_exact(replacements)
+    step = perf_counter()
+    progress("uploading_store", message="Uploading Scarf Zarr hierarchy")
+    assert_owner()
+    storage.sync_store(store, record.cytebaseId)
+    record.timings["uploadSeconds"] = perf_counter() - step
+    step = perf_counter()
+    progress(
+        "verifying_store",
+        message="Comparing published counts with the local store sample",
+    )
+    converted["verification"] = retry(
+        lambda: verify_store(
+            zarr_uri,
+            manifest.model_dump(mode="json"),
+            storage_options={"token": storage.token, "skip_instance_cache": True},
+            local_location=str(store),
+        ),
+        progress=progress,
+    )
+    record.timings["verifySeconds"] = perf_counter() - step
+    completed = datetime.now(UTC)
+    converted["completedAt"] = completed.isoformat()
+    assert_owner()
+    storage.write_json(f"{prefix}/scarf_ingest.json", converted)
+    record.processedVersionId = record.latestVersionId
+    record.processedAt = completed
+    record.zarrUri = zarr_uri
+    record.h5adUri = None
+    record.inspection = manifest
+    record.cellCount, record.nGenes = manifest.nObs, manifest.nVars
+    record.primaryCellCount = manifest.isPrimaryDataCounts["true"]
+    record.needsInput = None
+    _source_details(record, manifest.sourceBytes, manifest.sourceSha256)
+    for version in record.versions:
+        if version.datasetVersionId == record.latestVersionId:
+            version.processedAt = completed
+    record.buildReceipt = {
+        "datasetVersionId": version_id,
+        "sourceSha256": manifest.sourceSha256,
+        "zarrUri": zarr_uri,
+        "verifiedAt": completed.isoformat(),
+        "verification": converted["verification"],
+    }
+    ready = record.model_copy(
+        update={"status": "ready", "stageOutcome": "succeeded", "updatedAt": completed}
+    )
+    assert_owner()
+    storage.write_json(f"{prefix}/dataset.json", ready.model_dump(mode="json"))
+    record.status, record.stageOutcome, record.updatedAt = (
+        ready.status,
+        ready.stageOutcome,
+        ready.updatedAt,
+    )
     return {"outcome": "succeeded"}

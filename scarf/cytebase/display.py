@@ -7,6 +7,7 @@ from typing import Any
 _HEADERS = {
     "cytebase_id": "Cytebase ID",
     "status": "Status",
+    "title": "Title",
     "cell_count": "Cells",
     "primary_cell_count": "Primary cells",
     "n_genes": "Genes",

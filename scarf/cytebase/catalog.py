@@ -24,6 +24,8 @@ if TYPE_CHECKING:
 
     from scarf import DataStore
 
+    from .dataset import CytebaseDataset
+
 _CATALOG_PATH = "catalog/cytebase.duckdb"
 _HASH_PATH = f"{_CATALOG_PATH}.sha256"
 _HASH_PATTERN = re.compile(rb"([0-9a-fA-F]{64})  cytebase\.duckdb(?:\r?\n)?")
@@ -43,6 +45,30 @@ _FACET_COLUMNS = {
     facet: f"{facet}_labels" if facet != "suspension_type" else "suspension_types"
     for facet in FACETS
 }
+_READY_PREDICATE = (
+    "status = 'ready' AND processed_version_id = latest_version_id "
+    "AND zarr_uri IS NOT NULL"
+)
+_DATASET_ORDER = " ORDER BY cell_count DESC NULLS LAST, cytebase_id"
+_SEARCH_TEXT = " || ' ' || ".join(
+    [
+        "coalesce(cytebase_id, '')",
+        "coalesce(title, '')",
+        "coalesce(citation, '')",
+        "coalesce(first_author, '')",
+        *(
+            f"coalesce(array_to_string({column}, ' '), '')"
+            for column in dict.fromkeys(_FACET_COLUMNS.values())
+        ),
+    ]
+)
+_SEARCH_COLUMNS = (
+    "cytebase_id",
+    "title",
+    "cell_count",
+    "tissue_labels",
+    "disease_labels",
+)
 
 
 def _cache_directory(storage: Bucket) -> Path:
@@ -252,9 +278,7 @@ class Catalog:
         predicates = []
         parameters = []
         if ready_only:
-            predicates.append(
-                "status = 'ready' AND processed_version_id = latest_version_id AND zarr_uri IS NOT NULL"
-            )
+            predicates.append(_READY_PREDICATE)
         for facet, values in facets.items():
             if facet not in _FACET_COLUMNS:
                 raise ValueError(
@@ -268,12 +292,7 @@ class Catalog:
             predicates.append(f"list_has_any({_FACET_COLUMNS[facet]}, ?)")
             parameters.append(labels)
         where = " WHERE " + " AND ".join(predicates) if predicates else ""
-        rows = self.query(
-            "SELECT * FROM datasets"
-            + where
-            + " ORDER BY cell_count DESC NULLS LAST, cytebase_id",
-            parameters,
-        )
+        rows = self.query("SELECT * FROM datasets" + where + _DATASET_ORDER, parameters)
         return CatalogResults(
             rows,
             columns=(
@@ -285,6 +304,41 @@ class Catalog:
                 "disease_labels",
             ),
         )
+
+    def search(
+        self, text: str, *, ready_only: bool = True, limit: int | None = 50
+    ) -> CatalogResults:
+        """Find datasets whose text matches every word in ``text``, ignoring case.
+
+        Words are matched against the ID, title, citation, first author, and all
+        facet labels. Use :meth:`find_datasets` for exact ontology labels.
+        """
+        if not isinstance(text, str) or not text.split():
+            raise ValueError("Provide at least one search word")
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or limit < 1
+        ):
+            raise ValueError("limit must be a positive integer or None")
+        words = text.split()
+        predicates = [f"({_SEARCH_TEXT}) ILIKE ?" for _ in words]
+        parameters: list[Any] = [f"%{word}%" for word in words]
+        if ready_only:
+            predicates.append(_READY_PREDICATE)
+        sql = "SELECT * FROM datasets WHERE " + " AND ".join(predicates)
+        sql += _DATASET_ORDER
+        if limit is not None:
+            sql += " LIMIT ?"
+            parameters.append(limit)
+        return CatalogResults(self.query(sql, parameters), columns=_SEARCH_COLUMNS)
+
+    def dataset(self, cytebase_id: str) -> "CytebaseDataset":
+        """Return a handle for one catalog dataset without opening its store."""
+        from .dataset import CytebaseDataset
+
+        rows = self.query("SELECT * FROM datasets WHERE cytebase_id = ?", [cytebase_id])
+        if not rows:
+            raise KeyError(f"No catalog dataset is registered as {cytebase_id!r}")
+        return CytebaseDataset(self, rows[0])
 
     def list_terms(self, facet: str | None = None) -> CatalogResults:
         """List all facets, or one facet, using the published natural-sort ranks."""
