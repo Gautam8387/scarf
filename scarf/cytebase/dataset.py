@@ -1,5 +1,6 @@
 """One catalog dataset: details, read-only access, and precomputed CELLxGENE results."""
 
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -22,6 +23,8 @@ _SUMMARY_FACETS = (
     ("Diseases", "disease_labels"),
     ("Suspension", "suspension_types"),
 )
+# CELLxGENE citations join the publication, dataset version, and collection on one line.
+_CITATION_BREAKS = re.compile(r"\s+(?=Dataset Version:|curated and distributed by)")
 
 
 class CytebaseDataset:
@@ -74,7 +77,12 @@ class CytebaseDataset:
         row = self.row
         lines = [f"### {self.title or self.id}", "", f"- **Cytebase ID:** `{self.id}`"]
         if self.citation:
-            lines.append(f"- **Citation:** {self.citation}")
+            parts = _CITATION_BREAKS.split(self.citation.strip())
+            if len(parts) == 1:
+                lines.append(f"- **Citation:** {parts[0]}")
+            else:
+                lines.append("- **Citation:**")
+                lines.extend(f"    - {part}" for part in parts)
         if row.get("doi"):
             lines.append(f"- **DOI:** {row['doi']}")
         for label, key in (

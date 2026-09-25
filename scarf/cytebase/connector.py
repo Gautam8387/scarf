@@ -148,6 +148,7 @@ def open_dataset(
         identity["zarrUri"],
         zarr_mode="r",
         storage_options={"token": storage.token, "skip_instance_cache": True},
+        zarrProfile="cloud",
         **options,
     )
     try:

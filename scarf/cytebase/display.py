@@ -40,13 +40,21 @@ def _cell(value: Any, max_characters: int | None) -> tuple[str, bool]:
     return text.translate(_MARKDOWN_ESCAPES), shortened
 
 
+def _validate_max_cell_chars(value: int | None) -> None:
+    if value is not None and (
+        isinstance(value, bool) or not isinstance(value, int) or value < 1
+    ):
+        raise ValueError("max_cell_chars must be a positive integer or None")
+
+
 class CatalogResults(list[dict[str, Any]]):
     """List-compatible rows with a compact Markdown representation.
 
     Indexing and iteration expose the original complete row dictionaries. As
     with a normal list, slicing returns a list. ``list(results)`` gives a plain
     list for callers that require the exact built-in type. Display truncation
-    never modifies records or changes the query's ordering.
+    never modifies records or changes the query's ordering. ``max_cell_chars``
+    sets the notebook and text representation limit; ``None`` shows full values.
     """
 
     def __init__(
@@ -54,9 +62,12 @@ class CatalogResults(list[dict[str, Any]]):
         rows: Iterable[dict[str, Any]] = (),
         *,
         columns: Sequence[str] = (),
+        max_cell_chars: int | None = 100,
     ) -> None:
+        _validate_max_cell_chars(max_cell_chars)
         super().__init__(rows)
         self._display_columns = tuple(columns)
+        self._max_cell_chars = max_cell_chars
 
     def to_markdown(
         self,
@@ -73,12 +84,7 @@ class CatalogResults(list[dict[str, Any]]):
             isinstance(max_rows, bool) or not isinstance(max_rows, int) or max_rows < 0
         ):
             raise ValueError("max_rows must be a nonnegative integer or None")
-        if max_cell_chars is not None and (
-            isinstance(max_cell_chars, bool)
-            or not isinstance(max_cell_chars, int)
-            or max_cell_chars < 1
-        ):
-            raise ValueError("max_cell_chars must be a positive integer or None")
+        _validate_max_cell_chars(max_cell_chars)
         if isinstance(columns, str):
             raise TypeError("columns must be a sequence of column names")
         available = dict.fromkeys(self._display_columns)
@@ -129,13 +135,13 @@ class CatalogResults(list[dict[str, Any]]):
         return "\n".join(lines) + "\n\n" + summary
 
     def _repr_markdown_(self) -> str:
-        return self.to_markdown()
+        return self.to_markdown(max_cell_chars=self._max_cell_chars)
 
     def _repr_pretty_(self, printer: Any, cycle: bool) -> None:
-        printer.text("CatalogResults([...])" if cycle else self.to_markdown())
+        printer.text("CatalogResults([...])" if cycle else self._repr_markdown_())
 
     def __repr__(self) -> str:
-        return self.to_markdown()
+        return self._repr_markdown_()
 
     def __str__(self) -> str:
-        return self.to_markdown()
+        return self._repr_markdown_()

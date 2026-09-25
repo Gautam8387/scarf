@@ -1,9 +1,4 @@
-"""Verified local snapshots of the published, self-contained DuckDB catalog.
-
-Snapshots are immutable once verified. Older hashes remain cached so refreshing
-the catalog does not replace files held open by existing DuckDB connections,
-including on Windows. Automatic cache pruning is intentionally not provided.
-"""
+"""One verified local copy of the latest self-contained DuckDB catalog."""
 
 import hashlib
 import os
@@ -71,7 +66,7 @@ _SEARCH_COLUMNS = (
 )
 
 
-def _cache_directory(storage: Bucket) -> Path:
+def _cache_directory() -> Path:
     if sys.platform == "win32":
         base = (
             Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
@@ -79,8 +74,7 @@ def _cache_directory(storage: Bucket) -> Path:
         )
     else:
         base = Path.home() / ".scarf"
-    bucket_key = hashlib.sha256(storage.root.encode()).hexdigest()
-    return base / "cytebase" / bucket_key
+    return base
 
 
 def _parse_hash(raw: bytes) -> str:
@@ -168,45 +162,39 @@ def _install(temporary: Path, destination: Path, digest: str) -> None:
     try:
         temporary.replace(destination)
     except PermissionError as error:
-        # Windows can reject replacement if another reader opened the snapshot
+        # Windows can reject replacement if another reader opened the catalog
         # between the check above and the rename. A verified copy is sufficient.
         if _verified_cache(destination, digest):
             return
         raise RuntimeError(
-            f"Cannot replace damaged catalog cache at {destination}. Close any "
-            "connections using this snapshot and retry."
+            f"Cannot refresh catalog cache at {destination}. Close any "
+            "connections using this catalog and retry."
         ) from error
     _save_hash(destination.with_suffix(".duckdb.sha256"), digest)
 
 
 def _cached_catalog(storage: Bucket) -> Path:
-    """Check the remote hash on every access and return a verified local snapshot.
+    """Check the remote hash on every access and return the verified local catalog.
 
     Authentication or remote-check failures propagate instead of serving stale
     data. Each successful return has a locally computed, saved SHA-256 checksum.
     Catalog publication races allow three download attempts with bounded backoff.
-    Cache keys contain neither credentials nor bucket names.
+    Only the latest verified catalog is kept, shared across configured buckets.
     """
-    root = _cache_directory(storage)
+    root = _cache_directory()
+    destination = root / "cytebase.duckdb"
     for attempt in range(_DOWNLOAD_ATTEMPTS):
         expected = _remote_hash(storage)
-        directory = root / expected
-        destination = directory / "cytebase.duckdb"
         if _verified_cache(destination, expected):
-            logger.debug("Using verified Cytebase catalog cache at {}", destination)
             return destination
 
-        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        logger.info(
-            "Downloading the Cytebase catalog into {}. Catalog setup and each "
-            "catalog access check the published SHA-256 and reuse this local "
-            "copy while unchanged.",
-            destination,
-        )
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if attempt == 0 and destination.is_file():
+            logger.info("Catalog checksum mismatch; refreshing local cache.")
         temporary = None
         try:
             with NamedTemporaryFile(
-                prefix=".catalog-", suffix=".download", dir=directory, delete=False
+                prefix=".catalog-", suffix=".download", dir=root, delete=False
             ) as handle:
                 temporary = Path(handle.name)
             storage.download(_CATALOG_PATH, temporary)
@@ -215,11 +203,6 @@ def _cached_catalog(storage: Bucket) -> Path:
             current = _remote_hash(storage)
             if actual == expected == current:
                 _install(temporary, destination, actual)
-                logger.info(
-                    "Verified Cytebase catalog; database and computed SHA-256 "
-                    "are cached in {}.",
-                    directory,
-                )
                 return destination
         finally:
             if temporary is not None:
@@ -232,8 +215,8 @@ def _cached_catalog(storage: Bucket) -> Path:
     raise RuntimeError(
         "The downloaded catalog did not match its published SHA-256 after three "
         "attempts. Retry when catalog publication has finished; if the mismatch "
-        "persists, ask the publisher to rebuild the catalog. Existing verified local "
-        "snapshots have been retained."
+        "persists, ask the publisher to rebuild the catalog. The previous local "
+        "catalog, if present, has been retained."
     )
 
 
@@ -263,23 +246,35 @@ class Catalog:
             ) from error
         return duckdb.connect(str(_cached_catalog(self._storage)), read_only=True)
 
-    def query(self, sql: str, parameters: list | dict | None = None) -> CatalogResults:
-        """Execute SQL on the local read-only catalog and return Markdown rows."""
+    def query(
+        self,
+        sql: str,
+        parameters: list | dict | None = None,
+        *,
+        max_cell_chars: int | None = 100,
+    ) -> CatalogResults:
+        """Query the local catalog; ``max_cell_chars=None`` shows full cell values."""
         with self.connect_catalog() as connection:
             result = connection.execute(sql, parameters)
             columns = [column[0] for column in result.description]
             return CatalogResults(
                 [dict(zip(columns, row, strict=True)) for row in result.fetchall()],
                 columns=columns,
+                max_cell_chars=max_cell_chars,
             )
 
     def find_datasets(
-        self, *, ready_only: bool = True, **facets: str | list[str]
+        self,
+        *,
+        ready_only: bool = True,
+        max_cell_chars: int | None = 100,
+        **facets: str | list[str],
     ) -> CatalogResults:
         """Match exact labels: every facet must match, with OR within label lists.
 
         Discovery includes all registered datasets unless ``ready_only=True``.
         Row dictionaries retain every catalog column, including ``zarr_uri``.
+        Set ``max_cell_chars=None`` to display full cell values.
         """
         predicates = []
         parameters = []
@@ -298,7 +293,11 @@ class Catalog:
             predicates.append(f"list_has_any({_FACET_COLUMNS[facet]}, ?)")
             parameters.append(labels)
         where = " WHERE " + " AND ".join(predicates) if predicates else ""
-        rows = self.query("SELECT * FROM datasets" + where + _DATASET_ORDER, parameters)
+        rows = self.query(
+            "SELECT * FROM datasets" + where + _DATASET_ORDER,
+            parameters,
+            max_cell_chars=max_cell_chars,
+        )
         return CatalogResults(
             rows,
             columns=(
@@ -309,15 +308,22 @@ class Catalog:
                 "tissue_labels",
                 "disease_labels",
             ),
+            max_cell_chars=max_cell_chars,
         )
 
     def search(
-        self, text: str, *, ready_only: bool = True, limit: int | None = 50
+        self,
+        text: str,
+        *,
+        ready_only: bool = True,
+        limit: int | None = 50,
+        max_cell_chars: int | None = 100,
     ) -> CatalogResults:
         """Find datasets whose text matches every word in ``text``, ignoring case.
 
         Words are matched against the ID, title, citation, first author, and all
         facet labels. Use :meth:`find_datasets` for exact ontology labels.
+        Set ``max_cell_chars=None`` to display full cell values.
         """
         if not isinstance(text, str) or not text.split():
             raise ValueError("Provide at least one search word")
@@ -335,7 +341,11 @@ class Catalog:
         if limit is not None:
             sql += " LIMIT ?"
             parameters.append(limit)
-        return CatalogResults(self.query(sql, parameters), columns=_SEARCH_COLUMNS)
+        return CatalogResults(
+            self.query(sql, parameters, max_cell_chars=max_cell_chars),
+            columns=_SEARCH_COLUMNS,
+            max_cell_chars=max_cell_chars,
+        )
 
     def dataset(self, cytebase_id: str) -> "CytebaseDataset":
         """Return a handle for one catalog dataset without opening its store."""
@@ -346,8 +356,10 @@ class Catalog:
             raise KeyError(f"No catalog dataset is registered as {cytebase_id!r}")
         return CytebaseDataset(self, rows[0])
 
-    def list_terms(self, facet: str | None = None) -> CatalogResults:
-        """List all facets, or one facet, using the published natural-sort ranks."""
+    def list_terms(
+        self, facet: str | None = None, *, max_cell_chars: int | None = 100
+    ) -> CatalogResults:
+        """List naturally sorted terms; ``max_cell_chars=None`` shows full values."""
         if facet is not None and facet not in FACETS:
             raise ValueError(
                 f"Unknown facet {facet!r}; choose from {', '.join(FACETS)}"
@@ -359,10 +371,13 @@ class Catalog:
             + where
             + "GROUP BY facet, label, term_id, label_rank ORDER BY facet, label_rank, term_id",
             [facet] if facet is not None else [],
+            max_cell_chars=max_cell_chars,
         )
         columns = ("label", "term_id", "n_datasets")
         return CatalogResults(
-            rows, columns=("facet", *columns) if facet is None else columns
+            rows,
+            columns=("facet", *columns) if facet is None else columns,
+            max_cell_chars=max_cell_chars,
         )
 
     def open_dataset(self, cytebase_id: str, **datastore_options: Any) -> "DataStore":

@@ -22,7 +22,7 @@ from huggingface_hub import (
     sync_bucket,
 )
 from huggingface_hub.errors import EntryNotFoundError, HfHubHTTPError
-from huggingface_hub.utils import parse_ratelimit_headers
+from huggingface_hub.utils import disable_progress_bars, parse_ratelimit_headers
 
 
 def dataset_prefix(cytebase_id: str) -> str:
@@ -169,15 +169,16 @@ class Bucket:
         remote = _path(remote)
         destination = Path(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        retry(
-            lambda: download_bucket_files(
-                self.bucket_id,
-                files=[(remote, destination)],
-                raise_on_missing_files=True,
-                token=self.token,
-            ),
-            self.progress,
-        )
+        with disable_progress_bars("huggingface_hub.download_bucket_files"):
+            retry(
+                lambda: download_bucket_files(
+                    self.bucket_id,
+                    files=[(remote, destination)],
+                    raise_on_missing_files=True,
+                    token=self.token,
+                ),
+                self.progress,
+            )
 
     def read_bytes(self, path: str) -> bytes | None:
         with TemporaryDirectory(prefix="cytebase-read-") as directory:
