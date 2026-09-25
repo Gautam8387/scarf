@@ -59,6 +59,8 @@ dependencies = [
 [project.optional-dependencies]
 cytebase = [
     "duckdb>=1.5.5",
+    "matplotlib>=3.9",
+    "seaborn>=0.13",
 ]
 agent = [
     "pydantic-ai-slim[openai]>=2.19.0",

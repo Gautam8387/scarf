@@ -65,7 +65,15 @@ _SHA = (
 )
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("build-essential", "git", "libfftw3-dev", "libmetis-dev", "libtbb-dev")
+    .apt_install(
+        "aria2",
+        "ca-certificates",
+        "build-essential",
+        "git",
+        "libfftw3-dev",
+        "libmetis-dev",
+        "libtbb-dev",
+    )
     .uv_sync(groups=["cytebase"], frozen=True, extra_options="--no-default-groups")
     .add_local_python_source(
         "scarf",
@@ -102,19 +110,25 @@ def _progress_summary(counters: dict | None) -> str:
     if completed is not None:
         if counters.get("unit") == "bytes":
             expected = f"{total / 1024**3:.2f}" if total is not None else "?"
-            parts.append(f"assembled={completed / 1024**3:.2f}/{expected} GiB")
+            label = "hashed" if counters.get("phase") == "checksum" else "downloaded"
+            parts.append(f"{label}={completed / 1024**3:.2f}/{expected} GiB")
         else:
             expected = f"{total:,}" if total is not None else "?"
             parts.append(f"checked={completed:,}/{expected} {counters.get('unit', '')}")
     if counters.get("percent") is not None:
         parts.append(f"{counters['percent']:.1f}%")
-    if counters.get("fetchedBytes") is not None:
-        parts.append(f"fetched={counters['fetchedBytes'] / 1024**3:.2f} GiB")
-    for key in ("activeFetches", "consumerStep", "storedValuesChecked", "message"):
+    if (
+        counters.get("phase") == "checksum"
+        and counters.get("downloadedBytes") is not None
+    ):
+        parts.append(f"downloaded={counters['downloadedBytes'] / 1024**3:.2f} GiB")
+    for key in ("activeConnections", "phase", "storedValuesChecked", "message"):
         if counters.get(key) is not None:
             parts.append(f"{key}={counters[key]}")
-    if counters.get("sourceRetries"):
-        parts.append(f"sourceRetries={len(counters['sourceRetries'])}")
+    if counters.get("downloadSpeedBytesPerSecond") is not None:
+        parts.append(
+            f"speed={counters['downloadSpeedBytesPerSecond'] / 1024**2:.1f} MiB/s"
+        )
     return " ".join(parts)
 
 
@@ -402,8 +416,8 @@ def build_catalog(request: dict, run_id: str) -> dict:
 @app.function(
     image=image,
     secrets=[secret],
-    cpu=2,
-    memory=4096,
+    cpu=4,
+    memory=16384,
     timeout=86400,
     retries=0,
     max_containers=PROCESS_CONTAINERS,

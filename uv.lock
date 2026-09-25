@@ -3525,6 +3525,8 @@ agent = [
 ]
 cytebase = [
     { name = "duckdb" },
+    { name = "matplotlib" },
+    { name = "seaborn" },
 ]
 docs = [
     { name = "jedi" },
@@ -3604,6 +3606,7 @@ requires-dist = [
     { name = "kneed", marker = "extra == 'extra'", specifier = ">=0.8" },
     { name = "leidenalg", specifier = ">=0.12" },
     { name = "loguru", specifier = ">=0.7" },
+    { name = "matplotlib", marker = "extra == 'cytebase'", specifier = ">=3.9" },
     { name = "matplotlib", marker = "extra == 'extra'", specifier = ">=3.9" },
     { name = "myst-nb", marker = "extra == 'docs'" },
     { name = "myst-parser", marker = "extra == 'docs'" },
@@ -3624,6 +3627,7 @@ requires-dist = [
     { name = "scikit-learn", specifier = ">=1.5" },
     { name = "scikit-network", marker = "extra == 'test'", specifier = ">=0.33.1" },
     { name = "scipy", specifier = ">=1.13,!=1.17.0" },
+    { name = "seaborn", marker = "extra == 'cytebase'", specifier = ">=0.13" },
     { name = "seaborn", marker = "extra == 'extra'", specifier = ">=0.13" },
     { name = "setuptools", specifier = ">=61" },
     { name = "sgtsnepi" },

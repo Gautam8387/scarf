@@ -73,16 +73,14 @@ _SEARCH_COLUMNS = (
 
 def _cache_directory(storage: Bucket) -> Path:
     if sys.platform == "win32":
-        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
-    elif sys.platform == "darwin":
-        base = Path.home() / "Library" / "Caches"
+        base = (
+            Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+            / "scarf"
+        )
     else:
-        configured = os.environ.get("XDG_CACHE_HOME")
-        base = Path(configured) if configured else Path.home() / ".cache"
-        if not base.is_absolute():
-            base = Path.home() / ".cache"
+        base = Path.home() / ".scarf"
     bucket_key = hashlib.sha256(storage.root.encode()).hexdigest()
-    return base / "scarf" / "cytebase" / bucket_key
+    return base / "cytebase" / bucket_key
 
 
 def _parse_hash(raw: bytes) -> str:
@@ -200,8 +198,9 @@ def _cached_catalog(storage: Bucket) -> Path:
 
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         logger.info(
-            "Downloading the Cytebase catalog into {}. Future queries check its "
-            "published hash and reuse this local copy while unchanged.",
+            "Downloading the Cytebase catalog into {}. Catalog setup and each "
+            "catalog access check the published SHA-256 and reuse this local "
+            "copy while unchanged.",
             destination,
         )
         temporary = None
@@ -216,6 +215,11 @@ def _cached_catalog(storage: Bucket) -> Path:
             current = _remote_hash(storage)
             if actual == expected == current:
                 _install(temporary, destination, actual)
+                logger.info(
+                    "Verified Cytebase catalog; database and computed SHA-256 "
+                    "are cached in {}.",
+                    directory,
+                )
                 return destination
         finally:
             if temporary is not None:
@@ -238,14 +242,16 @@ class Catalog:
 
     ``bucket`` accepts ``namespace/name`` or an HF bucket URI and otherwise uses
     ``CYTEBASE_BUCKET``. ``token=None`` uses standard Hugging Face authentication;
-    ``token=False`` explicitly selects anonymous access. Each new catalog query
-    checks the published checksum and opens a verified local snapshot read-only.
+    ``token=False`` explicitly selects anonymous access. Construction prepares a
+    verified local catalog. Each new catalog query checks the published checksum
+    again and opens a verified local snapshot read-only.
     """
 
     def __init__(
         self, bucket: str | None = None, token: str | bool | None = None
     ) -> None:
         self._storage = Bucket(bucket, token)
+        _cached_catalog(self._storage)
 
     def connect_catalog(self) -> "duckdb.DuckDBPyConnection":
         """Open a verified local snapshot; callers must close the connection."""
@@ -268,7 +274,7 @@ class Catalog:
             )
 
     def find_datasets(
-        self, *, ready_only: bool = False, **facets: str | list[str]
+        self, *, ready_only: bool = True, **facets: str | list[str]
     ) -> CatalogResults:
         """Match exact labels: every facet must match, with OR within label lists.
 
