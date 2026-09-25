@@ -9,6 +9,7 @@ from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 from time import monotonic
+from typing import Any
 
 import httpx
 
@@ -63,7 +64,7 @@ def _run_aria2(
     total: int,
     etag: str,
     connections: int,
-    report: Callable,
+    report: Callable[..., None],
 ) -> None:
     command = [
         executable,
@@ -97,7 +98,7 @@ def _run_aria2(
         "--",
         url,
     ]
-    recent = deque(maxlen=12)
+    recent: deque[str] = deque(maxlen=12)
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -144,7 +145,8 @@ def _run_aria2(
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
-        process.stdout.close()
+        if process.stdout is not None:
+            process.stdout.close()
 
 
 def download_h5ad(
@@ -152,7 +154,7 @@ def download_h5ad(
     destination: Path,
     expected_bytes: int | None = None,
     *,
-    progress: Callable | None = None,
+    progress: Callable[..., None] | None = None,
     timings: dict[str, float] | None = None,
 ) -> tuple[int, str]:
     """Let aria2 manage parallel connections and local resume, then return size/hash.
@@ -177,7 +179,7 @@ def download_h5ad(
     destination.parent.mkdir(parents=True, exist_ok=True)
     timings = timings if timings is not None else {}
 
-    def report(stage: str, **values) -> None:
+    def report(stage: str, **values: Any) -> None:
         if progress is not None:
             progress(stage, **values)
 

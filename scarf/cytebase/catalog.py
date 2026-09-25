@@ -221,10 +221,11 @@ def _cached_catalog(storage: Bucket) -> Path:
 
 
 class Catalog:
-    """Discover and open datasets in an explicitly configured Cytebase bucket.
+    """Discover and open datasets in the public Cytebase catalog or another bucket.
 
     ``bucket`` accepts ``namespace/name`` or an HF bucket URI and otherwise uses
-    ``CYTEBASE_BUCKET``. ``token=None`` uses standard Hugging Face authentication;
+    ``CYTEBASE_BUCKET``, falling back to the public ``Nygen/cytebase`` bucket.
+    ``token=None`` uses standard Hugging Face authentication when available;
     ``token=False`` explicitly selects anonymous access. Construction prepares a
     verified local catalog. Each new catalog query checks the published checksum
     again and opens a verified local snapshot read-only.
@@ -233,7 +234,12 @@ class Catalog:
     def __init__(
         self, bucket: str | None = None, token: str | bool | None = None
     ) -> None:
-        self._storage = Bucket(bucket, token)
+        selected_bucket = (
+            bucket
+            if bucket is not None
+            else os.environ.get("CYTEBASE_BUCKET", "Nygen/cytebase")
+        )
+        self._storage = Bucket(selected_bucket, token)
         _cached_catalog(self._storage)
 
     def connect_catalog(self) -> "duckdb.DuckDBPyConnection":

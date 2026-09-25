@@ -4,7 +4,7 @@ import json
 import os
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from concurrent.futures import CancelledError
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -152,7 +152,7 @@ class Bucket:
         self.token = (get_token() or False) if token is None else token
         self.progress: Callable | None = None
 
-    def upload(self, files: list[tuple[Path | bytes, str]]) -> None:
+    def upload(self, files: Iterable[tuple[str | Path | bytes, str]]) -> None:
         additions = [(source, _path(path)) for source, path in files]
         if additions:
             retry(

@@ -5,25 +5,27 @@ import logging
 import os
 import re
 import subprocess
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event, Lock, Thread
 from time import monotonic
+from typing import Any
 
 import modal
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from .._storage import Bucket, dataset_prefix, error_message
 from .catalog import load_record, select_dataset_ids
 from .download import download_connections
-from .models import ProcessRequest, RegisterRequest
+from .models import DatasetRecord, ProcessRequest, RegisterRequest
 
 
 class _LogFormatter(logging.Formatter):
-    def format(self, record):
+    def format(self, record: logging.LogRecord) -> str:
         message = super().format(record)
         token = os.environ.get("HF_TOKEN")
         if token:
@@ -132,7 +134,7 @@ def _progress_summary(counters: dict | None) -> str:
     return " ".join(parts)
 
 
-def _owner(storage: Bucket, run_id: str, key: str, call_id: str) -> None:
+def _owner(storage: Bucket, run_id: str, key: str, call_id: str | None) -> None:
     state = storage.read_json(RUN_PATH) or {}
     child = state.get("children", {}).get(key, {})
     if (
@@ -147,12 +149,12 @@ def _owner(storage: Bucket, run_id: str, key: str, call_id: str) -> None:
 
 
 @contextmanager
-def _progress(record, stage: str):
+def _progress(record: DatasetRecord, stage: str) -> Iterator[Callable[..., None]]:
     """Progress is display-only; expiry never changes durable dataset readiness."""
     key = f"{record.runId}:{record.cytebaseId}:{stage}"
     lock, publish_lock, stopped = Lock(), Lock(), Event()
     started = stage_started = monotonic()
-    value = {
+    value: dict[str, Any] = {
         "runId": record.runId,
         "callId": record.callId,
         "stage": stage,
@@ -161,7 +163,7 @@ def _progress(record, stage: str):
         "progress": None,
     }
 
-    def publish():
+    def publish() -> None:
         # Serialize writes so a delayed heartbeat cannot replace a newer stage.
         with publish_lock:
             with lock:
@@ -182,7 +184,7 @@ def _progress(record, stage: str):
             except Exception as error:
                 logger.warning("Progress update failed: %s", error_message(error))
 
-    def update(name: str, **counters):
+    def update(name: str, **counters: Any) -> None:
         nonlocal stage_started
         completed, total = counters.get("completed"), counters.get("total")
         counters["percent"] = (
@@ -206,7 +208,7 @@ def _progress(record, stage: str):
         if changed:
             publish()
 
-    def heartbeat():
+    def heartbeat() -> None:
         while not stopped.wait(15):
             publish()
 
@@ -220,7 +222,11 @@ def _progress(record, stage: str):
         thread.join()
 
 
-def _cleanup_local(workspace: TemporaryDirectory, record, progress) -> None:
+def _cleanup_local(
+    workspace: TemporaryDirectory,
+    record: DatasetRecord,
+    progress: Callable[..., None],
+) -> None:
     """Release this worker's files without hiding the result of publication."""
     started = monotonic()
     try:
@@ -235,7 +241,13 @@ def _cleanup_local(workspace: TemporaryDirectory, record, progress) -> None:
         record.timings["cleanupSeconds"] = monotonic() - started
 
 
-def _run_dataset(record, request: dict, storage: Bucket, progress, check) -> dict:
+def _run_dataset(
+    record: DatasetRecord,
+    request: dict,
+    storage: Bucket,
+    progress: Callable[..., None],
+    check: Callable[[], None],
+) -> dict:
     from .build import build_local, publish_store, replacement_paths
     from .download import download_h5ad
 
@@ -321,12 +333,14 @@ def _execute(cytebase_id: str, run_id: str, request: dict) -> dict:
     call_id = modal.current_function_call_id()
     key = f"{cytebase_id}:process"
 
-    def check():
+    def check() -> None:
         _owner(storage, run_id, key, call_id)
 
     check()
     record = load_record(storage, cytebase_id)
     state = storage.read_json(RUN_PATH)
+    if state is None:
+        raise RuntimeError("Pipeline state is missing")
     if str(record.latestVersionId) != state["children"][key]["datasetVersionId"]:
         raise ValueError("Registered version changed after submission")
     record.attempt += 1
@@ -396,7 +410,7 @@ def build_catalog(request: dict, run_id: str) -> dict:
 
     storage = _storage()
 
-    def check():
+    def check() -> None:
         _owner(storage, run_id, "catalog", modal.current_function_call_id())
 
     check()
@@ -505,7 +519,7 @@ async def run_pipeline(action: str, request: dict) -> dict:
         job = ProcessRequest.model_validate(request)
         keys = await asyncio.to_thread(select_dataset_ids, job, storage)
         groups = {key: request for key in keys}
-    state = {
+    state: dict[str, Any] = {
         "runId": modal.current_function_call_id(),
         "callId": modal.current_function_call_id(),
         "action": action,
@@ -524,7 +538,12 @@ async def run_pipeline(action: str, request: dict) -> dict:
     lock = asyncio.Lock()
     uncertain = False
 
-    async def invoke(function, key, args, reservation):
+    async def invoke(
+        function: modal.Function[..., dict, Any],
+        key: str,
+        args: tuple,
+        reservation: dict,
+    ) -> dict:
         nonlocal uncertain
         try:
             async with lock:
@@ -558,12 +577,13 @@ async def run_pipeline(action: str, request: dict) -> dict:
             uncertain = True
             raise
 
-    async def publish(payload):
+    async def publish(payload: dict) -> dict:
         return await invoke(
             build_catalog, "catalog", (payload, state["runId"]), {"stage": "catalog"}
         )
 
-    results, dirty = [], {}
+    results: list[dict] = []
+    dirty: dict[str, dict] = {}
     catalog_result, catalog_error = None, None
     try:
         if action in {"register", "catalog"}:
@@ -573,7 +593,7 @@ async def run_pipeline(action: str, request: dict) -> dict:
             # subsequent snapshots. Only completed stage records are merged.
             catalog_result = await publish({"updates": []})
 
-            async def one(key, payload):
+            async def one(key: str, payload: dict) -> dict:
                 try:
                     record = await asyncio.to_thread(load_record, storage, key)
                     arguments = payload | {
@@ -639,7 +659,7 @@ async def run_pipeline(action: str, request: dict) -> dict:
         updatedAt=_now(),
     )
     await asyncio.to_thread(storage.write_json, RUN_PATH, state)
-    result = {
+    result: dict[str, Any] = {
         "callId": state["runId"],
         "state": state["state"],
         "datasets": results,
@@ -680,26 +700,26 @@ def create_web_app() -> FastAPI:
     web = FastAPI(title="Cytebase pipeline (development)")
 
     @web.exception_handler(405)
-    async def missing_endpoint(_request, _error):
+    async def missing_endpoint(_request: Request, _error: Exception) -> JSONResponse:
         # A generic dataset GET route must not claim unsupported POST endpoints.
         return JSONResponse(status_code=404, content={"detail": "Not Found"})
 
-    def submit(action, payload):
+    def submit(action: str, payload: dict) -> dict:
         call = run_pipeline.spawn(action, payload)
         return {"callId": call.object_id}
 
     @web.post("/collections/register", status_code=202)
-    def register(job: RegisterRequest):
+    def register(job: RegisterRequest) -> dict:
         return submit("register", job.model_dump(mode="json"))
 
     @web.get("/collections")
-    def collections():
+    def collections() -> dict:
         from .catalog import list_collection_ids
 
         return {"collectionIds": list_collection_ids()}
 
     @web.post("/datasets/process", status_code=202)
-    def process(job: ProcessRequest):
+    def process(job: ProcessRequest) -> dict:
         try:
             keys = select_dataset_ids(job, _storage())
         except ValueError as error:
@@ -711,11 +731,11 @@ def create_web_app() -> FastAPI:
         }
 
     @web.post("/catalog/build", status_code=202)
-    def catalog():
+    def catalog() -> dict:
         return submit("catalog", {})
 
     @web.get("/jobs/{call_id}", response_model=None)
-    def job(call_id: str):
+    def job(call_id: str) -> Any:
         try:
             return modal.FunctionCall.from_id(call_id).get(timeout=0)
         except (
@@ -734,7 +754,7 @@ def create_web_app() -> FastAPI:
             raise HTTPException(500, detail=error_message(error)) from error
 
     @web.get("/datasets/{cytebase_id}")
-    def dataset(cytebase_id: str, includeReplacementPaths: bool = False):
+    def dataset(cytebase_id: str, includeReplacementPaths: bool = False) -> dict:
         storage = _storage()
         try:
             record = load_record(storage, cytebase_id)
@@ -761,7 +781,10 @@ def create_web_app() -> FastAPI:
                 progress_store.get(f"{record.runId}:{record.cytebaseId}:{record.stage}")
                 or {}
             )
-        result = {"dataset": record.model_dump(mode="json"), "status": status}
+        result: dict[str, Any] = {
+            "dataset": record.model_dump(mode="json"),
+            "status": status,
+        }
         if includeReplacementPaths:
             from .build import replacement_paths
 
@@ -769,7 +792,7 @@ def create_web_app() -> FastAPI:
         return result
 
     @web.get("/health")
-    def health():
+    def health() -> dict:
         return {"ok": True}
 
     return web

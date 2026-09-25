@@ -5,6 +5,7 @@ import json
 import os
 import re
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,12 +15,12 @@ from uuid import UUID
 
 import duckdb
 import httpx
-from huggingface_hub import BucketFolder, list_bucket_tree
+from huggingface_hub import BucketFile, BucketFolder, list_bucket_tree
 from huggingface_hub.errors import EntryNotFoundError
 from natsort import natsorted
 
 from .._storage import Bucket, dataset_prefix, error_message, retry
-from .models import DatasetRecord, DatasetVersion, FacetTerm
+from .models import DatasetRecord, DatasetVersion, FacetTerm, ProcessRequest
 from .selection import classify_dataset
 from .selection import is_main_dataset as is_main_dataset
 
@@ -46,7 +47,7 @@ def fetch_collection(collection_id: str) -> tuple[bytes, dict[str, Any]]:
 
 
 def _get(url: str) -> httpx.Response:
-    def request():
+    def request() -> httpx.Response:
         response = httpx.get(url, timeout=30, follow_redirects=True)
         response.raise_for_status()
         return response
@@ -612,7 +613,7 @@ def load_record(storage: Bucket, key: str) -> DatasetRecord:
 def list_records(storage: Bucket) -> list[DatasetRecord]:
     """Read dataset records using a shallow listing, never traversing Zarr files."""
 
-    def folders():
+    def folders() -> list[BucketFile | BucketFolder]:
         try:
             return list(
                 list_bucket_tree(
@@ -638,12 +639,14 @@ def list_records(storage: Bucket) -> list[DatasetRecord]:
     return records
 
 
-def select_dataset_ids(request, storage: Bucket) -> list[str]:
+def select_dataset_ids(request: ProcessRequest, storage: Bucket) -> list[str]:
     if request.cytebaseIds is not None:
         for key in request.cytebaseIds:
             dataset_prefix(key)
         return list(dict.fromkeys(request.cytebaseIds))
-    selected = set(request.collectionIds or [request.collectionId])
+    selected = (
+        set(request.collectionIds) if request.collectionIds else {request.collectionId}
+    )
     return [
         record.cytebaseId
         for record in list_records(storage)
@@ -658,7 +661,7 @@ def publish_catalog(
     with TemporaryDirectory(prefix="cytebase-catalog-") as directory:
         root = Path(directory)
         previous = root / "previous.duckdb"
-        rows = {name: [] for name in _SCHEMAS}
+        rows: dict[str, list[dict[str, Any]]] = {name: [] for name in _SCHEMAS}
         try:
             storage.download("catalog/cytebase.duckdb", previous)
         except EntryNotFoundError:
@@ -719,7 +722,9 @@ def publish_catalog(
         }
 
 
-def run_catalog(request: dict, storage: Bucket, assert_owner) -> dict:
+def run_catalog(
+    request: dict, storage: Bucket, assert_owner: Callable[[], None]
+) -> dict:
     """Save valid collections independently, then publish their catalog changes."""
     collection_rows = []
     records = []

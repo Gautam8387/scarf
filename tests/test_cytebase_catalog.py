@@ -92,6 +92,36 @@ def test_cytebase_extra_declares_pytz_for_duckdb_timestamps():
     assert any(req.startswith("duckdb") for req in extra)
 
 
+@pytest.mark.parametrize(
+    ("explicit", "environment", "expected"),
+    [
+        (None, None, "Nygen/cytebase"),
+        (None, "example/environment", "example/environment"),
+        ("example/explicit", "example/environment", "example/explicit"),
+        ("hf://buckets/example/explicit/", None, "example/explicit"),
+    ],
+)
+def test_catalog_bucket_precedence(monkeypatch, explicit, environment, expected):
+    monkeypatch.delenv("CYTEBASE_BUCKET", raising=False)
+    if environment is not None:
+        monkeypatch.setenv("CYTEBASE_BUCKET", environment)
+    opened = []
+    monkeypatch.setattr(catalog_module, "_cached_catalog", opened.append)
+
+    catalog = Catalog(bucket=explicit)
+
+    assert opened == [catalog._storage]
+    assert catalog._storage.bucket_id == expected
+    assert catalog._storage.token is False
+
+
+@pytest.mark.parametrize("explicit", [None, ""])
+def test_catalog_rejects_empty_bucket_configuration(monkeypatch, explicit):
+    monkeypatch.setenv("CYTEBASE_BUCKET", "")
+    with pytest.raises(ValueError, match="Supply bucket="):
+        Catalog(bucket=explicit)
+
+
 def test_cache_directory_uses_the_home_directory(cytebase_offline):
     assert catalog_module._cache_directory() == cytebase_offline / ".scarf"
 

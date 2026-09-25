@@ -2,10 +2,12 @@
 
 import json
 import os
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import Any
 from uuid import UUID
 
 from .._storage import error_message
@@ -158,12 +160,13 @@ def _summarize(snapshot: dict) -> None:
         for dataset in collection.get("datasets", {}).values()
     ]
     selected = [(key, row) for key, row in datasets if row["selection"] == "selected"]
-    for field, predicate in (
+    filters: tuple[tuple[str, Callable[[dict[str, Any]], bool]], ...] = (
         ("registrationReadyCollectionIds", lambda row: row.get("selection") == "ready"),
         ("needsReviewCollectionIds", lambda row: row.get("selection") == "needsReview"),
         ("failedCollectionIds", lambda row: row["status"] == "failed"),
         ("pendingCollectionIds", lambda row: row["status"] == "pending"),
-    ):
+    )
+    for field, predicate in filters:
         snapshot[field] = sorted(
             key for key, row in collections.items() if predicate(row)
         )
@@ -219,7 +222,7 @@ def build_inventory(output: Path, *, bucket: str | None = None) -> dict:
         _catalog_snapshot(bucket) if bucket is not None else (None, None)
     )
     ids = list_collection_ids()
-    snapshot = {
+    snapshot: dict[str, Any] = {
         "startedAt": _now(),
         "completedAt": None,
         "selectionSources": SELECTION_SOURCES,

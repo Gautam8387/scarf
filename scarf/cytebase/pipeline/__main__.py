@@ -43,6 +43,7 @@ def main() -> None:
 
 
 def _run_command(args: argparse.Namespace) -> dict:
+    result: dict
     if args.command == "inspect":
         from .build import inspect_file
 

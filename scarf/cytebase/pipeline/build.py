@@ -271,7 +271,7 @@ def _select_counts(
     raw_data_location: str | None = None,
 ) -> tuple[str, dict, dict | None]:
     candidates = ("raw/X", "X", "layers/counts", "layers/raw_counts")
-    diagnostics = {
+    diagnostics: dict[str, dict[str, Any]] = {
         key: {
             "present": key in h5,
             "validationComplete": False,
@@ -286,7 +286,7 @@ def _select_counts(
             return False
         diagnostics[key] = _validate_candidate(h5, key, matrices[key], progress)
         matrices[key] = diagnostics[key]
-        return diagnostics[key]["validCounts"]
+        return bool(diagnostics[key]["validCounts"])
 
     selected = "none"
     if raw_data_location is not None:
@@ -371,7 +371,7 @@ def _column_info(node: h5py.Group | h5py.Dataset) -> dict[str, Any]:
 
 def _column_values(node: h5py.Group | h5py.Dataset) -> np.ndarray:
     if isinstance(node, h5py.Dataset):
-        return node[:]
+        return np.asarray(node[:])
     if "categories" in node and "codes" in node:
         codes = node["codes"][:]
         categories = node["categories"][:]
@@ -383,7 +383,7 @@ def _column_values(node: h5py.Group | h5py.Dataset) -> np.ndarray:
         values[present] = categories[codes[present]]
         return values
     if "values" in node and "mask" in node:
-        values = node["values"][:].astype(object)
+        values = np.asarray(node["values"][:]).astype(object)
         values[node["mask"][:]] = None
         return values
     raise ValueError(f"Unsupported metadata column encoding: {node.name}")
@@ -774,8 +774,10 @@ def _open_verified_arrays(
     try:
         group = root["RNA"]
         counts, counts_t = root["RNA/counts"], root["RNA/countsT"]
-        if not isinstance(group, zarr.Group) or not all(
-            isinstance(array, zarr.Array) for array in (counts, counts_t)
+        if (
+            not isinstance(group, zarr.Group)
+            or not isinstance(counts, zarr.Array)
+            or not isinstance(counts_t, zarr.Array)
         ):
             raise ValueError("Scarf requires RNA/counts and RNA/countsT arrays")
         expected = (manifest["nObs"], manifest["nVars"])

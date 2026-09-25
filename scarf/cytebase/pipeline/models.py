@@ -1,7 +1,7 @@
 """CamelCase requests, source inspections and flat dataset records."""
 
 from datetime import datetime
-from typing import Literal
+from typing import Literal, Self
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -69,7 +69,7 @@ class ProcessRequest(BaseModel):
     approvedDeletionPaths: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def require_one_selector(self):
+    def require_one_selector(self) -> Self:
         if (
             sum(
                 value is not None
