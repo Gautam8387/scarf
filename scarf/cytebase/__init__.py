@@ -1,12 +1,12 @@
-"""Browse and download public data from Cytebase."""
+"""Discover Cytebase datasets and connect to their Scarf DataStores."""
 
 import os
-from dataclasses import dataclass
-from pathlib import Path, PurePosixPath, PureWindowsPath
 import shutil
 import tarfile
 import tempfile
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import TYPE_CHECKING, Any
 
 from huggingface_hub import (
     BucketFile,
@@ -18,11 +18,50 @@ from huggingface_hub import (
 if TYPE_CHECKING:
     import zarr
 
-__all__ = ["Repository", "connect", "list_repositories"]
+    from ._embeddings import embedding as embedding
+    from ._embeddings import embedding_coordinates as embedding_coordinates
+    from ._embeddings import embeddings as embeddings
+    from .catalog import Catalog as Catalog
+    from .entry import DatasetEntry as DatasetEntry
+
+__all__ = [
+    "Catalog",
+    "DatasetEntry",
+    "Repository",
+    "connect",
+    "embedding",
+    "embedding_coordinates",
+    "embeddings",
+    "list_repositories",
+]
 
 _BUCKET_ID = "Nygen/cytebase"
 _ZARR_ARCHIVE_SUFFIX = ".zarr.tar.gz"
 _LOCAL_CATALOG_ENV = "SCARF_CYTEBASE_LOCAL"
+
+
+def __getattr__(name: str) -> Any:
+    if name == "Catalog":
+        from .catalog import Catalog
+
+        globals()[name] = Catalog
+        return Catalog
+    if name == "DatasetEntry":
+        from .entry import DatasetEntry
+
+        globals()[name] = DatasetEntry
+        return DatasetEntry
+    if name in {"embedding", "embedding_coordinates", "embeddings"}:
+        from . import _embeddings
+
+        value = getattr(_embeddings, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
 
 
 def _safe_name(name: str, *, kind: str) -> str:
