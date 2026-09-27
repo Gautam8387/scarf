@@ -11,10 +11,6 @@ import pandas as pd
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
 from ...clustering.leiden import leiden_membership
-from ...metadata.rows import (
-    read_metadata_missing_rows_chunkwise,
-    read_metadata_rows_chunkwise,
-)
 from ...metadata.selection import resolve_cell_aligned_artifact
 from ...quality_control.cell_cycle_genes import (
     g2m_phase_genes,
@@ -36,6 +32,7 @@ from ...storage.refs import ArtifactRef
 from ...storage.selections import read_stored_selection_indices
 from ...storage.types import as_zarr_array
 from ...utils.logging import logger
+from ..tools import label_filter_bound, mark_missing_rows, read_marked_metadata_rows
 from .contracts import ArtifactRecord, ParameterCandidateEvaluation
 from .execution import (
     _cached_candidate_metric,
@@ -431,28 +428,6 @@ class _SelectionIndices:
         return indices
 
 
-def _aligned_metadata(
-    store: Any,
-    indices: np.ndarray,
-    column: str,
-    *,
-    aligned_with: str,
-    mark_missing: bool = False,
-) -> np.ndarray:
-    """Read one metadata column on already validated selection rows."""
-    values = np.asarray(read_metadata_rows_chunkwise(store.cells, column, indices))
-    if values.shape != (len(indices),):
-        raise ValueError(
-            f"Metadata column {column!r} does not align with {aligned_with}"
-        )
-    if mark_missing:
-        missing = read_metadata_missing_rows_chunkwise(store.cells, column, indices)
-        if missing is not None and np.any(missing):
-            values = values.astype(object)
-            values[missing] = None
-    return values
-
-
 def _column_fingerprint(store: Any, column: str, cache: dict[str, str] | None) -> str:
     """Fingerprint live metadata once per diagnostic pass when a cache is given."""
     if cache is None:
@@ -571,18 +546,15 @@ def _covariate_associations(
                     if selection_indices is None
                     else selection_indices(cell_selection)
                 )
-            values = _aligned_metadata(
-                store, indices, column, aligned_with="PCA", mark_missing=True
-            )
+            values = read_marked_metadata_rows(store.cells, column, indices)
         else:
-            values = np.asarray(
-                resolve_cell_aligned_artifact(
-                    store.zw,
-                    artifact,
-                    cell_selection=cell_selection,
-                    expected_kind="quality_metric",
-                ).values
+            resolved = resolve_cell_aligned_artifact(
+                store.zw,
+                artifact,
+                cell_selection=cell_selection,
+                expected_kind="quality_metric",
             )
+            values = mark_missing_rows(resolved.values, resolved.missing_mask)
         if values.shape != (coordinates.shape[0],):
             raise ValueError(f"Covariate {column!r} does not align with PCA rows")
         kind = (column_kinds or {}).get(column) or (
@@ -1232,16 +1204,16 @@ def _select_capture_cells(
 ) -> tuple[ArtifactRef, int]:
     if active_indices.shape != active_values.shape:
         raise ValueError("Capture values must align with the selected cells")
-    labels = active_values.astype(str)
-    selected = labels == str(value)
+    selected = ~pd.isna(active_values) & (active_values.astype(str) == str(value))
     expected = np.zeros(store.cells.N, dtype=bool)
     expected[active_indices] = selected
+    bound = label_filter_bound(value)
     reference = diagnostic_call(
         "core.captureSelection",
         store.filter_cells,
         [column],
-        [value],
-        [value],
+        [bound],
+        [bound],
         cell_selection=parent,
         keep_bounds=True,
         invalidate_cache=False,
@@ -1369,7 +1341,35 @@ def score_advisory_doublets(
         )
     limitations: list[str] = []
     selection_indices = _SelectionIndices(store)
-    if capture_column is None or capture_column not in store.cells.columns:
+    capture_groups: list[str] = []
+    if capture_column is not None and capture_column in store.cells.columns:
+        active_indices = selection_indices(parent_selection)
+        capture_values = read_marked_metadata_rows(
+            store.cells,
+            capture_column,
+            active_indices,
+        )
+        # Cells without a recorded capture label never form a capture group.
+        recorded_captures = capture_values[~pd.isna(capture_values)]
+        unique_capture_labels, first_capture_indices = np.unique(
+            recorded_captures.astype(str),
+            return_index=True,
+        )
+        capture_groups = unique_capture_labels.tolist()
+        raw_capture_values = {
+            str(label): recorded_captures[int(index)]
+            for label, index in zip(
+                unique_capture_labels,
+                first_capture_indices,
+                strict=True,
+            )
+        }
+        if len(capture_groups) > _MAX_DOUBLET_CAPTURES:
+            raise ValueError(
+                "Physical capture column exceeds the advisory doublet limit of "
+                f"{_MAX_DOUBLET_CAPTURES} values"
+            )
+    if len(capture_groups) <= 1:
         score = diagnostic_call(
             "core.doubletDetection",
             store.run_doublet_detection,
@@ -1378,10 +1378,11 @@ def score_advisory_doublets(
             from_assay=assay,
             invalidate_cache=False,
         )
-        limitations.append(
-            "Physical capture identity was unavailable, so advisory doublet "
-            "scores were computed across the selected dataset."
-        )
+        if not capture_groups:
+            limitations.append(
+                "Physical capture identity was unavailable, so advisory doublet "
+                "scores were computed across the selected dataset."
+            )
         return _build_advisory_doublet_scores(
             store,
             scores=(score,),
@@ -1389,59 +1390,13 @@ def score_advisory_doublets(
             native_graph=native_graph,
             native_clusters=native_clusters,
             parent_selection=parent_selection,
-            capture_values=("allSelectedCells",),
-            capture_column=None,
+            capture_values=tuple(capture_groups) or ("allSelectedCells",),
+            capture_column=capture_column if capture_groups else None,
             limitations=limitations,
             selection_indices=selection_indices,
         )
 
-    active_indices = selection_indices(parent_selection)
-    capture_values = read_metadata_rows_chunkwise(
-        store.cells,
-        capture_column,
-        active_indices,
-    )
-    capture_labels = capture_values.astype(str)
-    unique_capture_labels, first_capture_indices = np.unique(
-        capture_labels,
-        return_index=True,
-    )
-    capture_groups = unique_capture_labels.tolist()
-    raw_capture_values = {
-        str(label): capture_values[int(index)]
-        for label, index in zip(
-            unique_capture_labels,
-            first_capture_indices,
-            strict=True,
-        )
-    }
-    if len(capture_groups) > _MAX_DOUBLET_CAPTURES:
-        raise ValueError(
-            "Physical capture column exceeds the advisory doublet limit of "
-            f"{_MAX_DOUBLET_CAPTURES} values"
-        )
-    if len(capture_groups) == 1:
-        score = diagnostic_call(
-            "core.doubletDetection",
-            store.run_doublet_detection,
-            native_clusters,
-            native_graph,
-            from_assay=assay,
-            invalidate_cache=False,
-        )
-        return _build_advisory_doublet_scores(
-            store,
-            scores=(score,),
-            cell_selections=(parent_selection,),
-            native_graph=native_graph,
-            native_clusters=native_clusters,
-            parent_selection=parent_selection,
-            capture_values=(capture_groups[0],),
-            capture_column=capture_column,
-            limitations=limitations,
-            selection_indices=selection_indices,
-        )
-
+    assert capture_column is not None
     n_features = len(read_feature_selection_indices(store.zw, assay, feature_selection))
     scores: list[ArtifactRef] = []
     selections: list[ArtifactRef] = []
@@ -1696,24 +1651,11 @@ def population_support_evidence(
         )
         rows = indices[start:stop]
         for column in available:
-            values = np.asarray(read_metadata_rows_chunkwise(store.cells, column, rows))
-            missing = read_metadata_missing_rows_chunkwise(store.cells, column, rows)
-            if (
-                values.shape != rows.shape
-                or missing is not None
-                and missing.shape != rows.shape
-            ):
-                raise ValueError(
-                    f"Population metadata {column!r} does not align with cells"
-                )
-            for offset, (population, value) in enumerate(
-                zip(population_ids, values, strict=True)
-            ):
+            values = read_marked_metadata_rows(store.cells, column, rows)
+            for population, value in zip(population_ids, values, strict=True):
                 value = value.item() if isinstance(value, np.generic) else value
                 if (
-                    missing is not None
-                    and missing[offset]
-                    or pd.isna(value)
+                    pd.isna(value)
                     or isinstance(value, float)
                     and not np.isfinite(value)
                 ):
@@ -1868,17 +1810,21 @@ def augment_cluster_evaluations(
         else set()
     )
     selection_indices = _SelectionIndices(store)
-    cluster_metadata: dict[tuple[ArtifactRef, str], np.ndarray] = {}
+    cluster_metadata: dict[tuple[ArtifactRef, str], tuple[np.ndarray, np.ndarray]] = {}
 
-    def selected_labels(selection: ArtifactRef, column: str) -> np.ndarray:
+    def selected_labels(
+        selection: ArtifactRef, column: str
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return the recorded rows and their labels; missing rows form no unit."""
         key = (selection, column)
         if key not in cluster_metadata:
-            cluster_metadata[key] = _aligned_metadata(
-                store,
-                selection_indices(selection),
+            values = read_marked_metadata_rows(
+                store.cells,
                 column,
-                aligned_with="clusters",
-            ).astype(str)
+                selection_indices(selection),
+            )
+            recorded = np.asarray(~pd.isna(values), dtype=bool)
+            cluster_metadata[key] = (recorded, values[recorded].astype(str))
         return cluster_metadata[key]
 
     augmented: list[ParameterCandidateEvaluation] = []
@@ -2029,12 +1975,13 @@ def augment_cluster_evaluations(
             score
             for column in independent_unit_columns
             if column in cell_columns
+            for recorded, units in [selected_labels(selection_ref, column)]
             for score in [
                 diagnostic_call(
                     "metric.crossUnitSupport",
                     _cross_unit_support,
-                    labels,
-                    selected_labels(selection_ref, column),
+                    labels[recorded],
+                    units,
                 )
             ]
             if score is not None
@@ -2045,12 +1992,14 @@ def augment_cluster_evaluations(
                 diagnostic_call(
                     "metric.technicalAssociation",
                     normalized_mutual_info_score,
-                    labels,
-                    selected_labels(selection_ref, column),
+                    labels[recorded],
+                    batches,
                 )
             )
             for column in technical_columns
             if column in cell_columns
+            for recorded, batches in [selected_labels(selection_ref, column)]
+            if recorded.any()
         }
 
         metrics = evaluation.metrics.model_copy(

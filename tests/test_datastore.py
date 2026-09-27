@@ -394,6 +394,26 @@ def test_auto_filter_keeps_cells_with_zero_feature_percentages():
     assert bounds["skip_reason"] == "zero_mad"
 
 
+def test_cell_filters_read_metric_columns_in_one_concurrent_batch(monkeypatch):
+    store, _ = _qc_store()
+    dataset = _open_qc_store(store)
+    attrs = ["RNA_nCounts", "RNA_nFeatures"]
+    batches: list[list[str]] = []
+    fetch_all_columns = type(dataset.cells).fetch_all_columns
+
+    def spy(cells, columns):
+        batches.append(list(columns))
+        return fetch_all_columns(cells, columns)
+
+    monkeypatch.setattr(type(dataset.cells), "fetch_all_columns", spy)
+    dataset.auto_filter_cells(attrs=attrs, method="gaussian")
+    dataset.filter_cells(attrs=attrs, lows=[0, 0], highs=[1e9, 1e9])
+
+    # Chunk-by-chunk reads of several columns are sequential requests on
+    # object stores, so each filter reads its metric columns in one batch.
+    assert batches == [attrs, attrs]
+
+
 @pytest.mark.parametrize(
     ("pattern", "indices"),
     [("^mt-", [0, 1]), (r"(?-i:^MT-)", [1]), (r"\ARPS\d+\Z", [2, 3])],
@@ -831,6 +851,221 @@ def test_standalone_assay_prepares_statistics_explicitly():
     assert zarr.open_group(store=store, mode="r")["RNA"].attrs["prepared"] is True
 
 
+@pytest.fixture
+def toy_store_path(toy_crdir_writer, tmp_path) -> str:
+    import shutil
+
+    destination = tmp_path / "toy.zarr"
+    shutil.copytree(toy_crdir_writer, destination)
+    DataStore(str(destination), default_assay="RNA", min_features_per_cell=0)
+    return str(destination)
+
+
+def test_set_default_assay_is_atomic_on_read_only_store(toy_store_path) -> None:
+    store = DataStore(
+        toy_store_path,
+        default_assay="RNA",
+        min_features_per_cell=0,
+        zarr_mode="r",
+    )
+
+    with pytest.raises(ValueError, match="not found"):
+        store.set_default_assay("missing")
+    with pytest.raises(PermissionError, match="zarr_mode='r\\+'"):
+        store.set_default_assay("ADT")
+
+    assert store._defaultAssay == "RNA"
+    assert store.zw.attrs["defaultAssay"] == "RNA"
+    assert store._get_assay(None) is store.RNA
+    writable = DataStore(toy_store_path, min_features_per_cell=0)
+    writable.set_default_assay("ADT")
+    assert writable._get_assay(None) is writable.ADT
+    assert DataStore(toy_store_path, min_features_per_cell=0)._defaultAssay == "ADT"
+
+
+def test_get_assay_rejects_unknown_and_non_assay_names(toy_store_path) -> None:
+    store = DataStore(toy_store_path, default_assay="RNA", min_features_per_cell=0)
+
+    for name in ("missing", "cells", "zw", "_defaultAssay", "rna"):
+        with pytest.raises(ValueError, match="not found. Available assays"):
+            store._get_assay(name)
+
+    assert store._get_assay("ADT") is store.ADT
+    assert store._get_assay("") is store.RNA
+    assert store._get_assay(None) is store.RNA
+
+
+def _store_with_assay(name: str) -> MemoryStore:
+    from scarf.storage.identity import finalize_counts
+    from scarf.writers.counts_t import finalize_writer_counts_t
+
+    store = MemoryStore()
+    root = zarr.open_group(store=store, mode="w")
+    n_cells, n_features = _QC_VALUES.shape
+    ids = np.array([f"c{i}" for i in range(n_cells)])
+    create_cell_data(root, None, ids=ids, names=ids)
+    for assay in ("RNA", name):
+        counts = create_zarr_count_assay(
+            root,
+            assay,
+            None,
+            n_cells,
+            feat_ids=np.array([f"{assay}{i}" for i in range(n_features)]),
+            feat_names=_QC_FEATURE_NAMES,
+            dtype="uint32",
+        )
+        counts[:] = _QC_VALUES
+        finalize_counts(counts)
+        finalize_writer_counts_t(root, assay, None, assay_type="RNA")
+    return store
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "cells",
+        "zw",
+        "zarr_mode",
+        "memoryBytes",
+        "assay_names",
+        "run_pca",
+        "get_assay",
+        "_defaultAssay",
+        "__class__",
+    ],
+)
+def test_assay_named_like_a_datastore_member_leaves_the_member_intact(name) -> None:
+    store = _store_with_assay(name)
+    # The first writable open prepares both assays for read-only access.
+    for mode in ("r+", "r"):
+        ds = DataStore(
+            store, default_assay="RNA", min_features_per_cell=0, zarr_mode=mode
+        )
+
+        assert type(ds) is DataStore
+        assert isinstance(ds.cells, MetaData)
+        assert isinstance(ds.zw, zarr.Group)
+        assert ds.zarr_mode == mode
+        assert ds.memoryBytes > 0
+        assert ds.assay_names == sorted(["RNA", name])
+        assert ds._defaultAssay == "RNA"
+        assert not isinstance(getattr(ds, name), Assay)
+        assay = ds.get_assay(name)
+        assert isinstance(assay, Assay) and assay.name == name
+        assert ds._get_assay(name) is assay
+        assert ds.RNA is ds.get_assay("RNA") is ds._get_assay(None)
+        assert {"RNA", name} <= set(dir(ds))
+        np.testing.assert_array_equal(ds.cells.fetch_all("I"), _QC_VALUES.any(axis=1))
+        with pytest.raises(AttributeError, match="'rna'"):
+            _ = ds.rna
+
+
+def test_property_errors_are_not_masked_by_an_assay_of_the_same_name(
+    monkeypatch,
+) -> None:
+    def broken(self):
+        raise AttributeError("inner detail")
+
+    monkeypatch.setattr(DataStore, "broken_member", property(broken), raising=False)
+    ds = DataStore(
+        _store_with_assay("broken_member"),
+        default_assay="RNA",
+        min_features_per_cell=0,
+        zarr_mode="r+",
+    )
+
+    with pytest.raises(AttributeError, match="inner detail"):
+        _ = ds.broken_member
+    assert ds.get_assay("broken_member").name == "broken_member"
+
+
+def test_grouped_assay_named_like_a_datastore_member_keeps_the_store_usable():
+    store, _ = _qc_store()
+    ds = _open_qc_store(store)
+    ds.RNA.feats.insert("group", np.array(["a", "a", "b", "b", "c", "c"]))
+
+    ds.add_grouped_assay("group", assay_label="cells")
+
+    assert isinstance(ds.cells, MetaData)
+    assert ds.get_assay("cells").feats.fetch_all("ids").tolist() == [
+        "group_a",
+        "group_b",
+        "group_c",
+    ]
+    for mode in ("r+", "r"):
+        reopened = _open_qc_store(store, zarr_mode=mode)
+        assert isinstance(reopened.cells, MetaData)
+        assert reopened.assay_names == ["RNA", "cells"]
+        assert "cells" in dir(reopened)
+        np.testing.assert_allclose(
+            reopened.get_assay("cells").rawData.compute(),
+            ds.get_assay("cells").rawData.compute(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("argument", "value", "error_type", "message"),
+    [
+        *(
+            ("resolution", value, error_type, "Leiden resolution")
+            for value, error_type in (
+                (float("nan"), ValueError),
+                (float("inf"), ValueError),
+                (0, ValueError),
+                (-0.5, ValueError),
+                (True, TypeError),
+                ("1.0", TypeError),
+                (None, TypeError),
+            )
+        ),
+        *(
+            ("random_seed", value, error_type, "random_seed")
+            for value, error_type in (
+                (None, TypeError),
+                (True, TypeError),
+                (4444.0, TypeError),
+                ("4444", TypeError),
+                (-1, ValueError),
+            )
+        ),
+    ],
+)
+def test_run_leiden_clustering_rejects_invalid_resolution_or_seed(
+    datastore,
+    connectivity_graph,
+    argument: str,
+    value: object,
+    error_type: type[Exception],
+    message: str,
+) -> None:
+    before = datastore.list_artifacts(kind="cluster_labels")
+    with pytest.raises(error_type, match=message):
+        datastore.run_leiden_clustering(connectivity_graph, **{argument: value})
+
+    assert datastore.list_artifacts(kind="cluster_labels") == before
+
+
+def test_int_and_float_resolution_share_identity(
+    datastore,
+    connectivity_graph,
+    leiden_clustering,
+) -> None:
+    from_int = datastore.run_leiden_clustering(connectivity_graph, resolution=1)
+    from_numpy = datastore.run_leiden_clustering(
+        connectivity_graph,
+        resolution=np.float32(1.0),
+        random_seed=np.int64(4444),
+    )
+
+    assert from_int == leiden_clustering
+    assert from_numpy == leiden_clustering
+    parameters = datastore.inspect_artifact(from_int).parameters
+    assert parameters is not None
+    assert type(parameters["resolution"]) is float
+    assert parameters["resolution"] == 1.0
+    assert type(parameters["random_seed"]) is int
+
+
 class TestToyDataStore:
     def test_toy_crdir_metadata(self, toy_crdir_ds):
         assert np.all(
@@ -1201,7 +1436,8 @@ class TestDataStore:
         )
 
         assert not markers.empty
-        assert set(markers.group_id) == {1}
+        # Group labels are returned as strings whatever type was requested.
+        assert set(markers.group_id) == {"1"}
         assert markers.feature_name.is_unique
         assert {"score", "fold_change", "p_value"}.issubset(markers.columns)
         assert np.isfinite(markers.score).all()
@@ -1229,6 +1465,14 @@ class TestDataStore:
         from_all = all_markers[all_markers["group_id"] == "1"].reset_index(drop=True)
         assert len(from_all) == len(one)
         assert from_all["feature_name"].equals(one["feature_name"])
+        numeric_order = sorted(groups, key=int)
+        assert list(dict.fromkeys(all_markers["group_id"])) == [
+            group for group in numeric_order if group in set(all_markers["group_id"])
+        ]
+
+    def test_get_markers_rejects_unknown_group(self, marker_search, datastore):
+        with pytest.raises(ValueError, match="no group '999'"):
+            datastore.get_markers(marker=marker_search, group_id=999)
 
     def test_export_markers_to_csv(
         self, marker_search, paris_clustering, datastore, tmp_path
@@ -1239,14 +1483,18 @@ class TestDataStore:
             csv_filename=out_file,
         )
         markers = pd.read_csv(out_file)
+        # Columns follow numeric label order, so "2" precedes "10".
         groups = sorted(
-            str(value)
-            for value in np.unique(
-                artifact_values(
-                    artifact_group(datastore.zw, paris_clustering),
-                    "labels",
+            (
+                str(value)
+                for value in np.unique(
+                    artifact_values(
+                        artifact_group(datastore.zw, paris_clustering),
+                        "labels",
+                    )
                 )
-            )
+            ),
+            key=int,
         )
         assert list(markers.columns) == groups
         for group in groups:
