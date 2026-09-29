@@ -15,6 +15,7 @@ from ._h5ad_columns import (
     SPARSE_KEYS,
     column_encoding,
     column_length,
+    column_order,
     index_key,
     is_column,
     is_nullable,
@@ -23,6 +24,8 @@ from ._h5ad_columns import (
     sparse_encoding,
     sparse_shape,
     table_column_dtype,
+    table_column_names,
+    table_members,
 )
 from ._h5ad_inspect import H5adInspectResult, inspect_h5ad as inspect_h5ad
 from ._sparse import SparseRowStore
@@ -110,6 +113,11 @@ class H5adReader:
                 self.obsmAttrsKey: self._validate_group(self.obsmAttrsKey),
                 self.matrixKey: self._validate_group(self.matrixKey),
             }
+            # A malformed column-order must fail here, before a writer opens
+            # its destination.
+            for group in (self.cellAttrsKey, self.featureAttrsKey):
+                if self.groupCodes[group] == 2:
+                    column_order(self.h5[group])
             self.matrixOrientation = self._validate_sparse_matrix()
             self._convertedCsr: SparseRowStore | None = None
             self._indptrCache: np.ndarray | None = None
@@ -461,20 +469,36 @@ class H5adReader:
     def _table_columns(
         self, group: str, ignore_keys: Sequence[str]
     ) -> Iterator[tuple[str, np.ndarray, np.ndarray]]:
-        """Yield each decodable column with its stored values and missing mask."""
+        """Yield each decodable column with its stored values and missing mask.
+
+        Columns come by source name. A dataframe group lists them in
+        ``column-order``, which resolves a name that old AnnData versions
+        nested into groups because it contains ``/``.
+        """
         code = self.groupCodes[group]
         if code not in {1, 2}:
             return
         table = self.h5[group]
-        names = table.dtype.names if code == 1 else tuple(table.keys())
+        nodes: dict[str, Any] = {}
+        if code == 1:
+            names: tuple[str, ...] = tuple(table.dtype.names or ())
+        else:
+            members = table_members(table)
+            for name in members.unresolved:
+                logger.warning(
+                    f"Skipping {group} column {name!r} because column-order lists "
+                    "it but the file does not contain it"
+                )
+            nodes = dict(members.members)
+            names = tuple(nodes)
         for name in iter_progress(names, desc=f"Reading attributes from group {group}"):
             if name in ignore_keys:
                 continue
-            if code == 2 and not is_column(table[name]):
-                if isinstance(table[name], h5py.Group):
+            if code == 2 and not is_column(nodes[name]):
+                if isinstance(nodes[name], h5py.Group):
                     logger.warning(
                         f"Skipping {group} column {name!r} because its H5AD encoding "
-                        f"{column_encoding(table[name])!r} is not supported"
+                        f"{column_encoding(nodes[name])!r} is not supported"
                     )
                 continue
             try:
@@ -489,6 +513,17 @@ class H5adReader:
                 )
                 continue
             yield name, values, missing
+
+    def _source_column_names(self, group: str) -> list[str]:
+        """Return the source names of the decodable columns of a table.
+
+        The names include the ID, name, and cluster columns that metadata
+        import leaves out, so a caller can plan storage keys over the whole
+        table.
+        """
+        if self.groupCodes.get(group) not in {1, 2}:
+            return []
+        return table_column_names(self.h5[group])
 
     def _cell_column_value_dtype(self, key: str) -> np.dtype[Any]:
         return table_column_dtype(
