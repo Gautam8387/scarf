@@ -57,19 +57,19 @@ the same broad lineage.
 ```{code-cell} ipython3
 cell_type_by_cluster = {
     "1": "CD14 monocytes",
-    "2": "FCGR3A monocytes",
+    "2": "monocytes",
     "3": "B cells",
     "4": "T cells",
-    "5": "NK cells",
-    "6": "T cells",
+    "5": "T cells",
+    "6": "NK cells",
     "7": "T cells",
-    "8": "B cells",
-    "9": "T cells",
+    "8": "T cells",
+    "9": "B cells",
     "10": "pDC-like cells",
 }
 cell_type_order = (
     "CD14 monocytes",
-    "FCGR3A monocytes",
+    "monocytes",
     "B cells",
     "T cells",
     "NK cells",
@@ -87,6 +87,38 @@ cell_types[analysis_cells] = [
 ]
 ds.cells.insert("pbmc_cell_type", cell_types, overwrite=True)
 ds.cells.insert("rna_analysis_cells", analysis_cells, overwrite=True)
+```
+
+The cell below pins the winning cluster of each lineage program with asserts, so the broad labels above stay guarded if the partition ever changes.
+
+```{code-cell} ipython3
+broad_markers = ds.get_markers(
+    marker=run["markers"],
+    min_score=-1,
+    min_frac_exp=-1,
+)
+broad_best = (
+    broad_markers[broad_markers["feature_name"].isin(
+        ["CD14", "CDKN1C", "TCF7L2", "MS4A1", "CD3D", "NKG7",
+         "IL3RA", "IGHD", "IGHA1"]
+    )]
+    .sort_values("score", ascending=False)
+    .groupby("feature_name", sort=False)
+    .head(1)
+    .set_index("feature_name")["group_id"]
+    .astype(str)
+    .to_dict()
+)
+assert broad_best["CD14"] == "1"
+assert broad_best["CDKN1C"] == "2"
+assert broad_best["TCF7L2"] == "2"
+assert broad_best["MS4A1"] in {"3", "9"}
+assert broad_best["CD3D"] in {"4", "5", "7", "8"}
+assert broad_best["NKG7"] == "6"
+assert broad_best["IL3RA"] == "10"
+assert broad_best["IGHD"] == "9"
+assert broad_best["IGHA1"] == "3"
+broad_best
 ```
 
 ### Question: where are the broad PBMC populations?
