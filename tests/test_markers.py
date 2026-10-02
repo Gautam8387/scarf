@@ -21,6 +21,8 @@ from scarf.features.markers import (
 from scarf.features.markers.rank import (
     _batch_stats,
     _gene_major_feature,
+    _gene_major_slot,
+    _gene_major_slots,
     _marker_stats_batch,
     _marker_stats_gene_major,
 )
@@ -769,7 +771,8 @@ def _gene_major_inputs(raw: np.ndarray) -> tuple[np.ndarray, ...]:
     )
 
 
-def test_gene_major_python_kernel_matches_compiled_kernel() -> None:
+@pytest.mark.parametrize("threads", [1, 3])
+def test_gene_major_python_kernel_matches_compiled_kernel(threads: int) -> None:
     raw = np.array(
         [
             [0, 2, 0, 4],
@@ -779,7 +782,11 @@ def test_gene_major_python_kernel_matches_compiled_kernel() -> None:
         ],
         dtype=np.uint32,
     ).T
-    args = (*_gene_major_inputs(raw), np.arange(raw.shape[0], dtype=np.int64), 3)
+    args = (
+        *_gene_major_inputs(raw),
+        np.arange(raw.shape[0], dtype=np.int64),
+        threads,
+    )
     compiled = np.zeros((raw.shape[0], 2, 8), dtype=np.float64)
     python = np.zeros_like(compiled)
 
@@ -788,6 +795,36 @@ def test_gene_major_python_kernel_matches_compiled_kernel() -> None:
 
     np.testing.assert_array_equal(compiled, python)
     assert compiled.any()
+
+
+@pytest.mark.parametrize("invalid_row", [None, 2])
+def test_gene_major_slot_python_kernels_match_compiled_kernels(
+    invalid_row: int | None,
+) -> None:
+    raw = np.array(
+        [
+            [0, 2, 0, 4],
+            [1, 2, 0, 0],
+            [1, 0, 3, 4],
+            [0, 0, 3, 0],
+            [2, 0, 1, 0],
+        ],
+        dtype=np.float64,
+    )
+    if invalid_row is not None:
+        raw[invalid_row, 1] = -1.0
+    inputs = _gene_major_inputs(raw)
+    rows = np.arange(raw.shape[0], dtype=np.int64)
+    # Slot 0 of 2 takes rows 0, 2 and 4, so it stops at the invalid row, and
+    # the slots together report it as the first invalid position.
+    expected = raw.shape[0] if invalid_row is None else invalid_row
+    for kernel, slots in ((_gene_major_slot, (0, 2)), (_gene_major_slots, (2,))):
+        compiled = np.zeros((raw.shape[0], 2, 8), dtype=np.float64)
+        python = np.zeros_like(compiled)
+        assert kernel(*inputs, rows, rows, *slots, compiled) == expected
+        assert kernel.py_func(*inputs, rows, rows, *slots, python) == expected
+        np.testing.assert_array_equal(compiled, python)
+        assert compiled.any()
 
 
 @pytest.mark.parametrize(
@@ -2882,6 +2919,93 @@ def test_marker_search_and_write_fit_the_bytes_the_search_reserves(
     assert sorted(slot.group_keys()) == sorted(str(group) for group in result.group_ids)
 
 
+def test_marker_search_fits_its_threads_to_the_memory_budget(
+    tmp_path, monkeypatch
+) -> None:
+    import re
+
+    from scarf.features.markers import search
+    from scarf.features.markers.rank import gene_major_rank_scratch_bytes
+    from scarf.storage.budget import ResourceBudget
+
+    rng = np.random.default_rng(3)
+    values = rng.poisson(0.3, size=(20_000, 64)).astype(np.uint16)
+    store = _layout_store(tmp_path, values, nthreads=8)
+    labels = rng.integers(0, 6, size=len(values))
+    cells = np.arange(len(values))
+    features = np.arange(values.shape[1])
+    roomy = store.RNA.resources
+    expected = find_markers_by_rank(store.RNA, labels, cells, features).statistics
+    schedules: list[tuple[int, int]] = []
+    schedule = search._gene_major_schedule
+
+    def recorded(*args, **kwargs):
+        schedules.append(schedule(*args, **kwargs))
+        return schedules[-1]
+
+    monkeypatch.setattr(search, "_gene_major_schedule", recorded)
+
+    def rank(memory_bytes: int, nthreads: int = 8) -> np.ndarray:
+        store.RNA.resources = ResourceBudget(memory_bytes, roomy.workers)
+        return find_markers_by_rank(
+            store.RNA, labels, cells, features, nthreads=nthreads
+        ).statistics
+
+    with pytest.raises(MemoryError, match="needs at least") as refused:
+        rank(1)
+    (minimum,) = re.findall(r"needs at least (\d+) bytes", str(refused.value))
+    minimum = int(minimum)
+    with pytest.raises(MemoryError, match="needs at least"):
+        rank(minimum - 1)
+    # One thread fits exactly at the minimum, and a few more just above it.
+    np.testing.assert_array_equal(rank(minimum), expected)
+    assert schedules[-1] == (1, 1)
+    per_thread = gene_major_rank_scratch_bytes(
+        n_cells=len(cells), n_groups=6, n_features=0, nthreads=2
+    ) - gene_major_rank_scratch_bytes(
+        n_cells=len(cells), n_groups=6, n_features=0, nthreads=1
+    )
+    np.testing.assert_array_equal(rank(minimum + 2 * per_thread), expected)
+    threads, calls = schedules[-1]
+    assert 1 < threads * calls < roomy.workers
+    # nthreads caps the threads that a roomy budget would allow.
+    np.testing.assert_array_equal(rank(roomy.memoryBytes, nthreads=2), expected)
+    threads, calls = schedules[-1]
+    assert threads * calls == 2
+
+
+def test_marker_search_ranks_narrow_read_groups_at_once(tmp_path, monkeypatch) -> None:
+    from scarf.features.markers import search
+    from scarf.storage.feature_stream import persisted_read_group, read_group_rows
+
+    rng = np.random.default_rng(4)
+    values = rng.poisson(0.3, size=(20_000, 64)).astype(np.uint16)
+    store = _layout_store(tmp_path, values, nthreads=8)
+    labels = rng.integers(0, 6, size=len(values))
+    cells = np.arange(len(values))
+    counts_t = store.RNA.rawDataT
+    # One feature of each read group leaves one row per kernel call, so whole
+    # groups run at once, one serial kernel each.
+    features = np.arange(0, values.shape[1], persisted_read_group(counts_t)[0])
+    groups = len(read_group_rows(counts_t, features))
+    assert groups > 1
+    schedules: list[tuple[int, int]] = []
+    schedule = search._gene_major_schedule
+
+    def recorded(*args, **kwargs):
+        schedules.append(schedule(*args, **kwargs))
+        return schedules[-1]
+
+    monkeypatch.setattr(search, "_gene_major_schedule", recorded)
+    expected = find_markers_by_rank(store.RNA, labels, cells, features).statistics
+    observed = find_markers_by_rank(
+        store.RNA, labels, cells, features, nthreads=8
+    ).statistics
+
+    assert schedules == [(1, 1), (1, groups)]
+    np.testing.assert_array_equal(observed, expected)
+
+
 _SCRATCH_CHILD = textwrap.dedent(
     """
     import json
@@ -2923,26 +3047,49 @@ _SCRATCH_CHILD = textwrap.dedent(
         charged.append(kwargs["scratchBytes"])
         return original_map(*args, **kwargs)
 
+    original_schedule = search._gene_major_schedule
+    schedules = []
+
+    def schedule(*args, **kwargs):
+        planned = original_schedule(*args, **kwargs)
+        schedules.append(planned)
+        return planned
+
     search._marker_stats_gene_major = kernel
+    search._gene_major_schedule = schedule
     feature_stream.map_feature_read_groups = stream
-    result = search.find_markers_by_rank(
-        store.RNA, np.arange(n_cells) % 5, np.arange(n_cells), np.arange(n_features)
-    )
-    threads = max(call[0] for call in calls)
-    concurrent = max(call[2] for call in calls)
-    print("SCRATCH:" + json.dumps({
-        "workers": store.RNA.resources.workers,
-        "threads": sorted({call[0] for call in calls}),
-        "numbaThreads": sorted({call[1] for call in calls}),
-        "concurrentCalls": concurrent,
-        "charged": charged[0] - result.statistics.nbytes,
-        "kernelScratch": gene_major_rank_scratch_bytes(
-            n_cells=n_cells,
-            n_groups=5,
-            n_features=32,
-            nthreads=concurrent * threads,
-        ),
-    }))
+    counts_t = store.RNA.rawDataT
+    group_width = feature_stream.persisted_read_group(counts_t)[0]
+    # The features of one read group, then every feature.
+    for features in (np.arange(group_width), np.arange(n_features)):
+        calls.clear()
+        charged.clear()
+        schedules.clear()
+        result = search.find_markers_by_rank(
+            store.RNA,
+            np.arange(n_cells) % 5,
+            np.arange(n_cells),
+            features,
+            nthreads=8,
+        )
+        ((slots, planned_calls),) = schedules
+        print("SCRATCH:" + json.dumps({
+            "features": len(features),
+            "readGroups": len(feature_stream.read_group_rows(counts_t, features)),
+            "workers": store.RNA.resources.workers,
+            "slots": slots,
+            "plannedCalls": planned_calls,
+            "threads": sorted({call[0] for call in calls}),
+            "numbaThreads": sorted({call[1] for call in calls}),
+            "concurrentCalls": max(call[2] for call in calls),
+            "charged": charged[0] - result.statistics.nbytes,
+            "kernelScratch": planned_calls * gene_major_rank_scratch_bytes(
+                n_cells=n_cells,
+                n_groups=5,
+                n_features=group_width,
+                nthreads=slots,
+            ),
+        }))
     """
 )
 
@@ -2967,13 +3114,29 @@ def test_marker_kernel_scratch_covers_the_kernel_threads_that_run(tmp_path) -> N
     )
 
     assert completed.returncode == 0, completed.stderr
-    (line,) = [
-        line for line in completed.stdout.splitlines() if line.startswith("SCRATCH:")
-    ]
-    observed = json.loads(line.removeprefix("SCRATCH:"))
-    # Eight workers plan one ordered kernel call at a time, whose two slots
-    # are the two Numba threads that run it.
-    assert observed["workers"] == 8
-    assert observed["concurrentCalls"] == 1
-    assert observed["threads"] == observed["numbaThreads"] == [2]
-    assert observed["charged"] >= observed["kernelScratch"]
+    observed = {
+        entry["features"]: entry
+        for entry in (
+            json.loads(line.removeprefix("SCRATCH:"))
+            for line in completed.stdout.splitlines()
+            if line.startswith("SCRATCH:")
+        )
+    }
+    one_group, every_group = observed[min(observed)], observed[max(observed)]
+    # Eight workers split one read group over the two Numba threads of one
+    # kernel call at a time.
+    assert one_group["workers"] == 8
+    assert one_group["readGroups"] == 1
+    assert (one_group["slots"], one_group["plannedCalls"]) == (2, 1)
+    assert one_group["threads"] == one_group["numbaThreads"] == [2]
+    assert one_group["concurrentCalls"] == 1
+    # Narrow read groups run at once with one slot each, on no more compute
+    # workers than were planned for them.
+    groups = every_group["readGroups"]
+    assert 1 < groups <= 8
+    assert (every_group["slots"], every_group["plannedCalls"]) == (1, groups)
+    assert every_group["threads"] == [1]
+    assert every_group["concurrentCalls"] <= groups
+    # The search charges the scratch of every kernel call that can run.
+    for entry in (one_group, every_group):
+        assert entry["charged"] >= entry["kernelScratch"]
