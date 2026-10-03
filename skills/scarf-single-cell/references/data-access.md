@@ -115,6 +115,21 @@ for path in ("dir.zarr", "mtx.zarr", "h5ad.zarr", "seurat.zarr"):
 
 `CSVReader`/`CSVtoZarr` (small dense CSV) and `SparseToZarr` (SciPy CSR plus IDs) also exist.
 
+Every converter refuses this way (releases after 1.0.0rc18; earlier ones shrink the layout to
+fit), and the error is a `CountLayoutMemoryError`. Prefer a larger `mem_budget` when the host has
+the memory. Otherwise copy the policy numbers from the message exactly and record that choice:
+smaller layouts make every later gene-major read slower.
+
+```python
+from scarf.storage.count_matrix import CountMatrixPolicy
+
+policy = CountMatrixPolicy(unitBytes=3906250, chunkBytes=390625)   # copied from the message
+scarf.CrToZarr(reader, zarr_loc="pbmc.zarr", mem_budget="128M", policy=policy).dump()
+```
+
+The need follows genes per cell relative to the gene count, not the number of cells. The 1K PBMC
+CITE-seq file refuses at `512M` and imports at `1G`.
+
 ### Find a Cytebase dataset
 
 ```python

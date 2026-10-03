@@ -53,6 +53,10 @@ if TYPE_CHECKING:
     from .identity import CountSummary
 
 
+class CountLayoutMemoryError(MemoryError):
+    """A requested count layout cannot be written within its memory budget."""
+
+
 @dataclass(frozen=True, slots=True)
 class _DenseWriteBand:
     start: int
@@ -1415,7 +1419,7 @@ def fit_count_layout(
             kind = (
                 "default" if requested == DEFAULT_COUNT_MATRIX_POLICY else "requested"
             )
-            raise MemoryError(
+            raise CountLayoutMemoryError(
                 f"The {kind} count-matrix policy (unitBytes={requested.unitBytes}, "
                 f"chunkBytes={requested.chunkBytes}) does not fit mem_budget. "
                 f"{str(error).rstrip('.')}. {advice}"
