@@ -744,14 +744,23 @@ class FakeFunction:
         self.target = target
         self.name = name
         self.spawned: list[tuple[Any, ...]] = []
+        self.spawn_options: list[dict[str, Any]] = []
+        self._options: dict[str, Any] = {}
         self._spawn_error = spawn_error
         self._get_errors = list(get_errors or [])
         self.spawn = SimpleNamespace(aio=self._spawn)
+
+    def with_options(self, **options: Any) -> "FakeFunction":
+        variant = copy.copy(self)
+        variant._options = self._options | options
+        variant.spawn = SimpleNamespace(aio=variant._spawn)
+        return variant
 
     async def _spawn(self, *args: Any) -> SimpleNamespace:
         if self._spawn_error is not None:
             raise self._spawn_error
         self.spawned.append(args)
+        self.spawn_options.append(dict(self._options))
         object_id = f"fc-{self.name}-{len(self.spawned)}"
         error = self._get_errors.pop(0) if self._get_errors else None
 

@@ -23,6 +23,7 @@ from .._storage import Bucket, dataset_prefix, error_message
 from .catalog import load_record, select_dataset_ids
 from .download import download_connections
 from .models import DatasetRecord, ProcessRequest, RegisterRequest
+from .resources import PROCESS_RESOURCES, ImportMemoryRefusal, ProcessResources
 
 
 class _LogFormatter(logging.Formatter):
@@ -319,6 +320,8 @@ def _run_dataset(
     storage: Bucket,
     progress: Callable[..., None],
     check: Callable[[], None],
+    *,
+    resources: ProcessResources = PROCESS_RESOURCES[0],
 ) -> dict:
     from .build import build_local, publish_store, replacement_paths
     from .download import download_h5ad
@@ -386,7 +389,7 @@ def _run_dataset(
         )
         check()
         manifest, converted = build_local(
-            record, source, store, raw, size, checksum, progress
+            record, source, store, raw, size, checksum, progress, resources=resources
         )
         if converted["status"] == "done":
             try:
@@ -400,7 +403,10 @@ def _run_dataset(
         _cleanup_local(workspace, record, progress)
 
 
-def _execute(cytebase_id: str, run_id: str, request: dict) -> dict:
+def _execute(
+    cytebase_id: str, run_id: str, request: dict, resource_tier: int = 0
+) -> dict:
+    resources = PROCESS_RESOURCES[resource_tier]
     storage = _storage()
     call_id = modal.current_function_call_id()
     key = f"{cytebase_id}:process"
@@ -426,12 +432,16 @@ def _execute(cytebase_id: str, run_id: str, request: dict) -> dict:
     record.startedAt = datetime.now(UTC)
     record.timings = {}
     logger.info(
-        "Dataset worker started: dataset=%s version=%s run=%s call=%s attempt=%s",
+        "Dataset worker started: dataset=%s version=%s run=%s call=%s attempt=%s "
+        "cpu=%s memoryMiB=%s memBudget=%s",
         cytebase_id,
         record.latestVersionId,
         run_id,
         call_id,
         record.attempt,
+        resources.cpu,
+        resources.memoryMiB,
+        resources.memBudget,
     )
     storage.write_json(
         f"{dataset_prefix(cytebase_id)}/dataset.json", record.model_dump(mode="json")
@@ -440,11 +450,15 @@ def _execute(cytebase_id: str, run_id: str, request: dict) -> dict:
     try:
         with _progress(record, "process") as progress:
             storage.progress = progress
-            result = _run_dataset(record, request, storage, progress, check)
+            result = _run_dataset(
+                record, request, storage, progress, check, resources=resources
+            )
     except Exception as error:
         message = error_message(error)
         logger.exception("Dataset worker failed: dataset=%s %s", cytebase_id, message)
         result = {"outcome": "failed", "message": message}
+        if isinstance(error, ImportMemoryRefusal):
+            result["_retryableMemory"] = True
         record.status = "failed"
     finally:
         storage.progress = None
@@ -507,15 +521,17 @@ def build_catalog(request: dict, run_id: str) -> dict:
 @app.function(
     image=image,
     secrets=[secret],
-    cpu=4,
-    memory=16384,
+    cpu=PROCESS_RESOURCES[0].cpu,
+    memory=PROCESS_RESOURCES[0].memoryMiB,
     timeout=86400,
     retries=0,
     max_containers=PROCESS_CONTAINERS,
     nonpreemptible=True,
 )
-def process_dataset(cytebase_id: str, run_id: str, request: dict) -> dict:
-    return _execute(cytebase_id, run_id, request)
+def process_dataset(
+    cytebase_id: str, run_id: str, request: dict, resource_tier: int = 0
+) -> dict:
+    return _execute(cytebase_id, run_id, request, resource_tier)
 
 
 def _reset(storage: Bucket, request: dict) -> dict:
@@ -700,7 +716,6 @@ async def run_pipeline(action: str, request: dict) -> dict:
 
             async def one(key: str, payload: dict) -> dict:
                 async with slots:
-                    await pacer.wait()
                     return await dispatch(key, payload)
 
             async def dispatch(key: str, payload: dict) -> dict:
@@ -712,12 +727,32 @@ async def run_pipeline(action: str, request: dict) -> dict:
                             if path.startswith(f"{dataset_prefix(key)}/")
                         ],
                     }
-                    result = await invoke(
-                        process_dataset,
-                        f"{key}:process",
-                        (key, state["runId"], arguments),
-                        {"cytebaseId": key, "stage": "process"},
-                    )
+                    for tier, resources in enumerate(PROCESS_RESOURCES):
+                        await pacer.wait()
+                        result = await invoke(
+                            process_dataset.with_options(
+                                cpu=resources.cpu, memory=resources.memoryMiB
+                            ),
+                            f"{key}:process",
+                            (key, state["runId"], arguments, tier),
+                            {"cytebaseId": key, "stage": "process"},
+                        )
+                        retryable = result.pop("_retryableMemory", False)
+                        if (
+                            result["outcome"] != "failed"
+                            or not retryable
+                            or tier == len(PROCESS_RESOURCES) - 1
+                        ):
+                            break
+                        next_resources = PROCESS_RESOURCES[tier + 1]
+                        logger.info(
+                            "Retrying count-layout memory refusal: dataset=%s "
+                            "cpu=%s memoryMiB=%s memBudget=%s",
+                            key,
+                            next_resources.cpu,
+                            next_resources.memoryMiB,
+                            next_resources.memBudget,
+                        )
                     record = result.pop("record", None)
                     if record is not None:
                         dirty[key] = record
